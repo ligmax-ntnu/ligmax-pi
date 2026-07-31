@@ -1,0 +1,7 @@
+pyzmq
+numpy
+scipy
+python-can
+future
+pymavlink
+mavproxy
