@@ -11,24 +11,31 @@ import json
 from config import *
 
 NODES = [
-    {"name": "logging", "cmd": [sys.executable, "-m", "nodes.logging.main"], "on":True},
+    # nodes/logging/main.py is an empty stub - not implemented yet. Leave it
+    # off, since a node that exits immediately would otherwise respawn as
+    # fast as start_node()'s loop allows.
+    {"name": "logging", "cmd": [sys.executable, "-m", "nodes.logging.main"], "on":False},
     {"name": "io_manager", "cmd": [sys.executable, "-m", "nodes.io_manager.main"], "on":True},
     {"name": "balancing", "cmd": [sys.executable, "-m", "nodes.balancing.main"], "on":False},
-    {"name": "self_driving", "cmd": [sys.executable, "-m", "nodes.self_driving.main"], "on":False}    
+    {"name": "self_driving", "cmd": [sys.executable, "-m", "nodes.self_driving.main"], "on":False}
 ]
+
+RESTART_BACKOFF_S = 5.0  # a node that exits immediately must not respawn in a tight loop
 
 RUNNING_NODES = {}
 async def start_node(node, logging_sock):
     if node["name"] in RUNNING_NODES:
         await logging_sock.send_string(json.dumps({"name": "main.py", "level": "info", "message": f"Node {node['name']} is already running"}))
         return
-    
+
     while node["on"]:
         proc = await asyncio.create_subprocess_exec(*node["cmd"])
         RUNNING_NODES[node["name"]] = proc
         await logging_sock.send_string(json.dumps({"name": "main.py", "level": "info", "message": f"Started node {node['name']}"}))
         await proc.wait()
         await logging_sock.send_string(json.dumps({"name": "main.py", "level": "info", "message": f"Node {node['name']} exited with code {proc.returncode}"}))
+        if node["on"]:
+            await asyncio.sleep(RESTART_BACKOFF_S)
 
 
 async def stop_node(node, logging_sock):

@@ -3,7 +3,7 @@
 This is the *only* GPIO in ligmax-pi - everything else it touches is SocketCAN
 (`can1`) or MAVLink (`/dev/ttyACM0`).
 
-    BCM 24  out  homing trigger  ->  slider ESP32 GPIO 35 (INPUT_PULLDOWN, RISING)
+    BCM 23  out  homing trigger  ->  slider ESP32 GPIO 35 (INPUT_PULLDOWN, RISING)
     BCM 25  out  E-stop relay    ->  relay in series with the physical E-stop button
 
 Polarity matters on both lines, and it runs the opposite way on each:
@@ -26,8 +26,8 @@ Polarity matters on both lines, and it runs the opposite way on each:
     is watching - but it means an update that restarts main.py cuts thrust for as
     long as the restart takes (../../update.py).
 
-Pin numbers are **BCM**, which is both what gpiozero takes and what "GPIO 24"
-means on a pinout diagram: BCM 24 is physical header pin 18, BCM 25 is physical
+Pin numbers are **BCM**, which is both what gpiozero takes and what "GPIO 23"
+means on a pinout diagram: BCM 23 is physical header pin ?, BCM 25 is physical
 pin 22. Override either with `LIGMAX_HOMING_PIN` / `LIGMAX_ESTOP_PIN` if the
 harness says otherwise - measure before you believe a number in a docstring.
 
@@ -46,7 +46,7 @@ import time
 
 log = logging.getLogger("io_manager.gpio")
 
-HOMING_PIN = int(os.environ.get("LIGMAX_HOMING_PIN", "24"))
+HOMING_PIN = int(os.environ.get("LIGMAX_HOMING_PIN", "23"))
 ESTOP_RELAY_PIN = int(os.environ.get("LIGMAX_ESTOP_PIN", "25"))
 
 # The ESP32 only needs an edge; a second is for the human with the multimeter.
@@ -240,7 +240,7 @@ class BatteryHoming(_Line):
 
 if __name__ == "__main__":
     # Bench check on the Pi:  python -m nodes.io_manager.emergency_stop
-    #   BCM 24 pulses high for a second (the slider should start hunting),
+    #   BCM 23 pulses high for a second (the slider should start hunting),
     #   then BCM 25 goes low for two seconds (the contactor should drop out).
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     relay = EstopRelay()
