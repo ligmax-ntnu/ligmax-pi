@@ -23,8 +23,8 @@ Polarity matters on both lines, and it runs the opposite way on each:
     The corollary is worth knowing before you meet it on the water: when this
     node exits, the relay opens. The supervisor restarting the node therefore
     bounces propulsion power. That is deliberate - if nothing is running, nothing
-    is watching - but it is why `deploy/repos.conf` pulls this repo without
-    restarting it.
+    is watching - but it means an update that restarts main.py cuts thrust for as
+    long as the restart takes (../../update.py).
 
 Pin numbers are **BCM**, which is both what gpiozero takes and what "GPIO 24"
 means on a pinout diagram: BCM 24 is physical header pin 18, BCM 25 is physical
