@@ -25,8 +25,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ligmax
-WorkingDirectory=/home/ligmax/ligmax-pi
+User=admin
+WorkingDirectory=/home/admin/ligmax-pi
 EnvironmentFile=/etc/ligmax/node.env
 ExecStart=/usr/bin/python3 update.py
 
