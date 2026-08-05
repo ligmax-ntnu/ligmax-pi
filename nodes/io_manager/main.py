@@ -49,7 +49,8 @@ HEARTBEAT_PERIOD = 1.0
 PUBLISH_PERIOD = 1.0
 LOOP_SLEEP = 0.01
 MAX_MESSAGES_PER_TICK = 200  # never let a backlog starve the heartbeat
-LINK_FAIL_DELAY = 5.0  # the supervisor restarts us with no backoff of its own
+LINK_FAIL_DELAY = 5.0  # how long to wait before retrying a dead/missing link
+HEARTBEAT_WAIT_S = float(os.environ.get("LIGMAX_MAVLINK_HEARTBEAT_TIMEOUT_S", "3.0"))
 
 UINT16_MAX = 0xFFFF
 INT16_MAX = 0x7FFF
@@ -290,20 +291,28 @@ def handle_commands(uploader, relay, homing):
             uploader.ack(command_id, "acked" if ok else "failed", result)
 
 
-def safety_telemetry(relay, homing):
+def safety_telemetry(relay, homing, mavlink_up):
     """What the operator needs in order to trust - or distrust - the buttons."""
     return {
         "estop_engaged": relay.engaged,
         "estop_relay_line": relay.available,
         "homing_line": homing.available,
+        "mavlink_link": mavlink_up,
     }
 
 
 def connect():
-    """Open the MAVLink link and wait for the autopilot to introduce itself."""
+    """Open the MAVLink link and wait for the autopilot to introduce itself.
+
+    Raises on failure - either the port would not open, or nothing answered
+    the heartbeat within HEARTBEAT_WAIT_S. Callers decide what "not connected"
+    should mean; this function never blocks forever.
+    """
     log.info("opening %s at %s baud", MAVLINK_DEVICE, MAVLINK_BAUD)
     master = mavutil.mavlink_connection(MAVLINK_DEVICE, baud=MAVLINK_BAUD)
-    master.wait_heartbeat()
+    if master.wait_heartbeat(timeout=HEARTBEAT_WAIT_S) is None:
+        master.close()
+        raise TimeoutError(f"no heartbeat within {HEARTBEAT_WAIT_S:.0f}s")
     log.info(
         "autopilot up: system %s component %s",
         master.target_system,
@@ -348,16 +357,12 @@ def main():
                 line.pin,
             )
 
-    try:
-        master = connect()
-    except Exception as exc:  # noqa: BLE001 - report it upward, then let us restart
-        log.error("MAVLink link to %s failed: %s", MAVLINK_DEVICE, exc)
-        time.sleep(LINK_FAIL_DELAY)
-        homing.close()
-        relay.close()
-        bus.close()
-        uploader.close()
-        raise SystemExit(1)
+    # No Pixhawk yet is not fatal - it is common on the bench, and even on the
+    # water a disconnected autopilot is exactly when the E-stop and dashboard
+    # link matter most. `master` is None until connect() succeeds, and drops
+    # back to None on any link error; the loop below just keeps retrying.
+    master = None
+    next_connect_attempt = 0.0
 
     sys_status = None
     battery = None
@@ -368,34 +373,50 @@ def main():
         while True:
             now = time.time()
 
-            for _ in range(MAX_MESSAGES_PER_TICK):
-                message = master.recv_match(blocking=False)
-                if message is None:
-                    break
-                kind = message.get_type()
-                if kind == "SYS_STATUS":
-                    sys_status = message
-                elif kind == "BATTERY_STATUS":
-                    # Instance 0 only. A second monitor would otherwise
-                    # overwrite the same telemetry keys as the main pack.
-                    if getattr(message, "id", 0) == 0:
-                        battery = message
-                elif kind == "STATUSTEXT":
-                    uploader.log(
-                        STATUSTEXT_LEVELS.get(message.severity, "INFO"),
-                        str(message.text).strip(),
-                        name="pixhawk",
-                    )
+            if master is None and now >= next_connect_attempt:
+                try:
+                    master = connect()
+                except Exception as exc:  # noqa: BLE001 - Pixhawk may not be plugged in
+                    log.error("MAVLink link to %s failed: %s", MAVLINK_DEVICE, exc)
+                    next_connect_attempt = now + LINK_FAIL_DELAY
 
-            if now - last_heartbeat >= HEARTBEAT_PERIOD:
-                master.mav.heartbeat_send(
-                    mavutil.mavlink.MAV_TYPE_GCS,
-                    mavutil.mavlink.MAV_AUTOPILOT_INVALID,
-                    0,
-                    0,
-                    0,
-                )
-                last_heartbeat = now
+            if master is not None:
+                try:
+                    for _ in range(MAX_MESSAGES_PER_TICK):
+                        message = master.recv_match(blocking=False)
+                        if message is None:
+                            break
+                        kind = message.get_type()
+                        if kind == "SYS_STATUS":
+                            sys_status = message
+                        elif kind == "BATTERY_STATUS":
+                            # Instance 0 only. A second monitor would otherwise
+                            # overwrite the same telemetry keys as the main pack.
+                            if getattr(message, "id", 0) == 0:
+                                battery = message
+                        elif kind == "STATUSTEXT":
+                            uploader.log(
+                                STATUSTEXT_LEVELS.get(message.severity, "INFO"),
+                                str(message.text).strip(),
+                                name="pixhawk",
+                            )
+
+                    if now - last_heartbeat >= HEARTBEAT_PERIOD:
+                        master.mav.heartbeat_send(
+                            mavutil.mavlink.MAV_TYPE_GCS,
+                            mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                            0,
+                            0,
+                            0,
+                        )
+                        last_heartbeat = now
+                except Exception as exc:  # noqa: BLE001 - a dropped link must not kill the node
+                    log.error("MAVLink link to %s dropped: %s", MAVLINK_DEVICE, exc)
+                    master.close()
+                    master = None
+                    sys_status = None
+                    battery = None
+                    next_connect_attempt = now + LINK_FAIL_DELAY
 
             forward_log_bus(bus, uploader)
             handle_commands(uploader, relay, homing)
@@ -404,7 +425,7 @@ def main():
                 # Published even when the battery block is empty: a frame
                 # arriving at all is how the dashboard knows we are on the air,
                 # and `estop` is what lights its banner.
-                telemetry = {"safety": safety_telemetry(relay, homing)}
+                telemetry = {"safety": safety_telemetry(relay, homing, master is not None)}
                 if battery_block := battery_telemetry(sys_status, battery):
                     telemetry["battery"] = battery_block
                 uploader.publish(telemetry=telemetry, estop=relay.engaged)
@@ -422,6 +443,8 @@ def main():
         # power), then tell the dashboard why, then flush the uplink.
         homing.close()
         relay.close()
+        if master is not None:
+            master.close()
         bus.close()
         uploader.close()  # flushes what is still queued
 
