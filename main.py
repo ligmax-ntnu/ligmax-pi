@@ -4,11 +4,18 @@ Script for running the main processes and managing nodes, in other words startin
 
 
 import zmq
+import os
 import sys
 import asyncio
 import zmq.asyncio
 import json
 from config import *
+
+# Tells a node it is running under this supervisor, which in turn is running
+# under update.py. nodes/io_manager/selfupdate.py checks it before signalling the
+# process group to restart everything onto freshly pulled code - run a node by
+# hand and it must not take down a process group it does not own.
+NODE_ENV = {**os.environ, "LIGMAX_SUPERVISED": "1"}
 
 NODES = [
     # nodes/logging/main.py is an empty stub - not implemented yet. Leave it
@@ -29,7 +36,7 @@ async def start_node(node, logging_sock):
         return
 
     while node["on"]:
-        proc = await asyncio.create_subprocess_exec(*node["cmd"])
+        proc = await asyncio.create_subprocess_exec(*node["cmd"], env=NODE_ENV)
         RUNNING_NODES[node["name"]] = proc
         await logging_sock.send_string(json.dumps({"name": "main.py", "level": "info", "message": f"Started node {node['name']}"}))
         await proc.wait()

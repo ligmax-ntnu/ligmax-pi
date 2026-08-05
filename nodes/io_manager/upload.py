@@ -232,12 +232,23 @@ class Uploader:
                 return out
 
     def ack(
-        self, command_id: str, status: str = "acked", result: str | None = None
+        self,
+        command_id: str,
+        status: str = "acked",
+        result: str | None = None,
+        head: str | None = None,
     ) -> None:
-        """Report a command's outcome; rides along on the next frame."""
+        """Report a command's outcome; rides along on the next frame.
+
+        `head` is the commit this node is on now, and only `update` sets it: the
+        dashboard puts it in the Software panel's row so the operator can see
+        which SHA the pull actually landed on.
+        """
         ack: dict[str, Any] = {"id": str(command_id), "status": str(status)}
         if result is not None:
             ack["result"] = str(result)
+        if head:
+            ack["head"] = str(head)[:40]
         with self._lock:
             self._acks.append(ack)
         self._wake.set()

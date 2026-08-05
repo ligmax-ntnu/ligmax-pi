@@ -36,6 +36,7 @@ from pymavlink import mavutil
 from config import LOGGING_PORT
 
 from .emergency_stop import BatteryHoming, EstopRelay
+from .selfupdate import NAME as REPO_NAME, SelfUpdate, request_restart
 from .upload import Uploader
 
 # /dev/ttyACM0 is not stable across a replug - it can come back as ttyACM1, so
@@ -255,7 +256,7 @@ def forward_log_bus(bus, uploader):
         )
 
 
-def handle_commands(uploader, relay, homing):
+def handle_commands(uploader, relay, homing, updater):
     """Run the operator's queued commands and ack each one.
 
     Commands ride back in the reply to a telemetry POST, so this is only as
@@ -266,11 +267,16 @@ def handle_commands(uploader, relay, homing):
     Anything not implemented here is acked `failed` on purpose, so the dashboard
     says "failed: not implemented" instead of leaving the operator watching a
     command sit at "sent" until it expires.
+
+    `update` is the exception to acking here: it starts a `git pull` on a worker
+    thread and is acked later by `finish_update()`, because a pull can outlast
+    the autopilot's heartbeat timeout and must not run in this loop.
     """
     for command in uploader.commands():
         name = str(command.get("name", ""))
         command_id = command.get("id")
-        log.info("command %s: %s %s", command_id, name, command.get("args") or "")
+        args = command.get("args") or {}
+        log.info("command %s: %s %s", command_id, name, args)
 
         if name == "estop":
             ok, result = relay.engage(reason=f"dashboard command {command_id}")
@@ -283,12 +289,55 @@ def handle_commands(uploader, relay, homing):
                 log.warning("home_battery %s", result)
             else:
                 ok, result = homing.trigger(reason=f"dashboard command {command_id}")
+        elif name == "update":
+            # Every node reads the same command queue, so check this one is ours
+            # before pulling somebody else's repo into our checkout.
+            repo = str(args.get("repo") or "")
+            if repo != REPO_NAME:
+                ok, result = False, f"'{repo}' is not this node's repo ({REPO_NAME})"
+                log.warning("update %s", result)
+            elif command_id is None:
+                ok, result = False, "update needs a command id to ack against"
+            else:
+                started, why = updater.start(str(command_id))
+                if started:
+                    log.warning("update: %s", why)
+                    continue  # acked by finish_update() when the pull lands
+                ok, result = False, f"refused: {why}"
         else:
             ok, result = False, f"'{name}' is not implemented on the vessel"
             log.warning("command %s ignored: %s", command_id, result)
 
         if command_id is not None:
             uploader.ack(command_id, "acked" if ok else "failed", result)
+
+
+def finish_update(uploader, updater):
+    """Ack a finished pull. Returns True when the node tree should restart.
+
+    The ack goes out before anything is torn down - `uploader.close()` in the
+    caller's `finally` flushes it - because once the process group is signalled
+    there is nothing left to report with, and the operator's row would sit at
+    "Waiting" through a restart that actually worked.
+    """
+    outcome = updater.take()
+    if outcome is None:
+        return False
+
+    uploader.ack(
+        outcome.command_id,
+        "acked" if outcome.ok else "failed",
+        outcome.message,
+        head=outcome.head,
+    )
+    if not outcome.ok:
+        # A refused fast-forward is not a reason to bounce propulsion: the boat
+        # keeps running the code it has, and the operator reads git's own message.
+        return False
+    if not outcome.changed:
+        log.info("update: already up to date, nothing to restart for")
+        return False
+    return True
 
 
 def safety_telemetry(relay, homing, mavlink_up):
@@ -342,6 +391,8 @@ def main():
     )
 
     bus = LogBus()
+    updater = SelfUpdate()
+    restart_for_update = False
 
     # Claim the GPIO before the autopilot link, so the safety line is up even if
     # the Pixhawk is unplugged. EstopRelay() closes the relay as it opens the
@@ -419,7 +470,12 @@ def main():
                     next_connect_attempt = now + LINK_FAIL_DELAY
 
             forward_log_bus(bus, uploader)
-            handle_commands(uploader, relay, homing)
+            handle_commands(uploader, relay, homing, updater)
+            if finish_update(uploader, updater):
+                # Leave the loop the ordinary way: the `finally` below flushes the
+                # ack and drops the GPIO before anything is signalled.
+                restart_for_update = True
+                break
 
             if now - last_publish >= PUBLISH_PERIOD:
                 # Published even when the battery block is empty: a frame
@@ -446,7 +502,12 @@ def main():
         if master is not None:
             master.close()
         bus.close()
-        uploader.close()  # flushes what is still queued
+        uploader.close()  # flushes what is still queued, including the update ack
+
+    # Only reached on a clean exit, and only true after a pull that changed HEAD.
+    # The ack is already on its way out, so the supervisor can take the tree down.
+    if restart_for_update:
+        request_restart()
 
 
 if __name__ == "__main__":

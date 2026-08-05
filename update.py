@@ -1,8 +1,22 @@
-"""Run main.py, and pull + restart it when the dashboard's Update button is pressed.
+"""Run main.py, and restart it when it exits or when an update lands.
 
 Started at boot by ligmax-pi.service, so the vessel comes up on its own after a
 power cycle with no SSH needed. Runs as the repo owner: it owns the child process
 and restarts it itself, so no sudo and no systemctl.
+
+There are two ways an update reaches this node, and this file is only involved in
+one of them:
+
+  * **As a vessel command** - the normal path. The dashboard queues `update` on
+    the telemetry channel, `nodes/io_manager/selfupdate.py` fast-forwards and
+    signals main.py's process group, and this loop simply sees its child exit and
+    starts it again on the new code. Nothing here talks to the dashboard at all.
+
+  * **By polling** - the fallback, and **off unless LIGMAX_NODE_KEY is set**. It
+    is what still works when io_manager is the thing that is broken, but a key
+    that does not match the server's is rejected before the poll is recorded, so
+    a wrong one looks exactly like a node that is switched off. Leaving it unset
+    is better than leaving it wrong.
 """
 
 import json
@@ -18,7 +32,9 @@ NAME = "ligmax-pi"
 START = [sys.executable, "main.py"]
 DASH = os.environ.get("LIGMAX_DEPLOY_URL", "https://live.ligmax.no").rstrip("/")
 KEY = os.environ.get("LIGMAX_NODE_KEY", "")
-POLL = 30
+POLL = 30  # seconds between /pending checks, when the fallback is on
+TICK = 1  # how often we look at the child, so a restart is not a poll behind
+RESTART_DELAY = 5
 
 
 def say(msg):
@@ -42,28 +58,51 @@ def head():
     ).stdout.strip()
 
 
-while True:
-    # start_new_session so we can signal the whole tree, not just the parent
-    child = subprocess.Popen(START, cwd=REPO, start_new_session=True)
-    say(f"started {START[-1]} as pid {child.pid} at {head()[:8]}")
+def wait_for_work(child):
+    """Block until the child exits or the dashboard asks for a pull.
 
-    nonce = None
+    Returns the nonce of a poll-driven request, or None if the child exited on
+    its own - which is also what happens after io_manager pulls and signals the
+    group, and is why that path needs nothing from this function.
+    """
+    next_poll = time.time() + POLL
     while child.poll() is None:
-        time.sleep(POLL)
+        time.sleep(TICK)
+        if not KEY or time.time() < next_poll:
+            continue
+        next_poll = time.time() + POLL
         try:
             pending = ask("/pending")
             if pending.get("requested"):
-                nonce = pending.get("nonce")
-                break
+                return pending.get("nonce")
         except Exception:
             pass  # dashboard unreachable is normal on a boat; keep running
+    return None
 
-    if child.poll() is None:
-        os.killpg(os.getpgid(child.pid), signal.SIGTERM)
-        try:
-            child.wait(15)
-        except subprocess.TimeoutExpired:
-            os.killpg(os.getpgid(child.pid), signal.SIGKILL)
+
+def stop(child):
+    os.killpg(os.getpgid(child.pid), signal.SIGTERM)
+    try:
+        child.wait(15)
+    except subprocess.TimeoutExpired:
+        os.killpg(os.getpgid(child.pid), signal.SIGKILL)
+
+
+while True:
+    # start_new_session so we can signal the whole tree, not just the parent -
+    # and so io_manager can signal that same group to restart itself.
+    child = subprocess.Popen(START, cwd=REPO, start_new_session=True)
+    say(f"started {START[-1]} as pid {child.pid} at {head()[:8]}")
+
+    nonce = wait_for_work(child)
+
+    # Keyed off the request, not off whether the child is still up. Gating the
+    # pull on `child.poll() is None` meant a main.py that had died during the
+    # poll interval swallowed the request entirely: nothing was pulled, nothing
+    # was reported, and the operator's row sat at "Waiting" for 30 minutes.
+    if nonce is not None:
+        if child.poll() is None:
+            stop(child)
 
         before = head()
         pull = subprocess.run(
@@ -90,5 +129,8 @@ while True:
         elif before == head():
             say("nothing new")
     else:
-        say(f"{START[-1]} exited with {child.returncode}; restarting in 5s")
-        time.sleep(5)
+        # Either main.py crashed, or io_manager pulled and took the group down on
+        # purpose. Both want the same thing: start it again on whatever is now in
+        # the working tree.
+        say(f"{START[-1]} exited with {child.returncode}; restarting in {RESTART_DELAY}s")
+        time.sleep(RESTART_DELAY)
