@@ -5,3 +5,8 @@ python-can
 future
 pymavlink
 mavproxy
+# GPIO for the E-stop relay and the battery-slider homing pulse
+# (nodes/io_manager/emergency_stop.py). RPi.GPIO does NOT work on a Pi 5 -
+# gpiozero on the lgpio backend is the combination that does.
+gpiozero
+lgpio
