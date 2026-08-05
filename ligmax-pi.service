@@ -1,0 +1,40 @@
+# Runs update.py, which runs main.py and pulls when the dashboard asks.
+#
+# Install (edit the two paths and the user first):
+#   sudo cp ligmax-pi.service /etc/systemd/system/
+#   sudo mkdir -p /etc/ligmax
+#   sudo tee /etc/ligmax/node.env >/dev/null <<'EOF'
+#   LIGMAX_DEPLOY_URL=https://live.ligmax.no
+#   LIGMAX_NODE_KEY=<LIGMAX_NODE_KEY from ligmax-server/.env>
+#   EOF
+#   sudo chmod 640 /etc/ligmax/node.env
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ligmax-pi
+#
+# `enable` is the word that matters: it is what makes this come back after a power
+# cycle. `start` alone lasts until the next reboot. Check it took:
+#   systemctl is-enabled ligmax-pi        -> enabled
+#   journalctl -u ligmax-pi -f
+
+[Unit]
+Description=Ligmax Pi node (main.py) + updater
+# Wait for real connectivity, not just for an interface to exist: update.py reads
+# LIGMAX_NODE_KEY and talks to the dashboard on its first poll.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ligmax
+WorkingDirectory=/home/ligmax/ligmax-pi
+EnvironmentFile=/etc/ligmax/node.env
+ExecStart=/usr/bin/python3 update.py
+
+# If the supervisor itself dies, bring it back. Without this a crash in update.py
+# takes main.py down with it until someone SSHes in -- which is the situation this
+# whole file exists to avoid.
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
