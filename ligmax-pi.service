@@ -6,6 +6,7 @@
 #   sudo tee /etc/ligmax/node.env >/dev/null <<'EOF'
 #   LIGMAX_DEPLOY_URL=https://live.ligmax.no
 #   LIGMAX_NODE_KEY=<LIGMAX_NODE_KEY from ligmax-server/.env>
+#   LIGMAX_BOAT_KEY=<this boat's ingest key from ligmax-server/.env>
 #   EOF
 #   sudo chmod 640 /etc/ligmax/node.env
 #   sudo systemctl daemon-reload
