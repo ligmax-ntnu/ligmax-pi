@@ -24,6 +24,10 @@ What it does:
   * publishes what the trim actuators were told to do - battery-slider position
     and the two ama outputs (`trim.py`), commanded values, since neither
     actuator reports anything back.
+  * pulls **RTK corrections** from the caster on the ground station and injects
+    them into the autopilot, which forwards them to the GNSS (`rtk.py`). The
+    base station is on 4G like the boat, so both ends dial out to the ground
+    station and meet there. Optional: without it the fix is ordinary 3D.
   * forwards log lines to the dashboard's log panel: this node's own, the
     ZeroMQ node bus on LOGGING_PORT, and the autopilot's STATUSTEXT.
   * executes the operator's commands, which arrive in the reply to each
@@ -55,6 +59,7 @@ from .emergency_stop import BatteryHoming, EstopRelay
 from .lights import Lights
 from .navigation import Navigation
 from .propulsion import PropulsionWatch
+from .rtk import ENABLED as RTK_ENABLED, RtkClient, inject as inject_rtcm
 from .selfupdate import NAME as REPO_NAME, SelfUpdate, request_restart
 from .status import StatusMachine
 from .trim import Trim
@@ -528,6 +533,14 @@ def main():
         )
     bms = BmsReader()
 
+    # RTK corrections, pulled from the caster on the ground station and injected
+    # into the autopilot for forwarding to the GNSS. Its own thread and its own
+    # socket; the loop only drains a deque. Off if LIGMAX_RTK_ENABLED=0, and a
+    # caster that never answers costs nothing but a log line.
+    rtk = RtkClient() if RTK_ENABLED else None
+    if rtk is None:
+        log.info("RTK corrections disabled (LIGMAX_RTK_ENABLED=0)")
+
     # No Pixhawk yet is not fatal - it is common on the bench, and even on the
     # water a disconnected autopilot is exactly when the E-stop and dashboard
     # link matter most. `master` is None until connect() succeeds, and drops
@@ -599,6 +612,18 @@ def main():
                             # want, so a message nobody reads costs two lookups.
                             trim.handle(message)
 
+                    # RTCM straight back down the same link. Bounded per tick, so
+                    # a burst after a caster reconnect cannot delay the heartbeat
+                    # below - corrections are worth having, the heartbeat is worth
+                    # keeping the autopilot out of failsafe for.
+                    if rtk is not None:
+                        injected = 0
+                        for chunk in rtk.take():
+                            inject_rtcm(master, chunk)
+                            injected += len(chunk)
+                        if injected:
+                            rtk.note_injected(injected)
+
                     if now - last_heartbeat >= HEARTBEAT_PERIOD:
                         master.mav.heartbeat_send(
                             mavutil.mavlink.MAV_TYPE_GCS,
@@ -662,6 +687,12 @@ def main():
                     "propulsion": propulsion.telemetry(),
                     "lights": lights.telemetry(),
                 }
+                if rtk is not None:
+                    # This link only: bytes in, bytes injected, correction age.
+                    # Whether it *worked* is `gps.fix` going to RTK_FIXED, and
+                    # corrections flowing with the fix stuck at 3D is the
+                    # signature of a receiver that is not taking RTCM at all.
+                    telemetry["rtk"] = rtk.telemetry()
 
                 # The pack's own figures if the BMS answered, the autopilot's
                 # estimate if not, and `source` says which. Never a blend.
@@ -713,6 +744,8 @@ def main():
         time.sleep(0.15)  # long enough for the worker to get one write out
         lights.close()
         bms.close()
+        if rtk is not None:
+            rtk.close()
         if master is not None:
             master.close()
         bus.close()
