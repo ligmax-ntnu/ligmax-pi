@@ -60,10 +60,25 @@ import time
 
 log = logging.getLogger("io_manager.lights")
 
-# Serial2 on the ESP32 side. `/dev/ttyAMA0` is the Pi 5's primary PL011 once the
-# console is released; `/dev/serial0` is the symlink to whichever that is, which
-# is the safer thing to point at.
-PORT = os.environ.get("LIGMAX_LIGHTS_PORT", "/dev/serial0")
+# Serial2 on the ESP32 side, reached over the Pi's GPIO 14/15 UART.
+#
+# `/dev/serial0` is NOT the thing to point at on a Pi 5. There, serial0 is an
+# alias the firmware resolves at boot, and if `uart0` is disabled in
+# `config.txt` it resolves to `/dev/ttyAMA10` - the 3-pin *debug* connector,
+# which is a different set of physical pins and normally carries the kernel
+# console. Writing `M0\n` there is silently accepted and never reaches the
+# ESP32, which is exactly the failure this constant used to cause: the port
+# opened, every write "succeeded", `available` was True, and the hull stayed on
+# the firmware's idle profile.
+#
+# So name the device explicitly, and treat the debug UART as unusable
+# (`_DEBUG_UART`) rather than as a port that happens not to answer.
+PORT = os.environ.get("LIGMAX_LIGHTS_PORT", "/dev/ttyAMA0")
+
+# GPIO 14/15 needs `enable_uart=1` (and `dtparam=uart0=on`) in
+# `/boot/firmware/config.txt` plus a reboot. Without it /dev/ttyAMA0 does not
+# exist at all, so a missing port here means the boot config, not the cable.
+_DEBUG_UART = "/dev/ttyAMA10"
 BAUD = int(os.environ.get("LIGMAX_LIGHTS_BAUD", "115200"))
 
 # Well inside the firmware's 15 s fallback (`lights_esp.ino:131`), so the hull
@@ -117,6 +132,12 @@ try:
     import serial  # pyserial
 except ImportError:  # not on the Pi, or the library is not installed yet
     serial = None
+
+
+class _WrongPort(Exception):
+    """The configured port is not the GPIO 14/15 UART. A config fault, not a cable
+    fault - kept as its own type so `_open()` can log it once instead of every
+    OPEN_RETRY_PERIOD."""
 
 
 class Lights:
@@ -292,6 +313,25 @@ class Lights:
         if now - self._last_open_attempt < OPEN_RETRY_PERIOD:
             return
         self._last_open_attempt = now
+
+        # The debug connector opens and accepts writes perfectly happily, so
+        # without this the failure looks like a working link driving a hull that
+        # never changes colour. Refuse it by name instead.
+        if os.path.realpath(self.port_name) == _DEBUG_UART:
+            if not isinstance(self._last_error, _WrongPort):
+                self._last_error = _WrongPort(
+                    f"{self.port_name} resolves to {_DEBUG_UART}, the Pi 5 debug "
+                    f"connector, not GPIO 14/15"
+                )
+                log.error(
+                    "refusing to drive the lights over %s: it resolves to %s, "
+                    "the 3-pin debug connector, not the GPIO 14/15 UART. Set "
+                    "enable_uart=1 in /boot/firmware/config.txt, reboot, and "
+                    "point LIGMAX_LIGHTS_PORT at /dev/ttyAMA0.",
+                    self.port_name,
+                    _DEBUG_UART,
+                )
+            return
         try:
             port = serial.Serial(
                 self.port_name,

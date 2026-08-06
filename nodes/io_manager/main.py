@@ -457,6 +457,11 @@ def main():
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
     )
+    # python-can logs "Created a socket" at INFO every time a Bus is opened, and
+    # `battery.py` opens one per BMS poll - about every 3 s. `attach_logging()`
+    # below forwards everything to the operator's log, so at INFO this third-party
+    # chatter is the only thing anyone can see there. Warnings still come through.
+    logging.getLogger("can").setLevel(logging.WARNING)
 
     uploader = Uploader.from_env()
     uploader.attach_logging()  # everything logged from here on also goes up
