@@ -51,6 +51,7 @@ from .bms import BmsReader
 from .emergency_stop import BatteryHoming, EstopRelay
 from .lights import Lights
 from .navigation import Navigation
+from .propulsion import PropulsionWatch
 from .selfupdate import NAME as REPO_NAME, SelfUpdate, request_restart
 from .status import StatusMachine
 from .trim import Trim
@@ -492,10 +493,13 @@ def main():
     # Who is in charge, and the two things that answer to it. The status machine is
     # pure bookkeeping; the lights own a worker thread and a serial port.
     machine = StatusMachine()
+    # The only way the Pi learns that the physical E-stop went in: the VESCs are on
+    # the Pixhawk's CAN bus, so their telemetry stops. Pure bookkeeping, fed below.
+    propulsion = PropulsionWatch()
     lights = Lights()
     # Say something immediately rather than waiting for the first publish: until
     # the autopilot is heard from, the honest colour is not green.
-    lights.set_status(machine.evaluate(relay.engaged))
+    lights.set_status(machine.evaluate(relay.engaged, propulsion.propulsion_permitted))
 
     # Navigation and trim are fed from the MAVLink pump below; the BMS runs itself.
     navigation = Navigation()
@@ -558,6 +562,11 @@ def main():
                                     mode=getattr(master, "flightmode", None),
                                     armed=bool(master.motors_armed()),
                                 )
+                        elif kind == "ESC_TELEMETRY_1_TO_4":
+                            # The VESCs are on the autopilot's CAN bus, not ours,
+                            # so this is the Pi's only sight of them - and the
+                            # physical E-stop is only visible as their silence.
+                            propulsion.note_esc_telemetry(message)
                         elif kind == "RC_CHANNELS":
                             # FRSky is still delivering. This shares no hardware
                             # with the 5G link, so it counts as an independent
@@ -596,6 +605,11 @@ def main():
                     navigation.link_down()
                     trim.link_down()
                     machine.note_link_down()
+                    # Not just lost telemetry: the Pixhawk shares the rail the
+                    # E-stop cuts, so on this boat a dropped link is itself
+                    # evidence propulsion is gone. Measured 2026-08-06 - see
+                    # `propulsion.py`.
+                    propulsion.note_link_down()
                     next_connect_attempt = now + LINK_FAIL_DELAY
 
             forward_log_bus(bus, uploader)
@@ -609,7 +623,10 @@ def main():
             # Who is in charge, evaluated every loop rather than every publish: the
             # lights should follow the boat's actual state at loop rate, not at the
             # 1 Hz the uplink happens to run at. `evaluate()` is pure bookkeeping.
-            status = machine.evaluate(relay.engaged)
+            # `propulsion_permitted` is None until ESC telemetry has arrived at
+            # least once, and `evaluate()` reads None as "no opinion, trust the
+            # relay" - so on a bench with no autopilot this changes nothing.
+            status = machine.evaluate(relay.engaged, propulsion.propulsion_permitted)
             lights.set_status(status)
 
             if now - last_publish >= PUBLISH_PERIOD:
@@ -623,6 +640,9 @@ def main():
                     # Why the status is what it is - which of the three control
                     # links went away. The status itself is a top-level field.
                     "control": machine.telemetry(),
+                    # Why propulsion is believed gone, so an operator can tell a
+                    # pressed E-stop from a kicked CAN cable.
+                    "propulsion": propulsion.telemetry(),
                     "lights": lights.telemetry(),
                 }
 
