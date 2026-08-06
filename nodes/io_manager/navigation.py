@@ -35,10 +35,34 @@ opposite of what you would want for control and the right way round for a displa
 the operator is being shown what the sensor measured, and the sim, the dashboard
 and this module all agree on that so a discrepancy means something.
 
+The grid, and why this module owns it
+-------------------------------------
+The dashboard's chart is not drawn in degrees. It draws a local metre grid and
+lays map imagery under it, which needs two things the raw GNSS figures are not:
+``origin`` - the lat/lon of grid (0, 0) - and ``boat.position`` in metres from
+it. Publishing `telemetry.gps.lat/lon` alone puts numbers in the figure list and
+leaves the map empty, because nothing else in the fleet converts one to the
+other (`ligmax-server/web/js/geo.js` does it client-side, but only for the
+cursor readout).
+
+So this module captures the first usable fix as the origin - the same thing
+`Boat.original_gps_position` means - and reports position relative to it as a
+tangent plane, +x east, +y north, which is the protocol's default grid. Over a
+Njord course a few hundred metres across the flat-earth error is well under a
+metre, and the constant is deliberately the same 111320 m/deg the dashboard
+uses, so the two ends cannot disagree about where the boat is.
+
+The origin outlives a MAVLink dropout and a node restart (it is cached in
+`ORIGIN_FILE`) because it is a georeference, not a measurement: re-zeroing it
+mid-run would silently shift the whole chart, the track history and every
+obstacle under the boat. `recentre()` - the dashboard's `recentre_origin`
+command - is the only way to move it, and a reboot clears the cache.
+
 Nothing here blocks or raises; a missing message means a missing field, and the
 dashboard shows a gap rather than a stale number.
 """
 
+import json
 import logging
 import math
 import os
@@ -68,6 +92,22 @@ COG_MIN_SPEED = float(os.environ.get("LIGMAX_COG_MIN_SPEED", "0.15"))
 UINT16_MAX = 0xFFFF
 INT16_MAX = 0x7FFF
 
+# Metres per degree of latitude. Must stay equal to METRES_PER_DEGREE_LAT in
+# `ligmax-server/web/js/geo.js`, which converts back the other way for the
+# cursor readout - a different constant here would put the boat and the mouse
+# pointer in two slightly different worlds.
+METRES_PER_DEGREE_LAT = 111320.0
+
+# Fixes too coarse to zero a grid on. A 2D fix can sit tens of metres out, and
+# the offset would move the satellite imagery under the whole course, not just
+# the boat. lat/lon are still reported while we wait.
+UNUSABLE_FIXES = ("NO_GPS", "NO_FIX", "2D")
+
+# Where the captured origin is cached, so an io_manager restart rejoins the grid
+# it left rather than re-zeroing under the operator. /run is tmpfs: cleared by a
+# reboot, which is exactly when "the fix it booted at" should mean a new one.
+ORIGIN_FILE = os.environ.get("LIGMAX_GRID_ORIGIN_FILE", "/run/ligmax/grid-origin.json")
+
 
 def _wrap360(degrees):
     return degrees % 360.0
@@ -76,6 +116,40 @@ def _wrap360(degrees):
 def _wrap180(degrees):
     """Signed difference, wrapped to (-180, 180]. Used for the crab angle."""
     return ((degrees + 540.0) % 360.0) - 180.0
+
+
+def _load_origin():
+    """The cached grid origin, or None. Never raises - a bad cache is no cache."""
+    try:
+        with open(ORIGIN_FILE, "r", encoding="utf-8") as handle:
+            cached = json.load(handle)
+        lat, lon = float(cached["lat"]), float(cached["lon"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    if abs(lat) > 90.0 or abs(lon) > 180.0:
+        log.warning("ignoring nonsense cached grid origin %s", ORIGIN_FILE)
+        return None
+    log.info("grid origin restored from cache: %.7f, %.7f", lat, lon)
+    return {"lat": lat, "lon": lon}
+
+
+def _save_origin(origin):
+    """Cache the origin so a node restart rejoins the same grid. Best effort."""
+    try:
+        os.makedirs(os.path.dirname(ORIGIN_FILE) or ".", exist_ok=True)
+        with open(ORIGIN_FILE, "w", encoding="utf-8") as handle:
+            json.dump(origin, handle)
+    except OSError as exc:
+        # Not fatal: the grid is still correct for as long as this process runs,
+        # and the operator would rather have a map than an exception.
+        log.warning("could not cache grid origin to %s: %s", ORIGIN_FILE, exc)
+
+
+def _forget_origin():
+    try:
+        os.remove(ORIGIN_FILE)
+    except OSError:
+        pass
 
 
 class Navigation:
@@ -95,6 +169,7 @@ class Navigation:
         self._nav = None
         self._mission_seq = None
         self._warned_no_position = False
+        self._origin = _load_origin()
 
     # -- fed by the MAVLink pump -------------------------------------------
 
@@ -121,6 +196,10 @@ class Navigation:
         This matters more here than anywhere else on the boat: a chart showing the
         vessel where it was thirty seconds ago is worse than a chart showing
         nothing, because it looks correct.
+
+        The origin is deliberately kept. It is a georeference rather than a
+        measurement, and dropping it would move the grid - and with it every
+        track and the operator's track history - the moment the link came back.
         """
         self._gps_raw = None
         self._global = None
@@ -196,6 +275,97 @@ class Navigation:
                 return _wrap360(float(hdg))  # whole degrees
         return None
 
+    # -- the grid the map is drawn in ---------------------------------------
+
+    @property
+    def fix(self):
+        """The fix type as a name (`3D`, `RTK_FIXED`, ...), or None if unknown."""
+        if self._gps_raw is None:
+            return None
+        raw = getattr(self._gps_raw, "fix_type", None)
+        if raw is None:
+            return None
+        return FIX_TYPES.get(int(raw), f"FIX_{raw}")
+
+    @property
+    def origin(self):
+        """`{"lat": ..., "lon": ...}` of grid (0, 0), or None until a fix lands."""
+        return dict(self._origin) if self._origin else None
+
+    def recentre(self):
+        """Drop the origin so the next usable fix re-zeros the grid.
+
+        Wired to the dashboard's `recentre_origin` command. Everything on the
+        chart moves when this takes effect, which is why it is an explicit
+        operator action and not something a reconnect does on its own.
+        """
+        self._origin = None
+        _forget_origin()
+        log.warning("grid origin cleared; the next usable fix will re-zero it")
+
+    def _ensure_origin(self, position):
+        """Capture `position` as the origin if we have not got one yet."""
+        if self._origin is not None:
+            return
+        if (fix := self.fix) in UNUSABLE_FIXES:
+            return  # lat/lon still get published; the grid can wait for a 3D fix
+        self._origin = {"lat": position[0], "lon": position[1]}
+        _save_origin(self._origin)
+        log.info(
+            "grid origin set to %.7f, %.7f on a %s fix",
+            position[0],
+            position[1],
+            fix or "unreported",
+        )
+
+    @property
+    def grid_position(self):
+        """`[east, north]` metres from the origin, or None.
+
+        Flat-earth about the origin's latitude - the same approximation, and the
+        same constant, the dashboard uses in the other direction.
+        """
+        position = self.position
+        if position is None:
+            return None
+        self._ensure_origin(position)
+        if self._origin is None:
+            return None
+        north = (position[0] - self._origin["lat"]) * METRES_PER_DEGREE_LAT
+        east = (
+            (position[1] - self._origin["lon"])
+            * METRES_PER_DEGREE_LAT
+            * math.cos(math.radians(self._origin["lat"]))
+        )
+        return [round(east, 2), round(north, 2)]
+
+    def world(self):
+        """The map fields: `{"origin": ..., "boat": ...}`, or `{"boat": None}`.
+
+        `boat` is explicitly null when there is no position, because the server
+        merges frames: leaving the key out would keep the last known position on
+        the chart for the rest of the run, which is the one failure mode this
+        module exists to avoid. `grid_bearing` is left alone - the grid is
+        north-aligned, which is the protocol's default.
+        """
+        grid = self.grid_position
+        if grid is None:
+            return {"boat": None}
+
+        boat = {"position": grid}
+        if (heading := self.heading) is not None:
+            # Compass degrees; the server turns it into a grid unit vector.
+            boat["heading_deg"] = round(heading, 1)
+        if (course := self.cog) is not None and (speed := self.sog) is not None:
+            # Only with a COG: below COG_MIN_SPEED the direction is noise, and
+            # the chart's velocity arrow would spin on the spot.
+            rad = math.radians(course)
+            boat["velocity"] = [
+                round(speed * math.sin(rad), 3),
+                round(speed * math.cos(rad), 3),
+            ]
+        return {"origin": self.origin, "boat": boat}
+
     # -- output -------------------------------------------------------------
 
     def telemetry(self):
@@ -211,9 +381,8 @@ class Navigation:
             log.warning("autopilot is reporting no GNSS position yet")
 
         if self._gps_raw is not None:
-            fix = getattr(self._gps_raw, "fix_type", None)
-            if fix is not None:
-                gps["fix"] = FIX_TYPES.get(int(fix), f"FIX_{fix}")
+            if (fix := self.fix) is not None:
+                gps["fix"] = fix
             satellites = getattr(self._gps_raw, "satellites_visible", None)
             if satellites is not None and satellites != 255:
                 gps["satellites"] = int(satellites)

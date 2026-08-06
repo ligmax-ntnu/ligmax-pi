@@ -14,7 +14,10 @@ What it does:
     the telemetry link, and the colour of the lights on the hull (`lights.py`).
   * publishes the navigation figures the operator's GUI needs: position, heading,
     course and speed over ground, and the distance to the next waypoint
-    (`navigation.py`).
+    (`navigation.py`) - **and the grid the map is drawn in**: `origin`, the
+    lat/lon of grid (0, 0), plus the vessel's position in metres from it. The
+    chart is metres, not degrees, so without those two the map stays empty
+    however good the fix is.
   * publishes the battery, **read off the Daly BMS over CAN** rather than taken
     from the autopilot (`bms.py`). The autopilot's own estimate is kept as a
     labelled fallback and `telemetry.battery.source` says which is answering.
@@ -315,7 +318,9 @@ def forward_log_bus(bus, uploader):
         )
 
 
-def handle_commands(uploader, relay, homing, updater, machine=None, trim=None):
+def handle_commands(
+    uploader, relay, homing, updater, machine=None, trim=None, navigation=None
+):
     """Run the operator's queued commands and ack each one.
 
     Commands ride back in the reply to a telemetry POST, so this is only as
@@ -360,6 +365,16 @@ def handle_commands(uploader, relay, homing, updater, machine=None, trim=None):
                     # Pixhawk's position demand entirely, so the commanded rail
                     # figure is not even what it is chasing. Say so in telemetry.
                     trim.note_homing(True)
+        elif name == "recentre_origin":
+            # Re-zeroing the grid moves everything on the chart - the boat, the
+            # track history, every obstacle - so it only ever happens when the
+            # operator asks. The next usable fix supplies the new origin, which
+            # is a second or so away at 1 Hz.
+            if navigation is None:
+                ok, result = False, "no navigation source on this node"
+            else:
+                navigation.recentre()
+                ok, result = True, "grid origin cleared; re-zeroing on the next fix"
         elif name == "update":
             # Every node reads the same command queue, so check this one is ours
             # before pulling somebody else's repo into our checkout.
@@ -613,7 +628,9 @@ def main():
                     next_connect_attempt = now + LINK_FAIL_DELAY
 
             forward_log_bus(bus, uploader)
-            handle_commands(uploader, relay, homing, updater, machine, trim)
+            handle_commands(
+                uploader, relay, homing, updater, machine, trim, navigation
+            )
             if finish_update(uploader, updater):
                 # Leave the loop the ordinary way: the `finally` below flushes the
                 # ack and drops the GPIO before anything is signalled.
@@ -662,10 +679,16 @@ def main():
                 if trim_block := trim.telemetry():
                     telemetry["trim"] = trim_block
 
+                # `origin` and `boat` are what put the vessel on the chart: the
+                # dashboard draws a metre grid, not degrees, so a GNSS fix in
+                # `telemetry.gps` alone fills the figures and leaves the map
+                # empty. `boat` comes back explicitly null when the position is
+                # gone, because frames merge (navigation.world()).
                 uploader.publish(
                     status=status,
                     telemetry=telemetry,
                     estop=relay.engaged,
+                    **navigation.world(),
                 )
                 last_publish = now
 
