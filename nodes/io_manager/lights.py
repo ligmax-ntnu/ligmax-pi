@@ -78,7 +78,7 @@ PORT = os.environ.get("LIGMAX_LIGHTS_PORT", "/dev/ttyAMA0")
 # GPIO 14/15 needs `enable_uart=1` (and `dtparam=uart0=on`) in
 # `/boot/firmware/config.txt` plus a reboot. Without it /dev/ttyAMA0 does not
 # exist at all, so a missing port here means the boot config, not the cable.
-_DEBUG_UART = "/dev/ttyAMA10"
+_DEBUG_UART = "/dev/ttyAMA0"
 BAUD = int(os.environ.get("LIGMAX_LIGHTS_BAUD", "115200"))
 
 # Well inside the firmware's 15 s fallback (`lights_esp.ino:131`), so the hull
