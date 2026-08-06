@@ -160,6 +160,13 @@ class RtkClient:
             # climbing past a few seconds means the *base* has gone quiet, which
             # looks like a healthy link from here.
             block["correction_age_s"] = round(now - self._last_data, 1)
+        elif connected:
+            # Connected to the caster, and it has never sent a byte. That is not
+            # a broken link - it is a caster with no base station pushing to it,
+            # and without saying so the panel reads as "link yes, 0 B" and looks
+            # like this module is at fault. It is the commonest RTK failure by
+            # far, because the base is a laptop somebody has to remember to start.
+            block["waiting_for_base"] = True
         if connected and self._connected_at:
             block["uptime_s"] = round(now - self._connected_at, 1)
         if queued:
@@ -304,6 +311,13 @@ class RtkClient:
                 self._queue.append(data[start : start + RTCM_CHUNK])
 
     def _note_error(self, message):
+        if self._closed:
+            # We are the ones who closed the socket. The worker is usually
+            # blocked in recv() when that happens and comes out of it with an
+            # error - "connection lost" on Windows, a clean EOF elsewhere - and
+            # logging it would put a warning in the operator's panel every time
+            # the node stops, which is every update and every restart.
+            return
         # Only log a change: a caster that is down would otherwise fill the
         # operator's log panel at the reconnect rate.
         if str(self._last_error) != message:
