@@ -10,4 +10,4 @@ mavproxy
 # gpiozero on the lgpio backend is the combination that does.
 gpiozero
 lgpiopip
-rplidar-robotic
+rplidar
