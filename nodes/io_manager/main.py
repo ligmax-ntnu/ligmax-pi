@@ -32,12 +32,20 @@ What it does:
     ZeroMQ node bus on LOGGING_PORT, and the autopilot's STATUSTEXT.
   * executes the operator's commands, which arrive in the reply to each
     telemetry POST: `estop`, `estop_clear` and `home_battery` drive the two
-    GPIO lines in `emergency_stop.py`. Every command is acked, so the
-    dashboard's command list shows what actually happened on the vessel.
+    GPIO lines in `emergency_stop.py`; `set_mode` and `arm`/`disarm` ask the
+    autopilot directly; `set_mission` uploads an admin-laid route of grid
+    waypoints as a real MAVLink mission (`mission.py`) for AUTO to run, and
+    `clear_waypoints` empties it. Every command is acked, so the dashboard's
+    command list shows what actually happened on the vessel - though
+    `set_mode`/`arm`/`disarm` can only ack that the message was *sent*, not
+    that the vehicle obeyed; watch `mode` and `telemetry.control.armed` on the
+    next heartbeat for that.
 
 What it does not do yet: ride-height control (`pixhalwk.set_ride_height`), and
-nothing here disarms the autopilot - the E-stop cuts propulsion *power* at the
-contactor rather than asking the Pixhawk nicely.
+the single-point `goto` command still has no GUIDED-mode implementation - only
+a laid mission (AUTO) runs today. Nothing here disarms the autopilot on its
+own initiative either - the E-stop cuts propulsion *power* at the contactor
+rather than asking the Pixhawk nicely.
 
 Everything added to the loop here is non-blocking by construction. The BMS read
 takes ~0.85 s and the lights write can stall on a dead cable, so both live on
@@ -57,6 +65,7 @@ from config import LOGGING_PORT
 from .bms import BmsReader
 from .emergency_stop import BatteryHoming, EstopRelay
 from .lights import Lights
+from .mission import MissionUploader, parse_waypoints
 from .navigation import Navigation
 from .propulsion import PropulsionWatch
 from .rtk import ENABLED as RTK_ENABLED, RtkClient, inject as inject_rtcm
@@ -323,8 +332,49 @@ def forward_log_bus(bus, uploader):
         )
 
 
+def apply_mode(master, mode_name):
+    """Ask the autopilot to switch flight mode. Returns `(ok, message)`.
+
+    This acks "requested", not "confirmed": `SET_MODE` gets no reliable ack
+    across MAVLink dialects, so the honest claim is that the message went out,
+    not that the vehicle is now in that mode. The real confirmation is the
+    `mode` field in the next HEARTBEAT, which already rides up as the frame's
+    top-level `mode` and `telemetry.control.autopilot_mode` - watch those, not
+    this ack, before trusting the boat is doing what was asked.
+    """
+    mapping = master.mode_mapping() or {}
+    if mode_name not in mapping:
+        known = ", ".join(sorted(mapping)) or "none seen yet - no heartbeat?"
+        return False, f"'{mode_name}' is not a mode this vehicle offers ({known})"
+    master.set_mode(mapping[mode_name])
+    return True, f"mode change to {mode_name} sent"
+
+
+def apply_arm(master, arm):
+    """Ask the autopilot to arm or disarm. Same "requested, not confirmed" caveat
+    as `apply_mode()` - `telemetry.control.armed` is fed from the next HEARTBEAT.
+    """
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        0,  # confirmation
+        1.0 if arm else 0.0,  # param1: 1 = arm, 0 = disarm
+        0, 0, 0, 0, 0, 0,
+    )
+    return True, f"{'arm' if arm else 'disarm'} sent"
+
+
 def handle_commands(
-    uploader, relay, homing, updater, machine=None, trim=None, navigation=None
+    uploader,
+    relay,
+    homing,
+    updater,
+    machine=None,
+    trim=None,
+    navigation=None,
+    master=None,
+    mission=None,
 ):
     """Run the operator's queued commands and ack each one.
 
@@ -337,9 +387,12 @@ def handle_commands(
     says "failed: not implemented" instead of leaving the operator watching a
     command sit at "sent" until it expires.
 
-    `update` is the exception to acking here: it starts a `git pull` on a worker
-    thread and is acked later by `finish_update()`, because a pull can outlast
-    the autopilot's heartbeat timeout and must not run in this loop.
+    Three commands are the exception to acking here, because each rides on an
+    exchange that can span several loop ticks: `update` starts a `git pull` on a
+    worker thread and is acked later by `finish_update()`; `set_mission` and
+    `clear_waypoints` start a MAVLink mission exchange and are acked later by
+    `finish_mission()` - both because neither must block the loop that owes the
+    autopilot its 1 Hz heartbeat.
     """
     for command in uploader.commands():
         name = str(command.get("name", ""))
@@ -380,6 +433,53 @@ def handle_commands(
             else:
                 navigation.recentre()
                 ok, result = True, "grid origin cleared; re-zeroing on the next fix"
+        elif name == "set_mode":
+            mode_name = str(args.get("mode", "")).strip().upper()
+            if master is None:
+                ok, result = False, "no autopilot link"
+            elif not mode_name:
+                ok, result = False, "'mode' is required"
+            else:
+                ok, result = apply_mode(master, mode_name)
+        elif name in ("arm", "disarm"):
+            if master is None:
+                ok, result = False, "no autopilot link"
+            else:
+                ok, result = apply_arm(master, arm=(name == "arm"))
+        elif name == "clear_waypoints":
+            if master is None:
+                ok, result = False, "no autopilot link"
+            elif mission is None:
+                ok, result = False, "no mission handler on this node"
+            elif mission.busy:
+                ok, result = False, "refused: another mission command is already in flight"
+            elif command_id is None:
+                ok, result = False, "clear_waypoints needs a command id to ack against"
+            else:
+                mission.clear(master, str(command_id))
+                continue  # acked by finish_mission() once MISSION_ACK lands
+        elif name == "set_mission":
+            # Points arrive in grid metres - the same frame `goto` uses and the
+            # one the dashboard's map is drawn in - and are converted to lat/lon
+            # here, against whatever origin `navigation` has captured, because
+            # the autopilot's mission protocol only speaks global coordinates.
+            points = parse_waypoints(args.get("points"))
+            if master is None:
+                ok, result = False, "no autopilot link"
+            elif mission is None:
+                ok, result = False, "no mission handler on this node"
+            elif navigation is None or navigation.origin is None:
+                ok, result = False, "no GPS origin yet - the grid is not georeferenced"
+            elif points is None:
+                ok, result = False, "'points' must be a non-empty list of [x, y] pairs"
+            elif mission.busy:
+                ok, result = False, "refused: another mission command is already in flight"
+            elif command_id is None:
+                ok, result = False, "set_mission needs a command id to ack against"
+            else:
+                global_points = [navigation.to_global(x, y) for x, y in points]
+                mission.upload(master, str(command_id), points, global_points)
+                continue  # acked by finish_mission() once MISSION_ACK lands
         elif name == "update":
             # Every node reads the same command queue, so check this one is ours
             # before pulling somebody else's repo into our checkout.
@@ -429,6 +529,30 @@ def finish_update(uploader, updater):
         log.info("update: already up to date, nothing to restart for")
         return False
     return True
+
+
+def finish_mission(uploader, mission):
+    """Ack a finished mission upload or clear, mirroring `finish_update()`.
+
+    A successful upload is echoed back as a `path` with `kind: "reference"` -
+    the dashboard already draws exactly this as the amber "ideal route" layer
+    (`ligmax-server/web/js/map.js`), which is what an admin-laid mission *is*:
+    the course as laid out, for the boat to compare its actual track against.
+    A successful clear removes it the same way `clear_waypoints` promises to -
+    sending `paths: []` replaces the list outright rather than merging, since
+    frames merge dicts but not lists (`ligmax_gui/state.py`).
+    """
+    outcome = mission.take()
+    if outcome is None:
+        return
+    command_id, ok, message, kind, grid_points = outcome
+    uploader.ack(command_id, "acked" if ok else "failed", message)
+    if not ok:
+        return
+    if kind == "upload":
+        uploader.publish(path={"points": grid_points, "kind": "reference", "label": "mission"})
+    elif kind == "clear":
+        uploader.publish(paths=[])
 
 
 def safety_telemetry(relay, homing, mavlink_up, lights=None):
@@ -524,6 +648,10 @@ def main():
     # Navigation and trim are fed from the MAVLink pump below; the BMS runs itself.
     navigation = Navigation()
     trim = Trim()
+    # Admin-laid waypoint missions and mode/arm changes - see mission.py. Owns no
+    # thread or socket of its own; every call takes `master` explicitly, like the
+    # heartbeat send below, so it can never race that connection object.
+    mission = MissionUploader()
     if not trim.configured:
         log.warning(
             "no servo channels configured for the trim readback, so the battery "
@@ -560,6 +688,17 @@ def main():
             if master is None and now >= next_connect_attempt:
                 try:
                     master = connect()
+                    # The vehicle-type-specific mode table, straight from
+                    # pymavlink's static tables keyed off the HEARTBEAT this
+                    # connection just saw - not a guess, and not the same thing
+                    # as `status.py`'s AUTONOMOUS_MODES/PILOTED_MODES, which is
+                    # this vehicle's *behaviour* classification of them. Sent
+                    # once per connection: the set does not change mid-session,
+                    # and the dashboard's mode dropdown only needs it once to
+                    # stop reading "vessel has not reported its modes".
+                    modes = sorted((master.mode_mapping() or {}).keys())
+                    if modes:
+                        uploader.publish(available_modes=modes)
                 except Exception as exc:  # noqa: BLE001 - Pixhawk may not be plugged in
                     log.error("MAVLink link to %s failed: %s", MAVLINK_DEVICE, exc)
                     next_connect_attempt = now + LINK_FAIL_DELAY
@@ -607,10 +746,18 @@ def main():
                                 name="pixhawk",
                             )
                         elif not navigation.handle(message):
-                            # Position, course and mission progress, then the servo
-                            # rail. Both return False for anything they do not
-                            # want, so a message nobody reads costs two lookups.
-                            trim.handle(message)
+                            # Position, course and mission progress, then a mission
+                            # upload/clear exchange in flight, then the servo rail.
+                            # All three return False for anything they do not want,
+                            # so a message nobody reads costs three lookups.
+                            if not mission.handle(master, message):
+                                trim.handle(message)
+
+                    # A mission exchange that never gets its next
+                    # MISSION_REQUEST_INT or its final MISSION_ACK must not sit
+                    # queued forever - cheap to check even when nothing is
+                    # pending.
+                    mission.check_timeout()
 
                     # RTCM straight back down the same link. Bounded per tick, so
                     # a burst after a caster reconnect cannot delay the heartbeat
@@ -644,6 +791,7 @@ def main():
                     # ago is worse than one showing nothing, because it looks right.
                     navigation.link_down()
                     trim.link_down()
+                    mission.link_down()
                     machine.note_link_down()
                     # Not just lost telemetry: the Pixhawk shares the rail the
                     # E-stop cuts, so on this boat a dropped link is itself
@@ -654,13 +802,22 @@ def main():
 
             forward_log_bus(bus, uploader)
             handle_commands(
-                uploader, relay, homing, updater, machine, trim, navigation
+                uploader,
+                relay,
+                homing,
+                updater,
+                machine,
+                trim,
+                navigation,
+                master,
+                mission,
             )
             if finish_update(uploader, updater):
                 # Leave the loop the ordinary way: the `finally` below flushes the
                 # ack and drops the GPIO before anything is signalled.
                 restart_for_update = True
                 break
+            finish_mission(uploader, mission)
 
             # Who is in charge, evaluated every loop rather than every publish: the
             # lights should follow the boat's actual state at loop rate, not at the

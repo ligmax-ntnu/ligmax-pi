@@ -339,6 +339,27 @@ class Navigation:
         )
         return [round(east, 2), round(north, 2)]
 
+    def to_global(self, x, y):
+        """Grid metres `(x east, y north)` -> `(lat, lon)` degrees, or None.
+
+        The exact inverse of `grid_position`, for the one thing that needs to
+        go the other way: an admin lays a waypoint on the chart in grid
+        metres, and the autopilot's mission protocol wants lat/lon
+        (`mission.py`). None until a fix has set the origin - a mission
+        cannot be georeferenced onto a grid that has no origin yet.
+
+        Like `grid_position`, this ignores `grid_bearing` because nothing in
+        this fleet ever sets it to anything but 0 (see `world()`) - if that
+        changes, both conversions need the same rotation added.
+        """
+        if self._origin is None:
+            return None
+        lat = self._origin["lat"] + y / METRES_PER_DEGREE_LAT
+        lon = self._origin["lon"] + x / (
+            METRES_PER_DEGREE_LAT * math.cos(math.radians(self._origin["lat"]))
+        )
+        return lat, lon
+
     def world(self):
         """The map fields: `{"origin": ..., "boat": ...}`, or `{"boat": None}`.
 
