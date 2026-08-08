@@ -414,6 +414,7 @@ def handle_commands(
     master=None,
     mission=None,
     tuning=None,
+    lights=None,
 ):
     """Run the operator's queued commands and ack each one.
 
@@ -539,6 +540,28 @@ def handle_commands(
                 if queued:
                     continue  # acked by finish_tuning() once PARAM_VALUE lands
                 ok, result = False, why
+        elif name == "set_lights_mode":
+            # The /led_control switch: standard (status-driven) vs. an admin's
+            # authored test pattern. `lights.py` itself refuses to honour this
+            # while the boat is KILLED, whatever it is set to - that guarantee
+            # lives there, not here, so it holds even if this handler is wrong.
+            if lights is None:
+                ok, result = False, "no lights driver on this node"
+            else:
+                custom = bool(args.get("custom"))
+                lights.set_override(custom)
+                ok, result = True, "custom pattern" if custom else "standard status"
+        elif name == "set_lights_pattern":
+            # The pattern itself: a solid colour, a per-pixel array, or a
+            # looping multi-frame animation authored on /led_control. Shown
+            # only once the switch above is also on. `set_pattern()` never
+            # raises - a malformed payload is just refused.
+            if lights is None:
+                ok, result = False, "no lights driver on this node"
+            elif lights.set_pattern(args.get("frames")):
+                ok, result = True, "pattern loaded"
+            else:
+                ok, result = False, "pattern rejected: see the log for why"
         elif name == "get_params":
             # Re-read the lot. Automatic on connect and once a minute anyway;
             # this is the button for after someone has been in Mission Planner.
@@ -953,6 +976,7 @@ def main():
                 master,
                 mission,
                 tuning,
+                lights,
             )
             if finish_update(uploader, updater):
                 # Leave the loop the ordinary way: the `finally` below flushes the

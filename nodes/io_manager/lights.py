@@ -138,6 +138,23 @@ STROBE_HZ = 4.0  # OUT_OF_CONTROL, per the docstring
 BREATHE_PERIOD = 4.0  # STANDBY, seconds for a full dim->bright->dim cycle
 BREATHE_FLOOR = 0.04  # never fully off, so "powered" stays readable
 
+# -- Admin test-pattern override ---------------------------------------------
+#
+# `/led_control` on the dashboard lets an admin author a solid colour, a full
+# per-pixel array, or a looping multi-frame animation, and push it down here to
+# preview on the real hull. It defaults to off and is never persisted, so a
+# restart always comes back showing the vessel's actual status, not whatever
+# was last authored.
+#
+# KILLED always wins. `main.py` never stops calling `set_status()` off the
+# real vessel status regardless of the override switch, and `_tick()` below
+# refuses to honour the override while `wanted == "KILLED"` - solid red is the
+# rules' promise that the thrusters are dead, and nothing authored on a
+# webpage gets to make that look like anything else.
+MAX_PATTERN_FRAMES = 60  # generous for a hand-authored loop, small enough to log
+MIN_HOLD_S = 0.02  # below one FRAME_PERIOD tick, a frame could never show anyway
+MAX_HOLD_S = 60.0
+
 # --- The mapping. This is the authoritative copy. ---------------------------
 #
 # Mirrored in `ligmax-server/tools/sim_boat.py` (LIGHT_COLOURS) so the simulator
@@ -230,8 +247,94 @@ def frame(pixel):
 BLANK = frame((0, 0, 0))
 
 
+def _hex_to_rgb(value):
+    """`"RRGGBB"` (an optional leading `#` tolerated) -> `(r, g, b)`, or raise."""
+    text = str(value).strip().lstrip("#")
+    if len(text) != 6:
+        raise ValueError(f"bad colour {value!r}, want 6 hex chars")
+    try:
+        return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16))
+    except ValueError:
+        raise ValueError(f"bad colour {value!r}, want hex digits") from None
+
+
+def _parse_pattern(frames):
+    """Admin-authored `frames` -> `[(pixels, hold_s), ...]`, or raise ValueError.
+
+    `pixels` is either one `"RRGGBB"` string (a solid frame) or exactly
+    `NUM_LEDS` of them (a per-pixel frame); both are expanded to a full
+    `NUM_LEDS`-long tuple here, so nothing downstream has to branch on which
+    shorthand the admin used.
+    """
+    if not isinstance(frames, list) or not frames:
+        raise ValueError("frames must be a non-empty list")
+    if len(frames) > MAX_PATTERN_FRAMES:
+        raise ValueError(f"at most {MAX_PATTERN_FRAMES} frames")
+    parsed = []
+    for i, entry in enumerate(frames):
+        if not isinstance(entry, dict):
+            raise ValueError(f"frame {i} is not an object")
+        try:
+            hold_s = float(entry.get("hold_ms")) / 1000.0
+        except (TypeError, ValueError):
+            raise ValueError(f"frame {i} has a bad hold_ms") from None
+        if not (MIN_HOLD_S <= hold_s <= MAX_HOLD_S):
+            raise ValueError(f"frame {i} hold_ms out of range")
+        pixels = entry.get("pixels")
+        if isinstance(pixels, str):
+            row = (_hex_to_rgb(pixels),) * NUM_LEDS
+        elif isinstance(pixels, list):
+            if len(pixels) != NUM_LEDS:
+                raise ValueError(f"frame {i} has {len(pixels)} pixels, want {NUM_LEDS}")
+            row = tuple(_hex_to_rgb(p) for p in pixels)
+        else:
+            raise ValueError(f"frame {i} pixels must be a string or a list")
+        parsed.append((row, hold_s))
+    return parsed
+
+
+def _pattern_frame_at(pattern, total_s, t):
+    """Which frame's pixels are current at time `t`, looping over `total_s`.
+
+    Phase-driven like `render()`'s breathe/strobe, not index-plus-elapsed, so
+    there is no per-object playhead to drift or to reset when the pattern is
+    replaced mid-loop.
+    """
+    if total_s <= 0:
+        return pattern[0][0]
+    phase = t % total_s
+    acc = 0.0
+    for pixels, hold_s in pattern:
+        acc += hold_s
+        if phase < acc:
+            return pixels
+    return pattern[-1][0]
+
+
+def _is_solid(pixels):
+    first = pixels[0]
+    return all(p == first for p in pixels)
+
+
+def _nibble(value):
+    """One 8-bit channel -> the hex digit `DATA` sends (inverse of the ESP32's
+    nibble-doubling expansion in `lights_esp.ino`)."""
+    return max(0, min(15, int(round(value / 17.0))))
+
+
+def data_frame(pixels):
+    """The wire format for a true per-pixel frame: `DATA ` + one hex nibble per
+    channel per LED + newline. Half `COL`'s precision, per the module
+    docstring - used only when a pattern frame is not a single solid colour.
+    """
+    body = "".join("%X%X%X" % (_nibble(r), _nibble(g), _nibble(b)) for r, g, b in pixels)
+    return "DATA " + body + "\n"
+
+
 class Lights:
-    """The hull's signal lights. `set_status()` is the whole interface.
+    """The hull's signal lights. `set_status()` drives the safety colour;
+    `set_override()` and `set_pattern()` let an admin substitute a
+    hand-authored test pattern for it - see "Admin test-pattern override" above.
 
     Owns one worker thread. The status is held as "the latest wanted", never
     accumulated: if it changes three times between two frames, the hull shows the
@@ -250,6 +353,10 @@ class Lights:
 
         self._wanted = None  # status name, or None until someone says
         self._shown = None  # the status the strip was last sent a frame for
+        self._shown_custom = False  # was that frame the admin pattern, not the status colour?
+        self._override = False  # admin switch: show _pattern instead of the status colour
+        self._pattern = None  # [(pixels, hold_s), ...] or None until an admin loads one
+        self._pattern_total_s = 0.0
         self._last_frame = None  # the exact line last written, to skip repeats
         self._last_write = 0.0
         self._last_open_attempt = 0.0
@@ -298,6 +405,48 @@ class Lights:
             log.info("hull lights -> %s (%s)", STATUS_COLOURS[status], status)
             self._wake.set()
 
+    def set_override(self, enabled):
+        """Switch between the vessel status (default) and the admin test pattern.
+
+        Never blocks or raises. Turning this on with no pattern loaded yet just
+        waits - `_tick()` keeps showing the status colour until `set_pattern()`
+        gives it something else, and it always keeps showing the status colour
+        outright while `wanted == "KILLED"`, whatever this is set to.
+        """
+        if self._closed:
+            return
+        enabled = bool(enabled)
+        with self._lock:
+            changed = enabled != self._override
+            self._override = enabled
+        if changed:
+            log.info("hull lights override -> %s",
+                      "custom pattern" if enabled else "standard status")
+            self._wake.set()
+
+    def set_pattern(self, frames):
+        """Load a looping test pattern: `[{"pixels": ..., "hold_ms": ...}, ...]`.
+
+        `pixels` is one `"RRGGBB"` string (solid) or exactly `NUM_LEDS` of them
+        (per-pixel). Never raises - a malformed payload is logged and ignored,
+        leaving whatever was loaded before (or nothing) in place. Returns
+        whether it was accepted, which is what the command handler acks on.
+        """
+        if self._closed:
+            return False
+        try:
+            parsed = _parse_pattern(frames)
+        except ValueError as exc:
+            log.warning("rejected light pattern: %s", exc)
+            return False
+        with self._lock:
+            self._pattern = parsed
+            self._pattern_total_s = sum(hold_s for _, hold_s in parsed)
+        log.info("hull lights pattern loaded: %d frame(s), %.1fs loop",
+                  len(parsed), self._pattern_total_s)
+        self._wake.set()
+        return True
+
     def telemetry(self):
         """The `telemetry.lights` block, which the dashboard cross-checks.
 
@@ -308,14 +457,20 @@ class Lights:
         records that the difference is real rather than an outage.
         """
         with self._lock:
-            wanted, shown = self._wanted, self._shown
+            wanted, shown, shown_custom = self._wanted, self._shown, self._shown_custom
+            override, pattern = self._override, self._pattern
         block = {
             "link": self.available and self._frames > 0,
             "verified": False,  # no return path on this firmware
             "frames": self._frames,
+            "override": override,
         }
+        if pattern is not None:
+            block["pattern_frames"] = len(pattern)
         if shown is not None:
-            block["colour"] = STATUS_COLOURS[shown]
+            # `shown_custom` is the ground truth for what actually went out -
+            # `override` alone would lie the instant KILLED forces it aside.
+            block["colour"] = "custom" if shown_custom else STATUS_COLOURS[shown]
             block["for_status"] = shown
         # Only worth reporting while it is actually true, so it does not sit in
         # the panel as a permanent field nobody reads.
@@ -369,6 +524,7 @@ class Lights:
     def _tick(self):
         with self._lock:
             wanted = self._wanted
+            override, pattern, total = self._override, self._pattern, self._pattern_total_s
         if wanted is None:
             return
 
@@ -378,7 +534,14 @@ class Lights:
                 return
 
         now = time.monotonic()
-        line = frame(render(wanted, now))
+        # KILLED is unconditional: whatever the switch says, solid red is the
+        # rules' promise that the thrusters are dead.
+        show_custom = override and pattern and wanted != "KILLED"
+        if show_custom:
+            pixels = _pattern_frame_at(pattern, total, now)
+            line = frame(pixels[0]) if _is_solid(pixels) else data_frame(pixels)
+        else:
+            line = frame(render(wanted, now))
 
         # Skip frames that would repaint the strip with what it already has, but
         # never go longer than KEEPALIVE_PERIOD: a strip that missed a byte or
@@ -400,6 +563,7 @@ class Lights:
         self._frames += 1
         with self._lock:
             self._shown = wanted
+            self._shown_custom = show_custom
         self._drain()
 
     def _open(self):
