@@ -203,6 +203,13 @@ class ScanPublisher:
         self.edge_link = edge_link
         self.aft = aft
         self.max_age = max_age
+        # The front sweep as relayed by the autonomy node, which owns TCP 3401
+        # by default (`edge_link.EDGE_OWNER`). `(scan, arrived_at, seq)` - our
+        # own counter, because the relay carries no sequence and the cache below
+        # keys on one. Only consulted when `edge_link` is None, i.e. when this
+        # node is not the one bound to the port.
+        self._relayed = None
+        self._relayed_seq = 0
         self._published = 0
         self._front_points = 0
         self._aft_points = 0
@@ -226,10 +233,51 @@ class ScanPublisher:
         self._cache[source] = (key, scan)
         return scan, True
 
+    def relay_front(self, scans):
+        """Take a front sweep built by the autonomy node. Already boat frame.
+
+        The autonomy node holds TCP 3401, so without this the coloured front
+        cloud would disappear from the operator's chart the moment autonomy
+        started - which is exactly when someone most wants to see it. The points
+        arrive already converted and already masked, so nothing is recomputed
+        here; this is a hand-over, not a second pipeline.
+        """
+        if not scans:
+            return
+        front = next(
+            (s for s in scans if isinstance(s, dict) and s.get("source") == "front_lidar"),
+            None,
+        )
+        if front is None:
+            return
+        self._relayed_seq += 1
+        self._relayed = (front, time.time(), self._relayed_seq)
+
+    def aft_scan_for_planner(self):
+        """The newest fresh aft sweep as a plain dict, or None.
+
+        The autonomy node needs it and cannot read the port - this node owns the
+        serial link. The front sweep goes the other way, so between them each
+        sensor crosses the bus exactly once and in one direction.
+        """
+        if self.aft is None:
+            return None
+        sweep = self.aft.latest()
+        if sweep is None or time.time() - sweep.t_end > self.max_age:
+            return None
+        scan, _is_new = self._cached("aft_lidar", sweep.seq, lambda: aft_scan(sweep))
+        return scan
+
     def _front(self):
         """The Jetson's newest fresh sweep, and whether it is one we have not sent."""
         if self.edge_link is None:
-            return None, False
+            # Not our port: the autonomy node is bound to 3401 and relays it.
+            if self._relayed is None:
+                return None, False
+            scan, arrived_at, seq = self._relayed
+            if time.time() - arrived_at > self.max_age:
+                return None, False
+            return self._cached("front_lidar", seq, lambda: scan)
         cloud, seq, arrived_at = self.edge_link.front_cloud()
         if not cloud or seq == 0:
             return None, False

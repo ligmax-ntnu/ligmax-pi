@@ -24,7 +24,12 @@ NODES = [
     {"name": "logging", "cmd": [sys.executable, "-m", "nodes.logging.main"], "on":False},
     {"name": "io_manager", "cmd": [sys.executable, "-m", "nodes.io_manager.main"], "on":True},
     {"name": "balancing", "cmd": [sys.executable, "-m", "nodes.balancing.main"], "on":False},
-    {"name": "self_driving", "cmd": [sys.executable, "-m", "nodes.self_driving.main"], "on":False}
+    # The autonomy node. On from boot, and safe to be: it commands nothing until
+    # an operator sends `autopilot_start`. Running it all the time is what has
+    # it warmed up - lidar tracked, plan restored, Jetson connected - by the
+    # moment somebody does. It also owns TCP 3401, so io_manager leaves that
+    # port alone (nodes/io_manager/edge_link.py, LIGMAX_EDGE_OWNER).
+    {"name": "self_driving", "cmd": [sys.executable, "-m", "nodes.self_driving.main"], "on":True}
 ]
 
 RESTART_BACKOFF_S = 5.0  # a node that exits immediately must not respawn in a tight loop

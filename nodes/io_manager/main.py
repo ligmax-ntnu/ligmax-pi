@@ -78,6 +78,7 @@ from pymavlink import mavutil
 
 from config import LOGGING_PORT, pixhawk_port
 
+from .autopilot_bridge import AUTOPILOT_COMMANDS, AutopilotBridge
 from .bms import BmsReader
 from .edge_link import ENABLED as EDGE_LINK_ENABLED, EdgeLink
 from .emergency_stop import BatteryHoming, EstopRelay
@@ -123,6 +124,12 @@ PUBLISH_PERIOD = 1.0
 # and the plot falls back to riding the 1 Hz publish.
 SCAN_PUBLISH_HZ = float(os.environ.get("LIGMAX_SCAN_PUBLISH_HZ", "10"))
 SCAN_PERIOD = (1.0 / SCAN_PUBLISH_HZ) if SCAN_PUBLISH_HZ > 0 else None
+
+# How often the autonomy node is handed the boat's pose over the node bus.
+# Matched to its own 10 Hz tick, and unrelated to SCAN_PUBLISH_HZ: this one goes
+# over loopback to another process on the same Pi, costs no 4G, and is what the
+# planner steers on. Turning the operator's plot down must not blind the boat.
+STATE_PERIOD = 1.0 / float(os.environ.get("LIGMAX_STATE_PUBLISH_HZ", "10"))
 
 LOOP_SLEEP = 0.01
 MAX_MESSAGES_PER_TICK = 200  # never let a backlog starve the heartbeat
@@ -418,6 +425,7 @@ def handle_commands(
     mission=None,
     tuning=None,
     lights=None,
+    bridge=None,
 ):
     """Run the operator's queued commands and ack each one.
 
@@ -430,6 +438,12 @@ def handle_commands(
     says "failed: not implemented" instead of leaving the operator watching a
     command sit at "sent" until it expires.
 
+    The exception is the autopilot's own commands (`AUTOPILOT_COMMANDS`), which
+    belong to `nodes/self_driving`. They are collected and returned rather than
+    handled, so the caller can put them on the node bus - and they are NOT acked
+    here, because the autonomy node acks them itself and two answers to one
+    command is worse than none.
+
     Four commands are the exception to acking here, because each rides on an
     exchange that can span several loop ticks: `update` starts a `git pull` on a
     worker thread and is acked later by `finish_update()`; `set_mission` and
@@ -438,6 +452,7 @@ def handle_commands(
     value it stored and is acked by `finish_tuning()`. None of them may block the
     loop that owes the autopilot its 1 Hz heartbeat.
     """
+    for_autopilot = []
     for command in uploader.commands():
         name = str(command.get("name", ""))
         command_id = command.get("id")
@@ -451,7 +466,15 @@ def handle_commands(
         if machine is not None:
             machine.note_operator()
 
-        if name == "estop":
+        if name in AUTOPILOT_COMMANDS:
+            # The autonomy node's, not ours. Collected here and put on the node
+            # bus by the caller; it acks them itself.
+            if bridge is None or not bridge.available:
+                ok, result = False, "the autopilot node bus is not available"
+            else:
+                for_autopilot.append(command)
+                continue
+        elif name == "estop":
             ok, result = relay.engage(reason=f"dashboard command {command_id}")
         elif name == "estop_clear":
             ok, result = relay.clear(reason=f"dashboard command {command_id}")
@@ -605,6 +628,7 @@ def handle_commands(
 
         if command_id is not None:
             uploader.ack(command_id, "acked" if ok else "failed", result)
+    return for_autopilot
 
 
 def finish_update(uploader, updater):
@@ -812,10 +836,20 @@ def main():
     if edge_link is not None:
         edge_link.start()
     else:
-        log.info("Jetson link disabled (LIGMAX_EDGE_LINK_ENABLED=0)")
+        log.info(
+            "not binding the Jetson port - nodes/self_driving owns it and relays "
+            "the front sweep back (LIGMAX_EDGE_OWNER=io_manager to take it back)"
+        )
     aft_lidar = LidarReader()
     aft_lidar.start()
     scans = ScanPublisher(edge_link, aft_lidar)
+
+    # The seam to `nodes/self_driving`: this node's pose and mode go out, its
+    # control requests come back and go onto the MAVLink link here. Binding
+    # both sockets costs nothing when the autonomy node is not running, and
+    # everything below degrades to exactly today's behaviour if pyzmq is
+    # missing (`autopilot_bridge.py`).
+    bridge = AutopilotBridge()
 
     # RTK corrections, pulled from the caster on the ground station and injected
     # into the autopilot for forwarding to the GNSS. Its own thread and its own
@@ -837,6 +871,8 @@ def main():
     last_heartbeat = 0.0
     last_publish = 0.0
     last_scan = 0.0
+    last_state = 0.0
+    for_autopilot = []
 
     try:
         while True:
@@ -976,8 +1012,31 @@ def main():
                     propulsion.note_link_down()
                     next_connect_attempt = now + LINK_FAIL_DELAY
 
+            # The autonomy node's control requests, straight onto the MAVLink
+            # link. Every loop rather than every publish: a docking command at
+            # 10 Hz arriving at 1 Hz is a boat that creeps in ten times slower
+            # than it thinks it is. Cheap when the bus is quiet.
+            bridge.pump(master)
+
             forward_log_bus(bus, uploader)
-            handle_commands(
+            for entry in bridge.take_logs():
+                uploader.log(
+                    entry.get("level", "INFO"),
+                    entry.get("msg", ""),
+                    name=entry.get("name", "self_driving"),
+                )
+            for ack in bridge.take_acks():
+                # The autonomy node answering an operator command it was handed
+                # below. Passed through verbatim so the dashboard's command list
+                # shows what actually happened.
+                uploader.ack(
+                    ack.get("id"), ack.get("status", "acked"), ack.get("result")
+                )
+            if relayed := bridge.take_scan():
+                # The front lidar, which the autonomy node owns the port for.
+                scans.relay_front(relayed)
+
+            for_autopilot = handle_commands(
                 uploader,
                 relay,
                 homing,
@@ -989,6 +1048,7 @@ def main():
                 mission,
                 tuning,
                 lights,
+                bridge,
             )
             if finish_update(uploader, updater):
                 # Leave the loop the ordinary way: the `finally` below flushes the
@@ -1006,6 +1066,23 @@ def main():
             # relay" - so on a bench with no autopilot this changes nothing.
             status = machine.evaluate(relay.engaged, propulsion.propulsion_permitted)
             lights.set_status(status)
+
+            # The state frame the autonomy node steers on, at STATE_PERIOD - NOT
+            # at the 1 Hz publish tick. A planner running at 10 Hz on a 1 Hz
+            # pose is working from a position up to a second stale, which at
+            # task speed is a metre of error it cannot see. An operator command
+            # bypasses the timer entirely, so pressing stop is never up to a
+            # tenth of a second late.
+            if for_autopilot or now - last_state >= STATE_PERIOD:
+                last_state = now
+                bridge.publish_state(
+                    navigation=navigation,
+                    machine=machine,
+                    relay=relay,
+                    scans=scans,
+                    master=master,
+                    commands=for_autopilot,
+                )
 
             # The lidar plot, on its own tick. Nothing else rides this one: the
             # uploader coalesces per key, so these POSTs carry `scans` and the
@@ -1052,6 +1129,15 @@ def main():
                 # reasons and by different routes, and "no returns" astern looks
                 # exactly like "clear water" astern unless the panel says which.
                 telemetry["lidar"] = scans.telemetry()
+                if bridge.relayed_lidar is not None:
+                    # The front unit's own health, as reported by whichever node
+                    # is actually bound to 3401.
+                    telemetry["lidar"]["front"] = bridge.relayed_lidar
+
+                # Whether the node bus itself is working. Its own block, because
+                # "the autonomy node is not running" and "the bus is not
+                # delivering" look identical from the dashboard otherwise.
+                telemetry["autopilot_bridge"] = bridge.telemetry()
 
                 # The pack's own figures if the BMS answered, the autopilot's
                 # estimate if not, and `source` says which. Never a blend.
@@ -1087,6 +1173,17 @@ def main():
                     "estop": relay.engaged,
                     **navigation.world(),
                 }
+
+                # Whatever the autonomy node has published since the last frame:
+                # `telemetry.autopilot` (what it is doing and why - NJORD §11.4
+                # scores exactly this), `tracks` for the chart's obstacle layer,
+                # and `path` for the amber ideal-route layer. Merged rather than
+                # nested, because each of those is a top-level protocol field.
+                for key, value in bridge.take_telemetry().items():
+                    if key == "autopilot":
+                        telemetry["autopilot"] = value
+                    else:
+                        frame[key] = value
                 if SCAN_PERIOD is None:
                     # The fast tick is switched off, so the plot rides this one
                     # rather than never going out at all.
@@ -1120,6 +1217,7 @@ def main():
         # streaming into a closed port is what makes the following start fail
         # with `Wrong body size` (lidar.py).
         aft_lidar.close()
+        bridge.close()
         if edge_link is not None:
             edge_link.close()
         if rtk is not None:

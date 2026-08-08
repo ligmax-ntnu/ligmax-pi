@@ -66,9 +66,19 @@ DEFAULT_PORT = int(os.environ.get("LIGMAX_EDGE_PORT", "3401"))
 # (docs/comms.md), so there is nothing here to expose.
 BIND_HOST = os.environ.get("LIGMAX_EDGE_BIND", "0.0.0.0")
 
-ENABLED = os.environ.get("LIGMAX_EDGE_LINK_ENABLED", "1").strip().lower() not in (
-    "0", "false", "no", "off",
-)
+# Who binds 3401. Only one process can, and since the autonomy node is the only
+# consumer that needs the full 10 Hz coloured cloud AND the detections, it takes
+# the port by default and relays a copy of the front sweep back here for the
+# operator's chart (`autopilot_bridge.py`). Set LIGMAX_EDGE_OWNER=io_manager to
+# put it back on this side - which is what you want when the autonomy node is
+# not running at all.
+EDGE_OWNER = os.environ.get("LIGMAX_EDGE_OWNER", "self_driving").strip().lower()
+
+_EXPLICIT = os.environ.get("LIGMAX_EDGE_LINK_ENABLED", "").strip().lower()
+if _EXPLICIT:
+    ENABLED = _EXPLICIT not in ("0", "false", "no", "off")
+else:
+    ENABLED = EDGE_OWNER == "io_manager"
 
 # The Jetson sends ~14 frames a second per camera. Silence for this long is a
 # dead link, not a quiet one - and because `read_message` does partial reads, a
@@ -102,6 +112,7 @@ class EdgeLink(threading.Thread):
         self._frames = 0
         self._sweeps = 0
         self._dets = [0, 0]         # detections in the newest frame, per camera
+        self._detections = [[], []]  # the detections themselves, newest per camera
         self._frame_at = [None, None]
         self._fps = None
         self._peer = None
@@ -128,6 +139,31 @@ class EdgeLink(threading.Thread):
         """
         with self._lock:
             return self._cloud, self._cloud_seq, self._cloud_at
+
+    def detections(self, max_age=1.0):
+        """The newest detections from both cameras, or `[]`. Never blocks.
+
+        Each entry is the detector's own dict (`edge_protocol.py`) with a `cam`
+        key added, because a track id is unique **per camera and not across the
+        pair** - `(cam, id)` is what identifies a target, and a consumer handed a
+        bare `id` from both cameras would merge cam0's #7 with cam1's #7.
+
+        Stale frames are dropped rather than returned: a detection is a claim
+        about where something was at `t_capture`, and on a boat turning at
+        30 deg/s a one-second-old bearing is 30 degrees wrong. The world model
+        only ever uses these to *refine* a lidar track (`world.absorb_detections`),
+        so a stale one does not merely add noise, it renames the wrong object.
+        """
+        now = time.time()
+        out = []
+        with self._lock:
+            for cam in (0, 1):
+                seen_at = self._frame_at[cam]
+                if seen_at is None or now - seen_at > max_age:
+                    continue
+                for det in self._detections[cam]:
+                    out.append(dict(det, cam=cam))
+        return out
 
     @property
     def connected(self):
@@ -283,9 +319,15 @@ class EdgeLink(threading.Thread):
         cam = header.get("cam")
         if cam not in (0, 1):
             return
+        dets = header.get("dets") or []
         with self._lock:
             self._frames += 1
-            self._dets[cam] = len(header.get("dets") or ())
+            self._dets[cam] = len(dets)
+            # Kept, not just counted: `nodes/self_driving` needs the detections
+            # themselves - they carry `card`/`card_conf`, which is the ONLY
+            # source on the boat for which cardinal a mark is. Bounded, because
+            # a detector having a bad moment must not grow this without limit.
+            self._detections[cam] = [d for d in dets if isinstance(d, dict)][:32]
             self._frame_at[cam] = time.time()
             if (fps := header.get("fps")) is not None:
                 self._fps = fps
