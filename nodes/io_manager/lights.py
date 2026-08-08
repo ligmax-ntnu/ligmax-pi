@@ -34,7 +34,7 @@ strip, so `COL` is what this module actually sends, at full 8-bit-per-channel
 precision - it is only 11 bytes regardless, so there is nothing to gain by
 cutting it further. `DATA` was the expensive one: 612 bytes to say the same 3
 bytes 101 times, and at 115200 baud that wire time was the whole reason the
-frame rate had a low ceiling (see the note by FRAME_PERIOD). Halving it to one
+frame rate had a low ceiling (see the note by DEFAULT_FPS). Halving it to one
 hex nibble per channel - 16 levels instead of 256 - halves that cost again, in
 exchange for banding nothing here ever has to look at, since this module never
 sends DATA itself; `tests/test_led.py`'s moving-dot bench script does, and
@@ -123,7 +123,16 @@ NUM_LEDS = int(os.environ.get("LIGMAX_LIGHTS_NUM_LEDS", "101"))
 # and the strobe. Frames identical to the last one sent are skipped, so a
 # solid colour still costs one frame per KEEPALIVE_PERIOD rather than 30 a
 # second.
-FRAME_PERIOD = 1.0 / float(os.environ.get("LIGMAX_LIGHTS_FPS", "30"))
+#
+# This is only the *default* now - `/led_control` can change it at runtime
+# with `set_fps()` (below), because a hand-authored per-pixel pattern is a
+# `DATA` frame (612 bytes half-precision, ~26 ms), and a fast multi-frame
+# animation wants headroom this module's own status colours never needed.
+# `DEFAULT_FPS`/`MIN_FPS`/`MAX_FPS` are mirrored in ligmax-server's server.py
+# so a bad value is a 400 there instead of reaching this clamp.
+DEFAULT_FPS = float(os.environ.get("LIGMAX_LIGHTS_FPS", "30"))
+MIN_FPS = 1.0
+MAX_FPS = 60.0
 KEEPALIVE_PERIOD = float(os.environ.get("LIGMAX_LIGHTS_RESEND_S", "1.0"))
 OPEN_RETRY_PERIOD = 5.0
 WRITE_TIMEOUT = 0.25
@@ -144,7 +153,8 @@ BREATHE_FLOOR = 0.04  # never fully off, so "powered" stays readable
 # per-pixel array, or a looping multi-frame animation, and push it down here to
 # preview on the real hull. It defaults to off and is never persisted, so a
 # restart always comes back showing the vessel's actual status, not whatever
-# was last authored.
+# was last authored. The refresh rate (`set_fps()`) is the same deal - a
+# runtime-only knob, back to DEFAULT_FPS on every restart.
 #
 # KILLED always wins. `main.py` never stops calling `set_status()` off the
 # real vessel status regardless of the override switch, and `_tick()` below
@@ -334,7 +344,8 @@ def data_frame(pixels):
 class Lights:
     """The hull's signal lights. `set_status()` drives the safety colour;
     `set_override()` and `set_pattern()` let an admin substitute a
-    hand-authored test pattern for it - see "Admin test-pattern override" above.
+    hand-authored test pattern for it, and `set_fps()` changes how often any
+    of it is redrawn - see "Admin test-pattern override" above.
 
     Owns one worker thread. The status is held as "the latest wanted", never
     accumulated: if it changes three times between two frames, the hull shows the
@@ -357,6 +368,7 @@ class Lights:
         self._override = False  # admin switch: show _pattern instead of the status colour
         self._pattern = None  # [(pixels, hold_s), ...] or None until an admin loads one
         self._pattern_total_s = 0.0
+        self._fps = DEFAULT_FPS  # how often _run() re-samples time and writes a frame
         self._last_frame = None  # the exact line last written, to skip repeats
         self._last_write = 0.0
         self._last_open_attempt = 0.0
@@ -424,6 +436,35 @@ class Lights:
                       "custom pattern" if enabled else "standard status")
             self._wake.set()
 
+    def set_fps(self, fps):
+        """Change how often the worker re-samples time and writes a frame.
+
+        This paces every pattern - the breathe, the strobe, and a loaded
+        custom pattern's playhead - not just the custom one, because they all
+        run through the same `_tick()`. Never blocks or raises: a bad value is
+        logged and ignored rather than allowed to stop the hull updating at
+        all, and an in-range one is clamped to [MIN_FPS, MAX_FPS] rather than
+        refused, since a typo like 600 is more useful clamped to 60 than
+        dropped.
+        """
+        if self._closed:
+            return
+        try:
+            value = float(fps)
+        except (TypeError, ValueError):
+            log.warning("ignored bad lights fps %r", fps)
+            return
+        if not math.isfinite(value):
+            log.warning("ignored bad lights fps %r", fps)
+            return
+        value = max(MIN_FPS, min(MAX_FPS, value))
+        with self._lock:
+            changed = value != self._fps
+            self._fps = value
+        if changed:
+            log.info("hull lights fps -> %.1f", value)
+            self._wake.set()
+
     def set_pattern(self, frames):
         """Load a looping test pattern: `[{"pixels": ..., "hold_ms": ...}, ...]`.
 
@@ -458,12 +499,13 @@ class Lights:
         """
         with self._lock:
             wanted, shown, shown_custom = self._wanted, self._shown, self._shown_custom
-            override, pattern = self._override, self._pattern
+            override, pattern, fps = self._override, self._pattern, self._fps
         block = {
             "link": self.available and self._frames > 0,
             "verified": False,  # no return path on this firmware
             "frames": self._frames,
             "override": override,
+            "fps": fps,
         }
         if pattern is not None:
             block["pattern_frames"] = len(pattern)
@@ -519,7 +561,9 @@ class Lights:
                 self._last_error = exc
                 log.error("lights worker: %s", exc)
             # Wake early on a status change, otherwise animate on the frame timer.
-            self._wake.wait(FRAME_PERIOD)
+            with self._lock:
+                period = 1.0 / self._fps
+            self._wake.wait(period)
 
     def _tick(self):
         with self._lock:

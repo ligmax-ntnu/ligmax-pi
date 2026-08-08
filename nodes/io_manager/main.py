@@ -48,7 +48,10 @@ What it does:
     autopilot directly; `set_mission` uploads an admin-laid route of grid
     waypoints as a real MAVLink mission (`mission.py`) for AUTO to run, and
     `clear_waypoints` empties it; `set_param` writes one stabilisation gain or
-    trim and `get_params` re-reads the lot (`tuning.py`). Every command is acked, so the dashboard's
+    trim and `get_params` re-reads the lot (`tuning.py`); `set_lights_mode`,
+    `set_lights_pattern` and `set_lights_fps` are `/led_control`'s
+    standard/custom switch, its pattern, and its refresh rate (`lights.py`).
+    Every command is acked, so the dashboard's
     command list shows what actually happened on the vessel - though
     `set_mode`/`arm`/`disarm` can only ack that the message was *sent*, not
     that the vehicle obeyed; watch `mode` and `telemetry.control.armed` on the
@@ -562,6 +565,15 @@ def handle_commands(
                 ok, result = True, "pattern loaded"
             else:
                 ok, result = False, "pattern rejected: see the log for why"
+        elif name == "set_lights_fps":
+            # How often the worker in lights.py redraws - the breathe and
+            # strobe as well as a loaded pattern's playhead. `set_fps()`
+            # clamps rather than refuses, so this always acks ok.
+            if lights is None:
+                ok, result = False, "no lights driver on this node"
+            else:
+                lights.set_fps(args.get("fps"))
+                ok, result = True, "fps updated"
         elif name == "get_params":
             # Re-read the lot. Automatic on connect and once a minute anyway;
             # this is the button for after someone has been in Mission Planner.
