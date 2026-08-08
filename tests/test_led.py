@@ -9,10 +9,12 @@ speed = 0
 print(f"Connecting to ESP32 on {PORT}...")
 
 def send_leds(leds):
-    # Join the list into a single 606-character string
+    # Join the list into a single 303-character string: one hex nibble per
+    # channel (half the precision of a full RRGGBB), which is what halves the
+    # DATA frame's wire time and buys the fps back.
     hex_string = "".join(leds)
-    
-    # Format and send the command exactly as the ESP32 expects: "DATA <606_hex_chars>\n"
+
+    # Format and send the command exactly as the ESP32 expects: "DATA <303_hex_chars>\n"
     command = f"DATA {hex_string}\n"
     esp32.write(command.encode('ascii'))
 
@@ -26,11 +28,11 @@ try:
     print("Running moving green dot test... (Press Ctrl+C to stop)")
     
     while True:
-        # Create a list of 101 black LEDs (hex string "000000")
-        leds = ["000000"] * NUM_LEDS
-        
-        # Set the current position to Bright Green ("00FF00")
-        leds[pos] = "00FF00"
+        # Create a list of 101 black LEDs (hex nibbles "000")
+        leds = ["000"] * NUM_LEDS
+
+        # Set the current position to Bright Green ("0F0")
+        leds[pos] = "0F0"
         
         send_leds(leds)
         
@@ -44,19 +46,19 @@ try:
         time.sleep(0.03*speed)
 
         if pos == 27:
-            leds = ["000000"] * NUM_LEDS
+            leds = ["000"] * NUM_LEDS
             send_leds(leds)
             time.sleep(0.03*22*speed)
 
 
         if pos == 51:
-            leds = ["000000"] * NUM_LEDS
+            leds = ["000"] * NUM_LEDS
             send_leds(leds)
             time.sleep(0.03*40*speed)
 
 
         if pos == 75:
-            leds = ["000000"] * NUM_LEDS
+            leds = ["000"] * NUM_LEDS
             send_leds(leds)
             time.sleep(0.03*22*speed)
             

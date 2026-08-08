@@ -20,10 +20,25 @@ chosen here rather than left to look like a fault:
 
 The link
 --------
-The ESP32 is now a dumb pixel driver. It listens at 115200 8N1 for exactly one
-command and answers nothing at all:
+The ESP32 is now a dumb pixel driver. It listens at 115200 8N1 for two
+commands and answers nothing at all:
 
-    DATA <NUM_LEDS*6 hex chars>\\n     set the whole strip, one RRGGBB per LED
+    DATA <NUM_LEDS*3 hex chars>\\n     one LED per RGB nibble - half the
+                                        precision of COL, so a full per-pixel
+                                        frame still costs half what it used to
+    COL <6 hex chars>\\n               set the whole strip to one full-precision
+                                        RRGGBB
+
+Every pattern `render()` produces is a single colour repeated across the
+strip, so `COL` is what this module actually sends, at full 8-bit-per-channel
+precision - it is only 11 bytes regardless, so there is nothing to gain by
+cutting it further. `DATA` was the expensive one: 612 bytes to say the same 3
+bytes 101 times, and at 115200 baud that wire time was the whole reason the
+frame rate had a low ceiling (see the note by FRAME_PERIOD). Halving it to one
+hex nibble per channel - 16 levels instead of 256 - halves that cost again, in
+exchange for banding nothing here ever has to look at, since this module never
+sends DATA itself; `tests/test_led.py`'s moving-dot bench script does, and
+gets the same fps headroom from it.
 
 The firmware used to own the animations and take `M<n>` mode commands, acking
 each with `OK M<n>`. It no longer does - `M0\\n` is accepted by the port, reaches
@@ -94,17 +109,21 @@ PORT = os.environ.get("LIGMAX_LIGHTS_PORT", "/dev/ttyAMA0")
 _DEBUG_UART = "/dev/ttyAMA10"
 BAUD = int(os.environ.get("LIGMAX_LIGHTS_BAUD", "115200"))
 
-# The strip the firmware expects. A frame is `DATA ` + NUM_LEDS*6 hex + `\n`;
-# get the count wrong and the ESP32 drops the whole line, so this has to match
-# the sketch's own LED count exactly.
+# The strip's pixel count, as flashed into the sketch. `COL` frames do not carry
+# it - the ESP32 fills its own array - so this is no longer part of the wire
+# format; it is kept for the pixel count in the `_open()` log line and for
+# whoever drives `DATA` directly.
 NUM_LEDS = int(os.environ.get("LIGMAX_LIGHTS_NUM_LEDS", "101"))
 
-# 101 LEDs is 612 bytes a frame, and 115200 8N1 carries 11.5 kB/s - so one frame
-# occupies the wire for ~53 ms and the ceiling is about 18 fps. 15 fps leaves
-# headroom for the UART to keep up while still being smooth enough for the
-# breathe. Frames identical to the last one sent are skipped, so a solid colour
-# costs one frame per KEEPALIVE_PERIOD rather than 15 a second.
-FRAME_PERIOD = 1.0 / float(os.environ.get("LIGMAX_LIGHTS_FPS", "15"))
+# A `COL` frame is 11 bytes flat, so at 115200 8N1 (11.5 kB/s) it costs under
+# 1 ms on the wire regardless of strip length - nothing like the old `DATA`
+# frame's 612 bytes (~53 ms, an ~18 fps ceiling) that forced 15 fps as a
+# compromise the breathe still looked a little stepped at. 30 fps at 11 bytes
+# uses less bandwidth than 15 fps used to and reads smooth on both the breathe
+# and the strobe. Frames identical to the last one sent are skipped, so a
+# solid colour still costs one frame per KEEPALIVE_PERIOD rather than 30 a
+# second.
+FRAME_PERIOD = 1.0 / float(os.environ.get("LIGMAX_LIGHTS_FPS", "30"))
 KEEPALIVE_PERIOD = float(os.environ.get("LIGMAX_LIGHTS_RESEND_S", "1.0"))
 OPEN_RETRY_PERIOD = 5.0
 WRITE_TIMEOUT = 0.25
@@ -197,8 +216,15 @@ def render(status, t):
 
 
 def frame(pixel):
-    """The wire format: `DATA ` + NUM_LEDS * RRGGBB + newline."""
-    return "DATA " + ("%02X%02X%02X" % pixel) * NUM_LEDS + "\n"
+    """The wire format: `COL ` + one RRGGBB + newline.
+
+    Every pattern in this module is a single colour for the whole strip (see
+    `render()`), so one triple is the whole frame - no reason to spell it out
+    once per LED and pay for that on a 115200 link. The firmware still accepts
+    `DATA <NUM_LEDS*3 hex>` (half-precision, one nibble per channel) for true
+    per-pixel patterns; nothing here needs it.
+    """
+    return "COL %02X%02X%02X\n" % pixel
 
 
 BLANK = frame((0, 0, 0))
