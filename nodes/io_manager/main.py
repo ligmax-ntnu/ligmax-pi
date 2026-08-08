@@ -24,6 +24,12 @@ What it does:
   * publishes what the trim actuators were told to do - battery-slider position
     and the two ama outputs (`trim.py`), commanded values, since neither
     actuator reports anything back.
+  * receives the **Jetson's feed on TCP 3401** (`edge_link.py`) - detections and
+    the front lidar, the latter already coloured by the cameras - reads this
+    Pi's own **aft lidar** off its serial port (`lidar.py`), and publishes both
+    as one boat-frame point cloud for the operator's chart (`scan.py`). Until
+    this existed nothing on the vessel bound 3401 at all, which is why the
+    Jetson still needs `LIDAR=1 ./run.sh` passed by hand.
   * pulls **RTK corrections** from the caster on the ground station and injects
     them into the autopilot, which forwards them to the GNSS (`rtk.py`). The
     base station is on 4G like the boat, so both ends dial out to the ground
@@ -63,12 +69,15 @@ from pymavlink import mavutil
 from config import LOGGING_PORT, pixhawk_port
 
 from .bms import BmsReader
+from .edge_link import ENABLED as EDGE_LINK_ENABLED, EdgeLink
 from .emergency_stop import BatteryHoming, EstopRelay
+from .lidar import LidarReader
 from .lights import Lights
 from .mission import MissionUploader, parse_waypoints
 from .navigation import Navigation
 from .propulsion import PropulsionWatch
 from .rtk import ENABLED as RTK_ENABLED, RtkClient, inject as inject_rtcm
+from .scan import ScanPublisher
 from .selfupdate import NAME as REPO_NAME, SelfUpdate, request_restart
 from .status import StatusMachine
 from .trim import Trim
@@ -85,6 +94,25 @@ MAVLINK_BAUD = int(os.environ.get("LIGMAX_MAVLINK_BAUD", "115200"))
 STREAM_RATE_HZ = 4  # only battery and status are consumed today
 HEARTBEAT_PERIOD = 1.0
 PUBLISH_PERIOD = 1.0
+
+# The lidar plot runs on its own tick, an order of magnitude faster than the rest
+# of the telemetry, because it is the only block anyone watches in real time -
+# you steer by it and you debug the mounting geometry with it, and at 1 Hz both
+# of those are guesswork. Battery, trim and status do not change meaningfully
+# inside a second and stay on PUBLISH_PERIOD.
+#
+# Frames still coalesce per key in the uploader, so this does NOT multiply the
+# whole frame by ten: nine of every ten POSTs carry only `scans`, and the tenth
+# carries everything. What it does cost is real, and measured rather than
+# guessed: a 270-point sweep from each unit, the front one carrying colour,
+# serialises to **9.5 kB**, so 10 Hz is about **95 kB/s (0.77 Mbit/s)** on the
+# same 4G uplink as the camera and the command channel. That is affordable and
+# it is not free - it is roughly what the camera stream costs. Turn it down with
+# LIGMAX_SCAN_PUBLISH_HZ if the link is tight; 0 disables the fast tick entirely
+# and the plot falls back to riding the 1 Hz publish.
+SCAN_PUBLISH_HZ = float(os.environ.get("LIGMAX_SCAN_PUBLISH_HZ", "10"))
+SCAN_PERIOD = (1.0 / SCAN_PUBLISH_HZ) if SCAN_PUBLISH_HZ > 0 else None
+
 LOOP_SLEEP = 0.01
 MAX_MESSAGES_PER_TICK = 200  # never let a backlog starve the heartbeat
 LINK_FAIL_DELAY = 5.0  # how long to wait before retrying a dead/missing link
@@ -614,7 +642,17 @@ def main():
     # chatter is the only thing anyone can see there. Warnings still come through.
     logging.getLogger("can").setLevel(logging.WARNING)
 
-    uploader = Uploader.from_env()
+    # The POST floor has to sit below the scan tick, or it becomes the thing
+    # limiting the plot rather than the network. The uploader sleeps
+    # `min_interval` AFTER each POST, so the achieved rate is 1/(RTT +
+    # min_interval): at the default 0.1 s floor a 10 Hz tick could never do
+    # better than ~7 Hz even on a perfect link, and on 4G rather less. Half the
+    # scan period leaves the round trip as the only real limit, which is the
+    # honest one - and coalescing means overshooting the link's capacity costs
+    # dropped duplicates, not a growing queue.
+    uploader = Uploader.from_env(
+        min_interval=0.1 if SCAN_PERIOD is None else min(0.1, SCAN_PERIOD / 2)
+    )
     uploader.attach_logging()  # everything logged from here on also goes up
     log.info(
         "telemetry uplink: %s (%s)",
@@ -667,6 +705,27 @@ def main():
         )
     bms = BmsReader()
 
+    # The two lidars, and the plot they become. Both own their own thread and
+    # this loop only ever reads their newest answer, exactly like the BMS above:
+    #
+    #   edge_link  binds TCP 3401 and takes the Jetson's stream - detections and
+    #              the front lidar, already coloured by the cameras. Until this
+    #              existed nothing on the vessel listened there at all, which is
+    #              why `ligmax-edge/run.sh` still needs `LIDAR=1` to be passed by
+    #              hand. It can be turned off with LIGMAX_EDGE_LINK_ENABLED=0.
+    #   aft        this Pi's own C1 on its USB serial port, facing astern. A
+    #              missing sensor costs a log line a minute and nothing else.
+    #   scans      puts both into the boat frame and hands the publish tick one
+    #              list of points - see scan.py for the hand-measured geometry.
+    edge_link = EdgeLink() if EDGE_LINK_ENABLED else None
+    if edge_link is not None:
+        edge_link.start()
+    else:
+        log.info("Jetson link disabled (LIGMAX_EDGE_LINK_ENABLED=0)")
+    aft_lidar = LidarReader()
+    aft_lidar.start()
+    scans = ScanPublisher(edge_link, aft_lidar)
+
     # RTK corrections, pulled from the caster on the ground station and injected
     # into the autopilot for forwarding to the GNSS. Its own thread and its own
     # socket; the loop only drains a deque. Off if LIGMAX_RTK_ENABLED=0, and a
@@ -686,6 +745,7 @@ def main():
     battery = None
     last_heartbeat = 0.0
     last_publish = 0.0
+    last_scan = 0.0
 
     try:
         while True:
@@ -834,6 +894,24 @@ def main():
             status = machine.evaluate(relay.engaged, propulsion.propulsion_permitted)
             lights.set_status(status)
 
+            # The lidar plot, on its own tick. Nothing else rides this one: the
+            # uploader coalesces per key, so these POSTs carry `scans` and the
+            # frame's own timestamp and nothing more, and the slow tick below
+            # still carries everything. Publishing is non-blocking - a link that
+            # cannot keep up coalesces sweeps rather than queueing them, so the
+            # operator sees the newest picture at whatever rate the 4G allows
+            # instead of a lengthening backlog of stale ones.
+            if SCAN_PERIOD is not None and now - last_scan >= SCAN_PERIOD:
+                last_scan = now
+                # Empty means neither lidar has turned since the last tick, which
+                # at 10 Hz is a good fraction of them. Skip the publish entirely
+                # rather than pass no fields: `publish()` with nothing in it is a
+                # deliberate keepalive, and one of those ten times a second is
+                # both pointless and indistinguishable from a real frame in the
+                # dashboard's rate counter.
+                if scan_fields := scans.publish_fields():
+                    uploader.publish(**scan_fields)
+
             if now - last_publish >= PUBLISH_PERIOD:
                 # Published even when every block is empty: a frame arriving at all
                 # is how the dashboard knows we are on the air, and `estop` is what
@@ -857,6 +935,11 @@ def main():
                     # signature of a receiver that is not taking RTCM at all.
                     telemetry["rtk"] = rtk.telemetry()
 
+                # Both lidars, reported separately: they fail for unrelated
+                # reasons and by different routes, and "no returns" astern looks
+                # exactly like "clear water" astern unless the panel says which.
+                telemetry["lidar"] = scans.telemetry()
+
                 # The pack's own figures if the BMS answered, the autopilot's
                 # estimate if not, and `source` says which. Never a blend.
                 battery_block = merge_battery(
@@ -878,12 +961,17 @@ def main():
                 # `telemetry.gps` alone fills the figures and leaves the map
                 # empty. `boat` comes back explicitly null when the position is
                 # gone, because frames merge (navigation.world()).
-                uploader.publish(
-                    status=status,
-                    telemetry=telemetry,
-                    estop=relay.engaged,
+                frame = {
+                    "status": status,
+                    "telemetry": telemetry,
+                    "estop": relay.engaged,
                     **navigation.world(),
-                )
+                }
+                if SCAN_PERIOD is None:
+                    # The fast tick is switched off, so the plot rides this one
+                    # rather than never going out at all.
+                    frame.update(scans.publish_fields())
+                uploader.publish(**frame)
                 last_publish = now
 
             time.sleep(LOOP_SLEEP)
@@ -907,6 +995,13 @@ def main():
         time.sleep(0.15)  # long enough for the worker to get one write out
         lights.close()
         bms.close()
+        # Both lidars before the autopilot link: the aft one holds a USB serial
+        # port that the next run has to be able to reopen, and a C1 left
+        # streaming into a closed port is what makes the following start fail
+        # with `Wrong body size` (lidar.py).
+        aft_lidar.close()
+        if edge_link is not None:
+            edge_link.close()
         if rtk is not None:
             rtk.close()
         if master is not None:
