@@ -68,6 +68,13 @@ republished. A point cloud that stopped updating but stays on the chart looks
 exactly like a sea that stopped changing, and this is the same rule
 `navigation.py` follows when it sends `boat: null` rather than leave the vessel
 drawn where it was thirty seconds ago.
+
+Both ages are measured on THIS machine's clock: the aft sweep from its own
+`t_end`, stamped here, and the front sweep from the instant it landed on 3401.
+The front cloud carries the Jetson's `t_start`/`t_end` too, in the same epoch
+seconds, and they are not used for this on purpose - see `_front()`. Clock
+disagreement between the two machines is reported as `clock_offset_s` and
+never allowed to decide whether a sensor exists.
 """
 
 import logging
@@ -223,17 +230,28 @@ class ScanPublisher:
         """The Jetson's newest fresh sweep, and whether it is one we have not sent."""
         if self.edge_link is None:
             return None, False
-        cloud, seq = self.edge_link.front_cloud()
+        cloud, seq, arrived_at = self.edge_link.front_cloud()
         if not cloud or seq == 0:
             return None, False
-        # Age is taken from the sweep's own end time, i.e. the boat clock at the
-        # moment the mirror finished the rotation - not from when it arrived, so
-        # a backed-up link cannot make a stale cloud look fresh. Both machines
-        # run NTP off the same vessel network; a clock skew between them shows
-        # up here as a sweep that is permanently too old to publish, which is
-        # the safe direction to be wrong in.
-        t_end = cloud.get("t_end")
-        if t_end is not None and time.time() - float(t_end) > self.max_age:
+        # Aged on OUR clock, from the instant the sweep landed - deliberately
+        # NOT from the `t_end` the Jetson stamped into the cloud.
+        #
+        # Both are epoch seconds and subtracting one from the other looks
+        # right; it measures the whole pipeline, sensor to here, instead of
+        # just the link. But they come from two machines' wall clocks, and any
+        # disagreement bigger than max_age makes every sweep read as ancient -
+        # so a perfectly healthy front lidar is dropped on every single tick,
+        # forever, while the aft unit stamped on this machine carries on fine.
+        # That is not a hypothetical: it is what the first hardware run looked
+        # like (3701 sweeps received, 0 points plotted), and it is worse than
+        # the problem it was guarding against, because a link so backed up that
+        # it hands us two-second-old rotations announces itself in `sweep_hz`
+        # anyway.
+        #
+        # The cross-machine offset is still worth knowing, so `edge_link`
+        # measures and publishes it as `clock_offset_s` rather than quietly
+        # dying of it.
+        if arrived_at is None or time.time() - arrived_at > self.max_age:
             return None, False
         return self._cached("front_lidar", seq, lambda: front_scan(cloud))
 

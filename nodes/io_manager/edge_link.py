@@ -22,7 +22,7 @@ server socket that accepts one connection at a time, and a Jetson restart just
 reconnects.
 
     link = EdgeLink(); link.start()
-    cloud, seq = link.front_cloud()       # newest sweep, rig frame, or (None, 0)
+    cloud, seq, at = link.front_cloud()   # newest sweep, rig frame, + OUR arrival stamp
 
 Everything is read on this thread and handed over under a lock, because the
 caller is the loop that owes the autopilot a 1 Hz heartbeat and must never
@@ -96,7 +96,8 @@ class EdgeLink(threading.Thread):
 
         self._cloud = None          # newest KIND_LIDAR payload, rig frame
         self._cloud_seq = 0         # our own counter, not the Jetson's
-        self._cloud_at = None       # when it landed, boat clock
+        self._cloud_at = None       # when it landed, OUR clock
+        self._cloud_t_end = None    # when the JETSON says the rotation ended
 
         self._frames = 0
         self._sweeps = 0
@@ -109,15 +110,24 @@ class EdgeLink(threading.Thread):
 
     # ------------------------------------------------------------------ access
     def front_cloud(self):
-        """`(cloud, seq)` - the newest front sweep, or `(None, 0)`.
+        """`(cloud, seq, arrived_at)` - the newest front sweep, or `(None, 0, None)`.
 
         `cloud` is the columnar payload exactly as it came off the wire: rig
         frame, +x starboard, +y down, +z forward, origin at the front lidar.
         `seq` counts sweeps received here, so a caller can tell a new sweep
         from the same one seen twice without trusting the sender's numbering.
+
+        `arrived_at` is OUR `time.time()` at the moment the sweep landed, and it
+        is the only timestamp a caller may age it against. The cloud also
+        carries the Jetson's own `t_start`/`t_end`, in the same units, which is
+        exactly what makes them dangerous: they are stamped by a different
+        machine's wall clock, and judging freshness across that boundary turns
+        any clock disagreement into a sensor that is silently never fresh. See
+        `clock_offset_s` in `telemetry()`, which measures that gap instead of
+        being destroyed by it.
         """
         with self._lock:
-            return self._cloud, self._cloud_seq
+            return self._cloud, self._cloud_seq, self._cloud_at
 
     @property
     def connected(self):
@@ -152,6 +162,18 @@ class EdgeLink(threading.Thread):
                 skew = cloud.get("skew_ms")
                 if isinstance(skew, (list, tuple)):
                     block["skew_ms"] = [s for s in skew if s is not None]
+                # How far apart the two machines' wall clocks are: our arrival
+                # instant minus the Jetson's end-of-rotation instant. The true
+                # flight time is a LAN hop, single-digit milliseconds, so
+                # anything past a second is the clocks disagreeing and not the
+                # link being slow.
+                #
+                # Reported, never acted on. Freshness is judged on our own clock
+                # (`front_cloud`), so an offset here costs the sweep timestamps
+                # their meaning without costing the operator the sensor.
+                if self._cloud_t_end is not None and self._cloud_at is not None:
+                    block["clock_offset_s"] = round(
+                        self._cloud_at - float(self._cloud_t_end), 2)
             if self.last_error:
                 block["last_error"] = self.last_error
         return block
@@ -239,10 +261,15 @@ class EdgeLink(threading.Thread):
             cloud = header.get("lidar")
             if not isinstance(cloud, dict):
                 return
+            t_end = cloud.get("t_end")
             with self._lock:
                 self._cloud = cloud
                 self._cloud_seq += 1
                 self._cloud_at = time.time()
+                # Kept only to measure how far apart the two clocks are. A
+                # sender that omits it, or sends something that is not a number,
+                # costs us the measurement and nothing else.
+                self._cloud_t_end = t_end if isinstance(t_end, (int, float)) else None
                 self._sweeps += 1
             return
 
