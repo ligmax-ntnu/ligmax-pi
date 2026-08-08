@@ -47,7 +47,8 @@ What it does:
     GPIO lines in `emergency_stop.py`; `set_mode` and `arm`/`disarm` ask the
     autopilot directly; `set_mission` uploads an admin-laid route of grid
     waypoints as a real MAVLink mission (`mission.py`) for AUTO to run, and
-    `clear_waypoints` empties it. Every command is acked, so the dashboard's
+    `clear_waypoints` empties it; `set_param` writes one stabilisation gain or
+    trim and `get_params` re-reads the lot (`tuning.py`). Every command is acked, so the dashboard's
     command list shows what actually happened on the vessel - though
     `set_mode`/`arm`/`disarm` can only ack that the message was *sent*, not
     that the vehicle obeyed; watch `mode` and `telemetry.control.armed` on the
@@ -87,6 +88,7 @@ from .scan import ScanPublisher
 from .selfupdate import NAME as REPO_NAME, SelfUpdate, request_restart
 from .status import StatusMachine
 from .trim import Trim
+from .tuning import TUNABLES, Tuning
 from .upload import Uploader
 
 # /dev/ttyACM0 is not stable across a replug - it can come back as ttyACM1, and
@@ -411,6 +413,7 @@ def handle_commands(
     navigation=None,
     master=None,
     mission=None,
+    tuning=None,
 ):
     """Run the operator's queued commands and ack each one.
 
@@ -423,12 +426,13 @@ def handle_commands(
     says "failed: not implemented" instead of leaving the operator watching a
     command sit at "sent" until it expires.
 
-    Three commands are the exception to acking here, because each rides on an
+    Four commands are the exception to acking here, because each rides on an
     exchange that can span several loop ticks: `update` starts a `git pull` on a
     worker thread and is acked later by `finish_update()`; `set_mission` and
     `clear_waypoints` start a MAVLink mission exchange and are acked later by
-    `finish_mission()` - both because neither must block the loop that owes the
-    autopilot its 1 Hz heartbeat.
+    `finish_mission()`; `set_param` waits for the autopilot to echo back the
+    value it stored and is acked by `finish_tuning()`. None of them may block the
+    loop that owes the autopilot its 1 Hz heartbeat.
     """
     for command in uploader.commands():
         name = str(command.get("name", ""))
@@ -516,6 +520,35 @@ def handle_commands(
                 global_points = [navigation.to_global(x, y) for x, y in points]
                 mission.upload(master, str(command_id), points, global_points)
                 continue  # acked by finish_mission() once MISSION_ACK lands
+        elif name == "set_param":
+            # One stabilisation gain or trim, straight into the flight
+            # controller's own storage. `tuning.py` holds the whitelist and the
+            # ranges: a name that is not on it, or a value outside its bounds, is
+            # refused here rather than written and regretted. The ack waits for
+            # the autopilot to echo the value it actually stored.
+            if master is None:
+                ok, result = False, "no autopilot link"
+            elif tuning is None:
+                ok, result = False, "no tuning handler on this node"
+            elif command_id is None:
+                ok, result = False, "set_param needs a command id to ack against"
+            else:
+                queued, why = tuning.queue_write(
+                    str(command_id), args.get("name"), args.get("value")
+                )
+                if queued:
+                    continue  # acked by finish_tuning() once PARAM_VALUE lands
+                ok, result = False, why
+        elif name == "get_params":
+            # Re-read the lot. Automatic on connect and once a minute anyway;
+            # this is the button for after someone has been in Mission Planner.
+            if master is None:
+                ok, result = False, "no autopilot link"
+            elif tuning is None:
+                ok, result = False, "no tuning handler on this node"
+            else:
+                tuning.request_all(f"dashboard command {command_id}")
+                ok, result = True, f"re-reading {len(TUNABLES)} parameters"
         elif name == "update":
             # Every node reads the same command queue, so check this one is ours
             # before pulling somebody else's repo into our checkout.
@@ -589,6 +622,19 @@ def finish_mission(uploader, mission):
         uploader.publish(path={"points": grid_points, "kind": "reference", "label": "mission"})
     elif kind == "clear":
         uploader.publish(paths=[])
+
+
+def finish_tuning(uploader, tuning):
+    """Ack every parameter write that has settled, mirroring `finish_mission()`.
+
+    A write is only acked once the autopilot has echoed the value it stored, so
+    "acked" here means the number is in the flight controller's own storage and
+    will still be there after a power cycle - which is the whole reason the
+    dashboard can present this as saving rather than as sending.
+    """
+    while (outcome := tuning.take()) is not None:
+        command_id, ok, message = outcome
+        uploader.ack(command_id, "acked" if ok else "failed", message)
 
 
 def safety_telemetry(relay, homing, mavlink_up, lights=None):
@@ -702,6 +748,10 @@ def main():
     # thread or socket of its own; every call takes `master` explicitly, like the
     # heartbeat send below, so it can never race that connection object.
     mission = MissionUploader()
+    # The roll and pitch gains and trims, which live on the flight controller as
+    # ArduPilot parameters. Reads itself in as soon as there is a link; writes
+    # only what the operator asks for. Owns no thread either - see tuning.py.
+    tuning = Tuning()
     if not trim.configured:
         log.warning(
             "no servo channels configured for the trim readback, so the battery "
@@ -771,6 +821,11 @@ def main():
                     modes = sorted((master.mode_mapping() or {}).keys())
                     if modes:
                         uploader.publish(available_modes=modes)
+                    # Load the tuning table without being asked, so the
+                    # dashboard's fields are filled in by the time anyone
+                    # opens the page. Nothing is sent to the autopilot
+                    # until `pump()` below paces it out.
+                    tuning.request_all("autopilot link up")
                 except Exception as exc:  # noqa: BLE001 - Pixhawk may not be plugged in
                     log.error("MAVLink link to %s failed: %s", pixhawk_port(), exc)
                     next_connect_attempt = now + LINK_FAIL_DELAY
@@ -817,6 +872,14 @@ def main():
                                 str(message.text).strip(),
                                 name="pixhawk",
                             )
+                        elif kind == "PARAM_VALUE":
+                            # The stabilisation gains and trims, both when we
+                            # asked for them and when a write is echoed back.
+                            # Its own branch rather than the chain below: the
+                            # autopilot answers a full param fetch from any GCS
+                            # on this link, so this is the one message type that
+                            # can arrive in bulk from something else entirely.
+                            tuning.handle(message)
                         elif not navigation.handle(message):
                             # Position, course and mission progress, then a mission
                             # upload/clear exchange in flight, then the servo rail.
@@ -830,6 +893,11 @@ def main():
                     # queued forever - cheap to check even when nothing is
                     # pending.
                     mission.check_timeout()
+
+                    # One parameter message per tick at most, paced inside: the
+                    # background re-read, and whatever the operator has just
+                    # asked to be saved. Cheap when there is nothing to do.
+                    tuning.pump(master)
 
                     # RTCM straight back down the same link. Bounded per tick, so
                     # a burst after a caster reconnect cannot delay the heartbeat
@@ -864,6 +932,7 @@ def main():
                     navigation.link_down()
                     trim.link_down()
                     mission.link_down()
+                    tuning.link_down()
                     machine.note_link_down()
                     # Not just lost telemetry: the Pixhawk shares the rail the
                     # E-stop cuts, so on this boat a dropped link is itself
@@ -883,6 +952,7 @@ def main():
                 navigation,
                 master,
                 mission,
+                tuning,
             )
             if finish_update(uploader, updater):
                 # Leave the loop the ordinary way: the `finally` below flushes the
@@ -890,6 +960,7 @@ def main():
                 restart_for_update = True
                 break
             finish_mission(uploader, mission)
+            finish_tuning(uploader, tuning)
 
             # Who is in charge, evaluated every loop rather than every publish: the
             # lights should follow the boat's actual state at loop rate, not at the
@@ -961,6 +1032,13 @@ def main():
                     telemetry.setdefault(key, {}).update(block)
                 if trim_block := trim.telemetry():
                     telemetry["trim"] = trim_block
+
+                # The gains and trims themselves, as opposed to what the
+                # actuators are doing with them. Always published, even before
+                # anything has answered: `known`/`of` and `missing` are how the
+                # dashboard says "still reading" or "battery_slider.lua is not
+                # loaded" instead of showing empty fields with no explanation.
+                telemetry["tuning"] = tuning.telemetry()
 
                 # `origin` and `boat` are what put the vessel on the chart: the
                 # dashboard draws a metre grid, not degrees, so a GNSS fix in
