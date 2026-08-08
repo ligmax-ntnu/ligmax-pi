@@ -1,0 +1,27 @@
+# Stable names for the boat's USB serial devices.
+#
+# ttyUSB0/ttyACM0 are handed out in probe order, so the lidar and the autopilot
+# can trade numbers across a reboot or a replug. These symlinks follow the
+# hardware instead. Nothing should open a raw tty name; see config.py.
+#
+#   sudo cp 99-ligmax-serial.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=tty
+#   ls -l /dev/ligmax-*
+#
+# MODE/GROUP are left alone: the Pi images already put ttyUSB/ttyACM in
+# `dialout`, and `admin` is in it. Check with `id -nG admin` if a port opens as
+# root but not as the service user.
+
+# RPLidar C1 -> Silicon Labs CP2102N USB-UART bridge.
+# Matched on vendor/product, not on ATTRS{serial}, so a replacement lidar works
+# without editing this file. If a *second* CP210x ever gets plugged into the
+# boat, add ATTRS{serial}=="84bb03ad556eef119ddee0c2c169b110" here to keep them
+# apart - the two would otherwise race for the same symlink.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="ligmax-lidar"
+
+# Holybro Pixhawk 6C. It exposes two CDC-ACM interfaces on one USB device:
+# interface 00 is the MAVLink port, interface 02 is the second/debug one. Match
+# the interface number, or the symlink lands on whichever enumerated first and
+# the link opens cleanly but never receives a heartbeat.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="3162", ATTRS{idProduct}=="0053", ENV{ID_USB_INTERFACE_NUM}=="00", SYMLINK+="ligmax-pixhawk"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="3162", ATTRS{idProduct}=="0053", ENV{ID_USB_INTERFACE_NUM}=="02", SYMLINK+="ligmax-pixhawk-debug"

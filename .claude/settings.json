@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(systemctl is-enabled *)",
+      "Bash(python3 -c \"import rplidar,serial;print\\(rplidar.__file__, serial.__version__\\)\")",
+      "Bash(sudo fuser -v /dev/ttyUSB0 /dev/ttyACM0)",
+      "Bash(timeout 25 python3 /home/admin/ligmax-pi/tests/test_lidar.py)",
+      "Bash(lsusb)",
+      "Bash(sudo cp /home/admin/ligmax-pi/99-ligmax-serial.rules /etc/udev/rules.d/)",
+      "Bash(sudo udevadm control --reload)",
+      "Bash(sudo udevadm trigger --subsystem-match=tty)",
+      "Bash(python3 -c \"from config import pixhawk_port, lidar_port; print\\(pixhawk_port\\(\\), lidar_port\\(\\)\\)\")",
+      "Bash(python3 -c \"import ast,sys; ast.parse\\(open\\('nodes/io_manager/main.py'\\).read\\(\\)\\)\")",
+      "Bash(rm -f /home/admin/ligmax-pi/lidar_c1_data_*.csv)",
+      "Bash(journalctl -u ligmax-pi --since \"-20s\" --no-pager)",
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}

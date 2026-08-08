@@ -9,6 +9,8 @@
 #   LIGMAX_BOAT_KEY=<this boat's ingest key from ligmax-server/.env>
 #   EOF
 #   sudo chmod 640 /etc/ligmax/node.env
+#   sudo cp 99-ligmax-serial.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=tty
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now ligmax-pi
 #
@@ -16,6 +18,11 @@
 # cycle. `start` alone lasts until the next reboot. Check it took:
 #   systemctl is-enabled ligmax-pi        -> enabled
 #   journalctl -u ligmax-pi -f
+#
+# The udev step is what keeps the autopilot and the lidar from swapping device
+# numbers across a reboot; without it `opening /dev/ttyACM0` is a coin flip.
+# Check it took:
+#   ls -l /dev/ligmax-*                   -> lidar, pixhawk, pixhawk-debug
 
 [Unit]
 Description=Ligmax Pi node (main.py) + updater

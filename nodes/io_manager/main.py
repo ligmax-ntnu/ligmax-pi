@@ -60,7 +60,7 @@ import time
 
 from pymavlink import mavutil
 
-from config import LOGGING_PORT
+from config import LOGGING_PORT, pixhawk_port
 
 from .bms import BmsReader
 from .emergency_stop import BatteryHoming, EstopRelay
@@ -74,10 +74,12 @@ from .status import StatusMachine
 from .trim import Trim
 from .upload import Uploader
 
-# /dev/ttyACM0 is not stable across a replug - it can come back as ttyACM1, so
-# a udev symlink is the real fix. The override also takes a SITL endpoint, e.g.
+# /dev/ttyACM0 is not stable across a replug - it can come back as ttyACM1, and
+# on a reboot the number depends on probe order. `pixhawk_port()` resolves the
+# udev symlink instead (config.py, 99-ligmax-serial.rules) and is re-read on
+# every connect() so a device that appears late still gets found.
+# LIGMAX_MAVLINK_DEVICE still overrides, and still takes a SITL endpoint, e.g.
 # LIGMAX_MAVLINK_DEVICE=udpin:127.0.0.1:14550
-MAVLINK_DEVICE = os.environ.get("LIGMAX_MAVLINK_DEVICE", "/dev/ttyACM0")
 MAVLINK_BAUD = int(os.environ.get("LIGMAX_MAVLINK_BAUD", "115200"))
 
 STREAM_RATE_HZ = 4  # only battery and status are consumed today
@@ -578,8 +580,12 @@ def connect():
     the heartbeat within HEARTBEAT_WAIT_S. Callers decide what "not connected"
     should mean; this function never blocks forever.
     """
-    log.info("opening %s at %s baud", MAVLINK_DEVICE, MAVLINK_BAUD)
-    master = mavutil.mavlink_connection(MAVLINK_DEVICE, baud=MAVLINK_BAUD)
+    # Resolved per attempt, not at import: on a cold boot this node can be up
+    # before the autopilot has finished enumerating, and a path captured at
+    # import time would then be the fallback name forever.
+    device = pixhawk_port()
+    log.info("opening %s at %s baud", device, MAVLINK_BAUD)
+    master = mavutil.mavlink_connection(device, baud=MAVLINK_BAUD)
     if master.wait_heartbeat(timeout=HEARTBEAT_WAIT_S) is None:
         master.close()
         raise TimeoutError(f"no heartbeat within {HEARTBEAT_WAIT_S:.0f}s")
@@ -700,7 +706,7 @@ def main():
                     if modes:
                         uploader.publish(available_modes=modes)
                 except Exception as exc:  # noqa: BLE001 - Pixhawk may not be plugged in
-                    log.error("MAVLink link to %s failed: %s", MAVLINK_DEVICE, exc)
+                    log.error("MAVLink link to %s failed: %s", pixhawk_port(), exc)
                     next_connect_attempt = now + LINK_FAIL_DELAY
 
             if master is not None:
@@ -781,7 +787,7 @@ def main():
                         )
                         last_heartbeat = now
                 except Exception as exc:  # noqa: BLE001 - a dropped link must not kill the node
-                    log.error("MAVLink link to %s dropped: %s", MAVLINK_DEVICE, exc)
+                    log.error("MAVLink link to %s dropped: %s", pixhawk_port(), exc)
                     master.close()
                     master = None
                     sys_status = None
