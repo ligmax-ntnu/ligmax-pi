@@ -24,6 +24,12 @@ What it does:
   * publishes what the trim actuators were told to do - battery-slider position
     and the two ama outputs (`trim.py`), commanded values, since neither
     actuator reports anything back.
+  * reads the **stabilisation tuning** off the flight controller and writes back
+    what the operator changes (`tuning.py`): the roll gains and trim in
+    `amas.lua`'s SCR_USER1..6 and the pitch PID and trim in
+    `battery_slider.lua`'s BSLD_*. Reading is automatic and repeated, writing is
+    ArduPilot's own set-and-save, so a tune survives a reboot of everything in
+    the chain without anyone having to write it down.
   * receives the **Jetson's feed on TCP 3401** (`edge_link.py`) - detections and
     the front lidar, the latter already coloured by the cameras - reads this
     Pi's own **aft lidar** off its serial port (`lidar.py`), and publishes both
