@@ -371,14 +371,22 @@ class Node:
         )
 
     def _publish_route(self, state):
-        """The plan as the chart's amber ideal-route layer. NJORD §11.4."""
+        """The plan as the chart's ideal-route layer, roles and all. NJORD §11.4.
+
+        The roles ride along with the points because a Njord course is a list of
+        places *plus what to do between them*, and a chart that draws only the
+        line cannot show that leg 5 is a dock and leg 3 obeys the buoy rules.
+        That is also the cheapest place to catch a role typed into the wrong row:
+        it is visible on the map the moment the upload is acked, rather than at
+        the moment the boat sails past a gate on the wrong side.
+        """
         if self.pilot.plan is None or state is None or not state.origin:
             return
-        points = self.pilot.plan.reference_path(state.origin)
-        if points:
+        layer = self.pilot.plan.reference_layer(state.origin)
+        if layer["points"]:
             self.link.telemetry(
                 path={
-                    "points": points,
+                    **layer,
                     "kind": "reference",
                     "label": f"plan: {self.pilot.plan.name}",
                 }

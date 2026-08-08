@@ -285,6 +285,45 @@ class Plan:
                 points.append([round(xy[0], 2), round(xy[1], 2)])
         return points
 
+    def reference_layer(self, origin):
+        """The route *and what each leg is for*, for the operator's chart.
+
+        `reference_path` alone gives the dashboard a line and nothing else, so a
+        course drawn from it cannot show that waypoint 5 is a dock and waypoint 3
+        obeys the buoy rules - which is the one thing about a Njord plan worth
+        seeing before it is run, and the thing a mis-typed role hides.
+
+        The three arrays run in lockstep with `points`, and `indices` says which
+        waypoint each entry came from: a waypoint that will not convert is
+        dropped from all four together rather than silently shifting the roles
+        one place along, which would paint a plausible and completely wrong
+        course. (Nothing drops in practice - `world()` only fails without an
+        origin, which the caller has already checked - but a mirrored world is
+        the failure most likely to survive a casual glance, so it is made
+        impossible rather than unlikely.)
+        """
+        points, roles, names, indices = [], [], [], []
+        for waypoint in self.waypoints:
+            xy = waypoint.world(origin)
+            if xy is None:
+                continue
+            points.append([round(xy[0], 2), round(xy[1], 2)])
+            roles.append(waypoint.role)
+            names.append(waypoint.name)
+            indices.append(waypoint.index)
+        return {
+            "points": points,
+            "roles": roles,
+            "names": names,
+            "indices": indices,
+            # Where the boat is up to *as of this upload*. It goes stale as the
+            # boat advances, and the dashboard prefers the live cursor out of
+            # `telemetry.autopilot.plan.index` - which is published at 2 Hz and
+            # costs nothing extra - rather than this being re-sent every tick.
+            "target_index": self.index,
+            "passed_index": self.last_passed,
+        }
+
     def bearing_of_buoyage(self, waypoint):
         """The direction of buoyage on the leg into `waypoint`, degrees."""
         if waypoint is not None and waypoint.channel_bearing is not None:
