@@ -130,8 +130,13 @@ The two fallbacks exist if that check fails:
 
 * `LIGMAX_LATERAL_MODE=rc` **plus** `LIGMAX_LATERAL_RC_CHAN=<n>` — the Pi drives
   the channel directly. It refuses to guess a channel deliberately:
-  `pixhalwk.py` already uses 16 for ride height and 15 is the remote's
-  contribution to the same sum, so neither is free.
+  `pixhalwk.py` uses **14** for ride height (moved off 16 on 2026-08-09) and the
+  remote's contribution to the same sum is now on **3**. Per `amas.lua`'s table
+  the only channel above 8 still free is **13** — 9..12 are the inhibit switch,
+  the two trim knobs and the side thruster, and **15/16 carry the radio link's
+  own telemetry**, which is what forced the move: 16 sat at a steady ~2006 µs
+  with nothing mapped to it, and `amas.lua` reads that as full-speed creep.
+  Do not park anything on 15 or 16.
 * `LIGMAX_LATERAL_MODE=none` — honest, and it works: parallel docking degrades
   to an angled approach (`dock.Dock._crab`).
 
@@ -685,7 +690,13 @@ and it is one of seven things, in this order: not engaged / no state / comms los
   was kept and extended because the frontend mirrors its enum values.
 * `nodes/logging/main.py` and `nodes/balancing/main.py` are still empty stubs and
   still `"on": False` in the supervisor.
-* `nodes/io_manager/pixhalwk.py` (ride height) is still not wired into
-  `main.py`. The autonomy node does not touch ride height at all.
+* `nodes/io_manager/pixhalwk.py` (ride height) **is now wired into `main.py`**
+  (uncommitted as of 2026-08-09): a `RideHeight` object refreshed every loop
+  tick, driven by the `set_ride_height` command, on **RC 14**. It is inert until
+  an operator asks — until the first command the node does not write the channel
+  at all. `stop()` holds 1500 rather than releasing, because releasing hands the
+  channel back to a transmitter that may have it parked off centre, and
+  `amas.lua` reads it as a velocity. The autonomy node still does not touch ride
+  height at all. **Untested on hardware.**
 * There is no `CLAUDE.md`; the docstrings are the documentation, which works
   because they are unusually thorough. Keep it that way.

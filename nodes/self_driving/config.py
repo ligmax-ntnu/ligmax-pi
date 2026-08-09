@@ -616,7 +616,7 @@ DOCK_LATERAL_TOLERANCE_M = _f("LIGMAX_AP_DOCK_LATERAL_M", 0.25)
 #              the autopilot is NOT configured that way - it ignores vy.
 #   "rc"       the Pi drives it directly with an RC override on
 #              LIGMAX_LATERAL_RC_CHAN, the way `io_manager/pixhalwk.py` drives
-#              the ride height on channel 16.
+#              the ride height on channel 14.
 #   "none"     no lateral thrust. Parallel docking falls back to an angled
 #              approach and a pivot, which is slower and less tidy but works.
 #

@@ -93,6 +93,7 @@ import json
 import logging
 import os
 import platform
+import shutil
 import subprocess
 import time
 
@@ -123,12 +124,19 @@ def _git_head(repo="/home/admin/ligmax-pi"):
 
 
 def _free_mb(path):
-    """Free megabytes on the filesystem holding `path`, or None."""
+    """Free megabytes on the filesystem holding `path`, or None.
+
+    `shutil.disk_usage` rather than `os.statvfs`, which exists only on POSIX.
+    The recorder itself only ever runs on the Pi, but `tests/test_autopilot.py`
+    exercises it, and the crew runs that suite on the **Windows** ground
+    station minutes before a start - where the statvfs version raised
+    `AttributeError` and took the recorder test down with it. Identical figure
+    on Linux, and the same call `ligmax-server/ligmax_gui/trips.py` uses.
+    """
     try:
-        stat = os.statvfs(path)
+        return shutil.disk_usage(path).free / (1024.0 * 1024.0)
     except OSError:
         return None
-    return (stat.f_bavail * stat.f_frsize) / (1024.0 * 1024.0)
 
 
 def _environment():

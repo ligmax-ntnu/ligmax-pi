@@ -50,16 +50,20 @@ What it does:
     `clear_waypoints` empties it; `set_param` writes one stabilisation gain or
     trim and `get_params` re-reads the lot (`tuning.py`); `set_lights_mode`,
     `set_lights_pattern` and `set_lights_fps` are `/led_control`'s
-    standard/custom switch, its pattern, and its refresh rate (`lights.py`).
+    standard/custom switch, its pattern, and its refresh rate (`lights.py`);
+    `set_ride_height` walks the amas up or down as an RC override on channel 14
+    (`pixhalwk.py`), refreshed here every loop because the autopilot expires
+    one that goes quiet, and `release_ride_height` hands that channel back to
+    the receiver - a separate command because it is not a stop.
     Every command is acked, so the dashboard's
     command list shows what actually happened on the vessel - though
     `set_mode`/`arm`/`disarm` can only ack that the message was *sent*, not
     that the vehicle obeyed; watch `mode` and `telemetry.control.armed` on the
     next heartbeat for that.
 
-What it does not do yet: ride-height control (`pixhalwk.set_ride_height`), and
-the single-point `goto` command still has no GUIDED-mode implementation - only
-a laid mission (AUTO) runs today. Nothing here disarms the autopilot on its
+What it does not do yet: the single-point `goto` command still has no
+GUIDED-mode implementation - only a laid mission (AUTO) runs today. Nothing here
+disarms the autopilot on its
 own initiative either - the E-stop cuts propulsion *power* at the contactor
 rather than asking the Pixhawk nicely.
 
@@ -86,6 +90,7 @@ from .lidar import LidarReader
 from .lights import Lights
 from .mission import MissionUploader, parse_waypoints
 from .navigation import Navigation
+from .pixhalwk import RideHeight
 from .propulsion import PropulsionWatch
 from .rtk import ENABLED as RTK_ENABLED, RtkClient, inject as inject_rtcm
 from .scan import ScanPublisher
@@ -426,6 +431,7 @@ def handle_commands(
     tuning=None,
     lights=None,
     bridge=None,
+    ride_height=None,
 ):
     """Run the operator's queued commands and ack each one.
 
@@ -566,6 +572,40 @@ def handle_commands(
                 if queued:
                     continue  # acked by finish_tuning() once PARAM_VALUE lands
                 ok, result = False, why
+        elif name in ("set_ride_height", "release_ride_height"):
+            # The amas' travel, as an RC override on channel 14. `amas.lua` adds
+            # that channel to the remote's 3 and to SCR_USER6, and the
+            # translator ESP32 reads the sum as a VELOCITY: 1500 is stop, and
+            # anything else keeps both amas moving for as long as it is sent.
+            # This is the "move it now while I watch" route; SCR_USER6 via
+            # `set_param` is the trim meant to stay set across a reboot.
+            #
+            # Releasing is its OWN command rather than a flag, because it is not
+            # a stop: 1500 holds the channel at the translator's own STOP, while
+            # releasing hands channel 14 back to the receiver - and if the
+            # transmitter has that channel parked off centre, letting go is what
+            # starts the creep rather than what ends it. Two buttons, two audit
+            # entries.
+            #
+            # A `release` flag on `set_ride_height` is still honoured, and that
+            # is deliberate rather than leftover: the flag was the shape this
+            # command had first, and anything still sending it means "let go".
+            # Ignoring it would drive the amas instead - the exact inversion
+            # worth being defensive about on a velocity command.
+            releasing = name == "release_ride_height" or bool(args.get("release"))
+            if master is None:
+                ok, result = False, "no autopilot link"
+            elif ride_height is None:
+                ok, result = False, "no ride-height handler on this node"
+            elif relay.engaged:
+                # Same rule as home_battery: the amas draw from the pack the
+                # relay just isolated, so this could only pretend to work.
+                ok, result = False, "refused: clear the emergency stop first"
+                log.warning("%s %s", name, result)
+            elif releasing:
+                ok, result = ride_height.release()
+            else:
+                ok, result = ride_height.command(args.get("pwm"))
         elif name == "set_lights_mode":
             # The /led_control switch: standard (status-driven) vs. an admin's
             # authored test pattern. `lights.py` itself refuses to honour this
@@ -851,6 +891,11 @@ def main():
     # missing (`autopilot_bridge.py`).
     bridge = AutopilotBridge()
 
+    # The amas' travel, as an RC override on channel 14 (`pixhalwk.py`). Inert
+    # until an operator commands it: until then this node does not write channel
+    # 14 at all and the receiver owns it, exactly as before this was wired up.
+    ride_height = RideHeight()
+
     # RTK corrections, pulled from the caster on the ground station and injected
     # into the autopilot for forwarding to the GNSS. Its own thread and its own
     # socket; the loop only drains a deque. Off if LIGMAX_RTK_ENABLED=0, and a
@@ -1018,6 +1063,11 @@ def main():
             # than it thinks it is. Cheap when the bus is quiet.
             bridge.pump(master)
 
+            # A standing ride-height command, re-sent before the autopilot
+            # expires it. Every loop for the same reason as bridge.pump() above,
+            # and a no-op on every tick where nothing is being commanded.
+            ride_height.refresh(master)
+
             forward_log_bus(bus, uploader)
             for entry in bridge.take_logs():
                 uploader.log(
@@ -1049,6 +1099,7 @@ def main():
                 tuning,
                 lights,
                 bridge,
+                ride_height,
             )
             if finish_update(uploader, updater):
                 # Leave the loop the ordinary way: the `finally` below flushes the

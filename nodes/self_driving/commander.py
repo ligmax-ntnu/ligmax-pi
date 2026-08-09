@@ -44,7 +44,7 @@ exist and `config.LATERAL_MODE` picks:
               it silently drops the term. **That is why this is the default** -
               it is the only option that is harmless when unverified.
     rc        an RC override on `LATERAL_RC_CHAN`, the way
-              `io_manager/pixhalwk.py` drives the ride height on channel 16.
+              `io_manager/pixhalwk.py` drives the ride height on channel 14.
               Refused unless a channel is configured, because guessing a channel
               number means driving something else on the boat.
     none      no lateral thrust; `dock.py` falls back to an angled approach.
