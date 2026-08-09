@@ -32,8 +32,8 @@ commands and answers nothing at all:
 Every pattern `render()` produces is a single colour repeated across the
 strip, so `COL` is what this module actually sends, at full 8-bit-per-channel
 precision - it is only 11 bytes regardless, so there is nothing to gain by
-cutting it further. `DATA` was the expensive one: 612 bytes to say the same 3
-bytes 101 times, and at 115200 baud that wire time was the whole reason the
+cutting it further. `DATA` was the expensive one: 606 bytes to say the same 3
+bytes 100 times, and at 115200 baud that wire time was the whole reason the
 frame rate had a low ceiling (see the note by DEFAULT_FPS). Halving it to one
 hex nibble per channel - 16 levels instead of 256 - halves that cost again, in
 exchange for banding nothing here ever has to look at, since this module never
@@ -113,7 +113,11 @@ BAUD = int(os.environ.get("LIGMAX_LIGHTS_BAUD", "115200"))
 # it - the ESP32 fills its own array - so this is no longer part of the wire
 # format; it is kept for the pixel count in the `_open()` log line and for
 # whoever drives `DATA` directly.
-NUM_LEDS = int(os.environ.get("LIGMAX_LIGHTS_NUM_LEDS", "101"))
+#
+# 100, not 101, since 2026-08-10: one LED in the 22-long forward-right segment
+# failed and was wired out of the chain rather than replaced. See
+# lights_esp.ino's header for the wire-index consequences.
+NUM_LEDS = int(os.environ.get("LIGMAX_LIGHTS_NUM_LEDS", "100"))
 
 # A `COL` frame is 11 bytes flat, so at 115200 8N1 (11.5 kB/s) it costs under
 # 1 ms on the wire regardless of strip length - nothing like the old `DATA`
@@ -137,7 +141,7 @@ KEEPALIVE_PERIOD = float(os.environ.get("LIGMAX_LIGHTS_RESEND_S", "1.0"))
 OPEN_RETRY_PERIOD = 5.0
 WRITE_TIMEOUT = 0.25
 
-# Scales every channel on the way out. The strip at full white is 101 pixels of
+# Scales every channel on the way out. The strip at full white is 100 pixels of
 # maximum draw, which is more than the hull's supply is sized for on some builds;
 # turn this down rather than dimming the individual patterns, so the colours stay
 # in the same ratios to each other.

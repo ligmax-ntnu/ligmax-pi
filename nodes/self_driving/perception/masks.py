@@ -24,9 +24,16 @@ Two shapes, because they fail differently
             boat: if the box is letting something through, this will not.
     both    the union.
 
-The front unit is filtered on the Jetson (`ligmax-edge`), where the rig geometry
-lives, so its mask is off by default here - two places correcting one occlusion
-is how a rig ends up corrected twice.
+The front unit is **not masked anywhere today.** This file said it was filtered
+on the Jetson, where the rig geometry lives, and that was the plan rather than
+the state of the code: checked against `ligmax-edge` on 2026-08-10, nothing there
+removes the front unit's view of the boat - not `fusion.py`, not `sender.py`, and
+`rig.json` carries no mask at all. The intent stands (two places correcting one
+occlusion is how a rig ends up corrected twice, so exactly one side should own
+it), but until one of them does, `LIGMAX_FRONT_MASK_MODE=box` here is the only
+thing that will do it. That is why the mode is reported in `describe()` instead
+of a sentence claiming somebody else has handled it - the sentence went into the
+telemetry and into every trip header, where it would be believed.
 
 Everything is measured in the BOAT frame, `[starboard, forward]` metres, the
 frame `scan.py` delivers - so the numbers below are the ones you get off the
@@ -62,8 +69,11 @@ AFT_MASK_FROM_M = _f("LIGMAX_AFT_MASK_FROM_M", -0.6)
 # The sector, for "sector"/"both". Half-angle either side of dead ahead.
 AFT_MASK_SECTOR_DEG = _f("LIGMAX_AFT_MASK_SECTOR_DEG", 60.0)
 
-# The front unit is masked on the Jetson. Off here unless somebody says
-# otherwise, in which case the same three knobs apply.
+# The front unit. Off by default, and see the module docstring: that default was
+# chosen because the Jetson was going to do it, and the Jetson does not. Setting
+# this to "box" is the interim, and the same three knobs below apply - but note
+# the front unit's own geometry is `rig.json`'s and is known-wrong (next_step.md
+# §5.0), so a mask set here is measured against a bearing nobody trusts yet.
 FRONT_MASK_MODE = _s("LIGMAX_FRONT_MASK_MODE", "none")
 FRONT_MASK_HALF_WIDTH_M = _f("LIGMAX_FRONT_MASK_HALF_WIDTH_M", 0.5)
 FRONT_MASK_FROM_M = _f("LIGMAX_FRONT_MASK_FROM_M", 0.6)
@@ -117,7 +127,12 @@ def mask_aft(points):
 
 
 def mask_front(points):
-    """Keep-mask for the front unit. Off by default - masked on the Jetson."""
+    """Keep-mask for the front unit, looking astern at the boat. Off by default.
+
+    Off because the Jetson was going to own this, not because it does. See the
+    module docstring: as of 2026-08-10 neither side masks the front unit, so on
+    a rig where it can see its own hull this is the only switch that helps.
+    """
     return keep_mask(
         points,
         FRONT_MASK_MODE,
@@ -192,5 +207,15 @@ def describe():
         "aft_from_m": AFT_MASK_FROM_M,
         "aft_sector_deg": AFT_MASK_SECTOR_DEG,
         "front_mode": FRONT_MASK_MODE,
-        "note": "the front unit is masked on the Jetson (ligmax-edge)",
+        # Was "the front unit is masked on the Jetson (ligmax-edge)". It is not,
+        # and this string goes into every trip header - where an untrue sentence
+        # about which returns were filtered is exactly the kind of thing that
+        # gets believed during a post-mortem. `front_mode` above is the fact;
+        # this only says what it means when it is off.
+        "note": (
+            "nothing masks the front unit's view of the boat unless front_mode "
+            "is set here - checked against ligmax-edge 2026-08-10"
+            if FRONT_MASK_MODE == "none"
+            else "the front unit is masked on the Pi (this file)"
+        ),
     }

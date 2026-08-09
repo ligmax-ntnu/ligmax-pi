@@ -54,6 +54,29 @@ Also landed on the Pi, in this repo:
   tick. Also fixed a `NameError` on the origin-moved path in `world.py` and a
   rate gate that silently recorded a 10 Hz loop at 6 Hz.
 
+### Added 2026-08-10
+
+This file was audited section by section against all three repos, because most
+of §2 and §5 had been built and the document still asked for it. **Everything
+struck through below was found already done.** What actually changed:
+
+* **The recordings come off the boat by themselves** —
+  `nodes/io_manager/trip_upload.py`, the Pi end of §2.7. The server route had
+  landed and `ligmax-server/ligmax_gui/trips.py:283` already referred to this
+  file by name. Chunked, resumable, and gated on the vessel being idle. See
+  §2.7, which is now a checklist rather than a proposal.
+* **A plan asking for 2.8 m/s no longer looks accepted.** The vessel's ceiling
+  went to 5 kn (2.5722 m/s) on 2026-08-09; `ligmax-server`'s mirror and the
+  browser's `<input max>` both still said 3.0, so the editor accepted it, the
+  server returned 200 and the **boat refused the whole plan** a second later.
+  That is the exact failure `ligmax_gui/plan.py`'s docstring says the mirror
+  exists to prevent. Fixed, and the browser now takes its bounds from
+  `/api/session` (`waypoint_limits`) so there is no longer a third copy.
+* **`masks.py` stopped claiming the Jetson masks the front lidar.** It does not
+  — checked against `ligmax-edge`, nothing there removes the front unit's view
+  of the boat. The claim was in a comment, a docstring, **and in `describe()`,
+  which goes into telemetry and into every trip header.** See §5.2.
+
 ---
 
 ## 1. Hardware, before anything else
@@ -187,7 +210,12 @@ on a following sea.
 
 ## 2. The website — what to build in `ligmax-server`
 
-This is the biggest remaining piece and none of it is in this repo.
+**Mostly built, as of 2026-08-10.** This was the biggest remaining piece and it
+is now the smallest: the command protocol, the plan editor, the autopilot panel,
+the chart layers, the map's clear-all and delete-one, and the trip endpoint all
+exist and were verified against source. What is left is listed under each
+heading and is small. Read this section for what the boat sends and what the
+server does with it; do not read it as a build list any more.
 
 ### 2.1 The command protocol — already implemented on the boat
 
@@ -225,11 +253,28 @@ Worth showing the ceiling next to the speed readout whenever careful mode is on,
 because a boat that is inexplicably slow is the second most common thing a crew
 misdiagnoses under time pressure.
 
-`forget_object` is the only one of these the server does not offer yet — see
-§2.6. `forget_world` already exists at `ligmax_gui/server.py:204` and reaches the
-boat end to end; its behaviour has changed only in that it now clears the
-persisted survey too, which is what an operator pressing "clear everything"
-means and what stops it all reappearing after the next restart.
+~~`forget_object` is the only one of these the server does not offer yet.~~
+**Every command in the table above is offered by the server and reaches the boat**
+(verified 2026-08-10). `forget_world` clears the persisted survey too, which is
+what an operator pressing "clear everything" means and what stops it all
+reappearing after the next restart.
+
+Three small gaps remain, none of them blocking:
+
+* **`autopilot_goto` has no UI at all.** The server offers it and the boat
+  handles it, but nothing in the frontend sends it — the cursor can only be
+  moved one waypoint at a time with Skip/Back. A number input beside those two
+  buttons in `web/js/autopilot.js` is the whole job.
+* **The optional `label` and `why` args are structurally unsendable.** The boat
+  reads `autopilot_start {label}`, `record_start {label}` and
+  `autopilot_stop {why}`; the server's validator drops undeclared args *and*
+  makes every declared arg mandatory (`ligmax_gui/server.py`), so adding them
+  naively would break the existing zero-argument buttons. The boat falls back to
+  the plan name and to "operator stopped autonomy", which is fine — treat the
+  `{label?}`/`{why?}` in the table above as aspirational until the validator
+  learns about optional arguments.
+* **`start_at`** (§2.2) has no editor field. The §8.2 re-entry is done with
+  `autopilot_back`, which does have a button, so this is a nicety.
 
 ### 2.2 The plan format
 
@@ -258,7 +303,20 @@ means and what stops it all reappearing after the next restart.
   `avoid` (+ COLREG), `hold` (arrive and station-keep; `hold_s: 0` = forever),
   `dock` (bow-in, hold, reverse out), `dock_parallel` (alongside, hold, ahead).
 * Optional per waypoint: `speed`, `radius`, `hold_s`, `channel_bearing`,
-  `berth_width_m`, `notes`.
+  `berth_width_m`, `notes`. The editor offers `speed` and `hold_s`; the other
+  four have to go in as JSON. **`berth_width_m` is the one worth a field** — it
+  is the 2 m berth of Task 3 and it is currently unreachable from the dashboard.
+
+**`speed` is bounded by the vessel's 5 kn limit, and the boat refuses the whole
+plan rather than clamping.** That is deliberate — an operator finds out on the
+dock with the ack in front of them instead of wondering later why the boat would
+not hold the speed they typed. It only works if the dashboard agrees about the
+number, and until 2026-08-10 it did not: the server's mirror and the editor's
+`<input max>` both still said the old 3.0 m/s. The browser now reads the bounds
+off `/api/session` (`waypoint_limits`), so the vessel's limit is the only copy
+that decides. **If the vessel's limit ever changes, change it in
+`ligmax-pi/config.py` and in `ligmax-server/ligmax_gui/plan.py`, and nowhere
+else.**
 
 ### 2.3 The autopilot panel
 
@@ -320,13 +378,21 @@ Minimum useful UI, in priority order:
   | `why` | now ends with "remembered from N s ago, position good to about X m" when the boat is remembering rather than seeing. |
 
   `avoid_radius` had **never been sent**: the Pi omitted it, so
-  `ligmax_gui/protocol.py:398` defaulted it to `0.0`, which means
-  `web/js/nogo.js::pointBlocked()` has never blocked anything and the map has
-  never drawn a no-go disc. It should simply start working. **Check it renders
-  sanely** — a remembered mark legitimately claims about 8 m (2 m clearance +
-  6 m uncertainty), which is correct but will look large the first time.
-  Same for `web/js/telemetry.js:627`, which counts tracks with
-  `avoid_radius > 0` as "blocked" and has therefore read 0 forever.
+  `ligmax_gui/protocol.py` defaulted it to `0.0` and the map never drew a no-go
+  disc. It is now sent and the disc draws. **Check it renders sanely** — a
+  remembered mark legitimately claims about 8 m (2 m clearance + 6 m
+  uncertainty), which is correct but will look large the first time. Note the
+  disc needs **both** the "No-go zones" and the radii layer chips on.
+
+  Two corrections to what this section used to promise (2026-08-10):
+
+  * `web/js/nogo.js::pointBlocked()` will **not** "simply start working" — it is
+    dead code, nothing calls it. Wiring it into the chart's cursor readout so
+    hovering a point says which track blocks it is a small, genuinely useful job.
+  * `web/js/telemetry.js`'s "N with avoid radius" counter will jump from 0 to
+    *every* track, because every track now has a non-zero `avoid_radius`. It has
+    stopped discriminating; counting `avoid_radius > clearance` — i.e. the
+    remembered ones — is what that figure was actually for.
 * **`path`** with `kind: "reference"` - the plan, published on upload. The
   dashboard already draws this amber layer. §11.4 asks for the actual course
   over ground "compared against the ideal route" - that comparison is this layer
@@ -334,88 +400,106 @@ Minimum useful UI, in priority order:
 * **`scans`** - unchanged; the front cloud is now relayed by the autonomy node,
   so it keeps working exactly as before.
 
-### 2.5 Present-but-unused telemetry worth surfacing
+### 2.5 Present-but-unused telemetry worth surfacing — **surfaced**
 
-`telemetry.autopilot_bridge` says whether the node bus is delivering. "The
-autonomy node is not running" and "the bus is broken" look identical without it.
+All of it is rendered, in the `/control` autopilot panel. Three things the audit
+of 2026-08-10 found still wrong, in descending order of how much they matter:
 
-`telemetry.autopilot.survey` is new: `{enabled, file, marks, age_s}`. So is
-`telemetry.autopilot.perception.established` / `.remembered` / `.restored`.
-Between attempts, **"the boat is starting with 7 marks it already knows"** is
-the single most useful sentence on the screen, and it is the only way to see
-that the survey actually loaded.
+1. **`telemetry.autopilot_bridge` is read from the wrong place**, so the panel's
+   "Bridge" row never renders against the real vessel and the "No autonomy node"
+   message never gets its diagnostic half — which is the entire reason this
+   field exists. It is a top-level `telemetry` key, not a field of
+   `telemetry.autopilot`. Two lines in `web/js/autopilot.js`.
+2. **`recording.free_mb` has no warning indicator** — it is plain text in a `dd`
+   with no threshold test, so a card at 20 MB free reads exactly like one at
+   20 GB. "The card filled up" is something the crew can act on from the dock
+   and cannot otherwise see; it wants to go red below `RECORD_MIN_FREE_MB`.
+3. **`survey.marks` does not mean what §6 of this file says.** It is
+   `Survey.entries_written`, set by a successful `write()` and **never by the
+   restore** — so "check `survey.marks` is non-zero at the start of attempt two"
+   is checking the wrong number. Use
+   `telemetry.autopilot.perception.restored`, which is set by the restore and is
+   what the journal line quotes. `survey.file` is published and displayed
+   nowhere, so a survey read from an unexpected path is invisible.
 
-`telemetry.autopilot.recording` now also carries `mb`, `free_mb` and
-`truncated`. `free_mb` is worth a small warning indicator — "the card filled up"
-is something the crew can act on from the dock and cannot otherwise see.
+### 2.6 Clear-all and delete-one on the map — ~~the remaining UI work~~ **DONE**
 
-### 2.6 Clear-all and delete-one on the map — **the remaining UI work**
+Built in `ligmax-server`, verified 2026-08-10. Nothing outstanding.
 
-The boat side of both is done. What is missing is entirely in `ligmax-server`.
+**Clear all** is a button in the map's own control cluster, with a confirm that
+reads the survey figure and warns you are deleting that too.
 
-**Clear all.** `forget_world` already exists in the COMMANDS table and
-`web/js/autopilot.js:198` renders it as a chip labelled "Clear what it has seen"
-— but only in the non-compact autopilot panel (`if (!this.compact)`). The ask
-was a button **on the map**. Add one to the map's control cluster in
-`web/js/map.js`, sending the same command through `autopilot.js`'s
-`send(name, args)`. The existing confirm text is still accurate.
+**Delete one object** is `forget_object` in the COMMANDS table with `{id: float}`
+narrowed to an integer server-side; tracks are hit-testable on the chart by
+right-click *and* by press-and-hold (so it cannot fire during a pan), and there
+is a hint in the tooltip for admins. Covered by `ligmax-server/tests/test_server.py`.
 
-**Delete one object.** Two changes:
+Both confirm before acting, because a mis-click removes a real mark. An undo is
+not needed: if the object is real the lidar puts it back, and the Pi's
+suppression window is exactly 30 s (`FORGET_SUPPRESS_S`).
 
-1. `ligmax_gui/server.py`, in the COMMANDS table beside `forget_world`:
+### 2.7 Taking trip recordings off the boat — **BUILT, UNTESTED ON HARDWARE**
 
-   ```python
-   "forget_object": {"label": "Delete this object", "args": {"id": "float"}},
-   ```
+The server has ~200 GB free; the Pi has a 32 GB card with the OS on it. A
+15-minute attempt is **60 MB** worst case (measured 2026-08-09, synthetic
+incompressible data — real sweeps compress far better). The card is safe; the
+problem was only ever that the recordings were stuck on it, and the run worth
+reviewing is often the one where the boat had to be carried back.
 
-   `"float"` is how `autopilot_goto` declares its `index`, so it needs no new
-   validation machinery. The Pi accepts `id` or `track_id`.
+Both ends now exist.
 
-2. `web/js/map.js` — make tracks clickable. They are drawn at `map.js:952-1011`,
-   which already computes screen positions and maintains
-   `this.hovered?.track?.track_id`, so the hit-testing exists in all but name.
-   On click — or on a context menu, so it cannot fire during a pan — send
-   `forget_object` with `{id: track.track_id}`.
+**Server** (`ligmax-server/ligmax_gui/trips.py` + four routes): `POST
+/api/trip/<name>` with the boat key, `Content-Type: application/gzip`, and
+`Content-Range` for resume; `GET /api/trip` listing what is held **and what is
+half-uploaded**; `GET /api/trip/<boat>/<name>` to download in the tent; admin-only
+`DELETE`. 256 MB per recording, 8 MB per ranged request, refuses once the ground
+station is under 2 GB free. Stored as `trips/<boat>/<name>.jsonl.gz`, `<boat>`
+from a `?boat=` query arg defaulting to `ligmax`.
 
-   The id lines up on its own: the Pi sends `id`, and `protocol.py:393` maps it
-   with `raw.get("track_id", raw.get("id", index))`. What the operator clicks is
-   what the Pi will match.
+**Pi** (`nodes/io_manager/trip_upload.py`, new 2026-08-10). One daemon thread in
+io_manager, because io_manager owns every link to shore. What is worth knowing:
 
-Confirm before deleting, because a mis-click removes a real mark. An undo is not
-needed: if the object is real the lidar puts it back, and the Pi's suppression
-window is exactly 30 s (`FORGET_SUPPRESS_S`).
+* **It never uploads while the vessel is armed, or while a recording is open.**
+  The same 4G carries the command channel and ~95 kB/s of lidar plot; a
+  recording that arrives an hour late costs nothing. `LIGMAX_TRIP_UPLOAD_WHILE_ARMED=1`
+  lifts the first gate for a bench test.
+* The "a recording is open" gate **expires** rather than latching, because an
+  autonomy node that died mid-run would otherwise pin its own recording to the
+  card forever — and that is the recording you want.
+* Newest first: attempt two is decided from attempt one.
+* **It never deletes anything.** The recorder's prune owns the card's budget; a
+  second thing removing files behind its back is how the recording somebody
+  asked for disappears between the asking and the fetching.
+* Chunks are 2 MB, not the server's permitted 8 MB, because on a link measured
+  in hundreds of kB/s an 8 MB piece is half a minute of exposure to a handover.
+* It reads `RECORD_DIR` by importing `nodes/self_driving/config.py`, so
+  `LIGMAX_AP_RECORD_DIR` moves the writer and the reader together.
 
-### 2.7 An endpoint to take trip recordings off the boat
+Knobs: `LIGMAX_TRIP_UPLOAD=0` (off), `LIGMAX_TRIP_UPLOAD_CHUNK_MB`,
+`LIGMAX_TRIP_UPLOAD_PERIOD_S`, `LIGMAX_TRIP_UPLOAD_QUIET_S`, `LIGMAX_BOAT_NAME`.
+Progress is in `telemetry.trips`.
 
-The server has ~200 GB free; the Pi has a 32 GB card with the OS on it.
+**One mismatch worth knowing, and it is not a bug yet.** The recorder will let a
+single trip reach `RECORD_MAX_TRIP_MB` = **512 MB** on disk, and the server
+refuses anything over **256 MB**. A file between the two can never be uploaded.
+It cannot happen at Njord — a 15-minute attempt is 60 MB and the rules cap the
+attempt — so nothing has been changed. The uploader detects it locally and says
+so loudly rather than discovering it over 4G, and the file is still on the card
+to be fetched by hand. If long bench recordings ever become a habit, set
+`LIGMAX_AP_RECORD_MAX_TRIP_MB=256` and the two agree.
 
-Measured 2026-08-09 on this Pi, worst case (synthetic incompressible data — real
-sweeps compress far better): a **15-minute attempt is 60 MB** on disk with
-everything recorded. The Pi keeps 40 trips or 3 GB, whichever bites first, and
-refuses to start a recording below 750 MB free. So the card is safe.
+#### What to run on the boat — none of this has touched hardware
 
-But the recordings are stuck on the boat, and the run worth reviewing is often
-the one where the boat had to be carried back.
+The checklist is **`docs/testing.md` §7h** in the umbrella checkout, where the
+standing hardware checklists live. Five minutes on the dock, and it cannot move
+the boat.
 
-There is **no bulk-upload route today** — `/api/ingest` takes JSON frames and
-`ligmax_gui/server.py:48` rejects a body over 4 MB. Proposed:
+The two steps that are not box-ticking: **step 3**, resume after a dropped link,
+which is the only part that cannot be checked any other way; and `sha256sum` on
+both copies of every file, which is the real pass criterion — a recording that
+looks complete and is not is worse than none at all.
 
-* `POST /api/trip/<name>` — `Authorization: Bearer $LIGMAX_BOAT_KEY` (the same
-  ingest secret `nodes/io_manager/upload.py` already holds),
-  `Content-Type: application/gzip`, raw body, `Content-Range` for resume over a
-  4G link that drops.
-* Its own size limit, well above the frame limit — 256 MB.
-* Store as `trips/<boat>/<name>.jsonl.gz`, listed on a page so they can be
-  pulled in the tent.
-* `GET /api/trip` returning the names already held, so the Pi can skip what it
-  has already sent instead of re-uploading on every reconnect.
-
-The Pi side is deliberately **not written yet**: inventing a protocol against an
-endpoint that does not exist is how the two ends end up disagreeing. Once the
-route exists the uploader is small — `upload.py` already keeps a TLS connection
-alive and knows the boat key.
-
-Until then, by hand:
+By hand, as before, and still the fallback:
 
 ```sh
 scp admin@ligmax-pi3.local:/home/admin/ligmax-trips/*.jsonl.gz .
@@ -437,13 +521,11 @@ came from.
    RED. `MIN_SATURATION` was raised to 0.55 as a result, which turns that scene
    into honest UNKNOWNs.
 
-   **That reasoning is now in doubt — see §5.1.** It assumed the Jetson sends
-   sensor-native RGB. Checked 2026-08-09: it does not. `fusion.py::_correct`
-   applies the OV5647 matrix before sending, on top of the ISP chroma gain in
-   the frame header's `saturation` field (default 2.0). If the 2026-08-08
-   capture predates that change, 0.55 is calibrated against a distribution the
-   boat no longer receives. **Re-derive it from a fresh capture. This is the
-   single highest-value tuning action available and it takes ten minutes.**
+   ~~That reasoning is now in doubt.~~ **Settled 2026-08-09, see §5.1:** the
+   capture does *not* predate the Jetson's colour correction, so 0.55 was
+   calibrated against roughly the distribution the boat still sends. This is an
+   ordinary confirmation in the day's light, **not** the highest-value tuning
+   action — that is §5.0, the front lidar's mounting angle.
    * Put a real red and a real green buoy in front of the boat, on the water,
      and check `telemetry.autopilot.sees`.
    * `LIGMAX_AP_WHITE_BALANCE=1` (grey-world, per sweep) is now **less likely to
@@ -540,6 +622,17 @@ survey carried into attempt two. A mirrored world is the failure most likely to
 survive a casual glance — the plot looks plausible and every mark is on the
 wrong side.
 
+**And it is worse than that, which nobody had written down.** `fusion.py` drops
+every return no camera could see (`keep = cam_of >= 0`), and which camera a
+return belongs to is decided by projecting it through the rig — *through this
+same `yaw_deg`*. So a wrong yaw does not merely rotate the picture: **the ~34°
+wedge that gets discarded is the wrong physical wedge**, and real obstacles dead
+ahead can be thrown away at the sender and never reach the Pi at all. The Pi
+cannot detect this — the sweep arrives looking complete, and `n + dropped` still
+adds up. Until the yaw is remeasured, run the Jetson with **`--lidar-keep-unseen`**:
+it keeps the uncoloured returns, so a mis-aimed rig costs colour rather than
+obstacles.
+
 `rig.json` gives the procedure:
 
 ```
@@ -578,40 +671,73 @@ on that belief. Both `nodes/self_driving/config.py` and
 is avoided on both sides) while too low is a confident wrong-side pass, which is
 the failure being scored.
 
-**Someone should run `git log -- fusion.py` in `ligmax-edge`** and establish
-whether the correction predates the 2026-08-08 capture. That settles whether
-0.55 was ever right, and it is a one-command answer.
+~~**Someone should run `git log -- fusion.py` in `ligmax-edge`**~~ **Answered,
+2026-08-09.** It did **not** predate the capture: `age_ms` first appears in
+`ligmax-edge` at `1b70dc4` (2026-08-08 18:04) and the capture contains it. The
+reasoning is written into `nodes/self_driving/config.py` and
+`perception/classify.py` at the value itself. Nobody needs to redo this.
+
+So 0.55 is calibrated against roughly the right distribution after all. **Do not
+treat re-deriving it as the highest-value tuning action** — it is an ordinary
+confirmation in the day's light: put a real red and a real green mark in front
+of the boat and read `telemetry.autopilot.sees`.
 
 #### 5.2 The rest
 
-1. **Mask the front lidar's view of the boat** on that side, where `rig.json`
-   lives. (Already planned per the 2026-08-08 conversation. `masks.mask_front`
-   exists on the Pi as a backstop but defaults to `none` - two places correcting
-   one occlusion is how a rig gets corrected twice.)
+1. **Mask the front lidar's view of the boat — and note that nothing does it
+   today.** This file used to say the Jetson filtered it and the Pi's
+   `masks.mask_front` was a backstop defaulting to `none`. Checked against
+   `ligmax-edge` on 2026-08-10: **neither side masks it.** Nothing in
+   `fusion.py` or `sender.py` removes the front unit's view of the hull and
+   `rig.json` carries no mask.
+
+   The Pi asserted otherwise in three places, one of them inside `describe()`,
+   which goes into telemetry **and into every trip header** — a false statement
+   about which returns were filtered, sitting in the file somebody reads during
+   a post-mortem. All three are corrected.
+
+   The design intent stands: exactly one side should own this, because two
+   places correcting one occlusion is how a rig gets corrected twice. Either
+   implement it on the edge where the geometry lives, or set
+   `LIGMAX_FRONT_MASK_MODE=box` on the Pi as the interim — but not both, and
+   note that a mask set on the Pi is measured against a bearing §5.0 says is
+   not trustworthy yet.
 2. ~~`run.sh` still needs **`LIDAR=1`** by hand.~~ **Already the default** —
    `run.sh:78` is `if [ "${LIDAR:-1}" = "0" ]`, so only `LIDAR=0` turns it off.
    `repos.md` has been corrected.
-3. The lidar block sends `age_ms`, `dropped` and `stale` that the Pi's
-   `edge_protocol.py` **still does not document** (the *code* is byte-identical
-   to the edge's `protocol.py` — verified by diff — so the wire format is sound;
-   only the docstring is behind). In the 2026-08-08 capture **179 of 269 points
-   were `stale`**, coloured from a frame outside the freshness window.
+3. ~~The lidar block sends `age_ms`, `dropped` and `stale` that the Pi's
+   `edge_protocol.py` **still does not document**.~~ **It documents all three,
+   plus `skew_ms` and `cam`.** The code is byte-identical to the edge's
+   `protocol.py` — verified by diff, and worth keeping in the checklist, since
+   it is the cheapest possible guard on the wire format. In the 2026-08-08
+   capture **179 of 269 points were `stale`**, coloured from a frame outside the
+   freshness window.
 
-   The useful follow-up is on the Pi: weight a cluster's colour vote by each
-   point's `age_ms` instead of treating every coloured return equally. Worth
-   doing only **after** §5.1, which dominates it. Note also that `skew_ms` is now
-   a whole-sweep summary and no longer decides any individual point's colour,
-   and that `cam = -1` only appears with `--lidar-keep-unseen` — by default those
-   returns are dropped, so `n + dropped` is the rotation size and `n` alone is
-   not. The Pi is safe against the `cam` change (`scan.py:174` maps `cam < 0` to
-   the uncoloured sentinel either way).
+   ~~The useful follow-up is on the Pi: weight a cluster's colour vote by each
+   point's `age_ms`.~~ **Done** — `perception/classify.py::age_weights`, with
+   its constants pinned to the edge's own CLI defaults, and covered by
+   `tests/test_autopilot.py`. Tuning it on the water is optional.
+
+   Still true: `skew_ms` is a whole-sweep summary and no longer decides any
+   individual point's colour, and `cam = -1` only appears with
+   `--lidar-keep-unseen` — by default those returns are dropped, so `n + dropped`
+   is the rotation size and `n` alone is not. The Pi is safe against the `cam`
+   change (`scan.py` maps `cam < 0` to the uncoloured sentinel either way).
+   **See §5.0 for why `--lidar-keep-unseen` is worth turning on right now.**
 
 ### `ligmax-server`
 
-Everything in §2 — and §2.6 (the map's clear-all and delete-one buttons) and
-§2.7 (an endpoint to take trip recordings off the boat) are the two new ones.
-`tracks` and `path` are already being published, so the chart work can start
-before any of the UI.
+**Almost nothing.** §2.6 and §2.7 both landed, and §2.1–§2.5 were verified
+against source on 2026-08-10. What is left is four small jobs, in order of
+value:
+
+1. Read `telemetry.autopilot_bridge` from the top level of `telemetry`, not from
+   `telemetry.autopilot` — §2.5 item 1. It is the field that tells a dead
+   autonomy node from a dead bus, and it currently renders never.
+2. A warning state on `recording.free_mb` — §2.5 item 2.
+3. `autopilot_goto` has no control anywhere — §2.1.
+4. A `berth_width_m` field in the editor — §2.2. The 2 m berth is the tightest
+   thing on the course and it is unreachable from the dashboard.
 
 ---
 
@@ -654,9 +780,12 @@ attempt one and attempt two of the same task** — that is exactly the map you
 want to keep. Attempt two starts knowing roughly where every gate is, at ±6 m,
 tightening to ±0.35 m the moment the lidar sees each one again.
 
-Check it loaded: `telemetry.autopilot.survey.marks` and
-`telemetry.autopilot.perception.restored` should be non-zero at the start of
-attempt two, and the journal says so loudly:
+Check it loaded: **`telemetry.autopilot.perception.restored`** should be
+non-zero at the start of attempt two. ~~`telemetry.autopilot.survey.marks`~~ is
+**not** the field to look at — corrected 2026-08-10: it counts entries the boat
+has *written*, so it legitimately reads 0 at the start of a run that restored
+seven marks, and reading it as "nothing loaded" would send somebody hunting a
+fault that is not there. The journal says it loudly and is the other check:
 
 ```
 restored 7 surveyed mark(s) from /home/admin/.ligmax/survey.json -
@@ -690,8 +819,14 @@ and it is one of seven things, in this order: not engaged / no state / comms los
   was kept and extended because the frontend mirrors its enum values.
 * `nodes/logging/main.py` and `nodes/balancing/main.py` are still empty stubs and
   still `"on": False` in the supervisor.
+* `nodes/io_manager/trip_upload.py` is new (2026-08-10) and is wired into
+  `main.py`: one daemon thread, fed the armed/recording gates on every 1 Hz
+  publish tick, reporting `telemetry.trips`, closed in the `finally`. It imports
+  `RECORD_DIR` from `nodes/self_driving/config.py` — the one cross-node import in
+  io_manager, and deliberate: a second copy of that path is how an uploader ends
+  up watching an empty directory and truthfully reporting nothing to send.
 * `nodes/io_manager/pixhalwk.py` (ride height) **is now wired into `main.py`**
-  (uncommitted as of 2026-08-09): a `RideHeight` object refreshed every loop
+  (committed 2026-08-09): a `RideHeight` object refreshed every loop
   tick, driven by the `set_ride_height` command, on **RC 14**. It is inert until
   an operator asks — until the first command the node does not write the channel
   at all. `stop()` holds 1500 rather than releasing, because releasing hands the

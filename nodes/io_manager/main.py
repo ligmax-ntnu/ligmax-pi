@@ -40,6 +40,12 @@ What it does:
     them into the autopilot, which forwards them to the GNSS (`rtk.py`). The
     base station is on 4G like the boat, so both ends dial out to the ground
     station and meet there. Optional: without it the fix is ordinary 3D.
+  * pushes finished **trip recordings** off the card and up to the dashboard
+    (`trip_upload.py`). The autonomy node writes them; this node owns every link
+    to shore, so it is the one that walks them up - chunked and resumable,
+    because a 60 MB file on 4G does not always arrive first time, and never
+    while the vessel is armed or a recording is open, because the same uplink
+    carries the command channel.
   * forwards log lines to the dashboard's log panel: this node's own, the
     ZeroMQ node bus on LOGGING_PORT, and the autopilot's STATUSTEXT.
   * executes the operator's commands, which arrive in the reply to each
@@ -97,6 +103,7 @@ from .scan import ScanPublisher
 from .selfupdate import NAME as REPO_NAME, SelfUpdate, request_restart
 from .status import StatusMachine
 from .trim import Trim
+from .trip_upload import TripUploader
 from .tuning import TUNABLES, Tuning
 from .upload import Uploader
 
@@ -135,6 +142,14 @@ SCAN_PERIOD = (1.0 / SCAN_PUBLISH_HZ) if SCAN_PUBLISH_HZ > 0 else None
 # over loopback to another process on the same Pi, costs no 4G, and is what the
 # planner steers on. Turning the operator's plot down must not blind the boat.
 STATE_PERIOD = 1.0 / float(os.environ.get("LIGMAX_STATE_PUBLISH_HZ", "10"))
+
+# How long `telemetry.autopilot` may be absent before this node stops believing
+# what it last said. Only the trip uploader's "a recording is open" gate reads
+# it, and that gate must not latch: an autonomy node that died mid-run would
+# otherwise hold the recording on the card forever, and the run that killed the
+# node is the one worth reading. Several times the bridge's 0.5 s publish, so an
+# ordinary hiccup never trips it.
+AUTOPILOT_TELEMETRY_STALE_S = 10.0
 
 LOOP_SLEEP = 0.01
 MAX_MESSAGES_PER_TICK = 200  # never let a backlog starve the heartbeat
@@ -904,6 +919,19 @@ def main():
     if rtk is None:
         log.info("RTK corrections disabled (LIGMAX_RTK_ENABLED=0)")
 
+    # The autonomy node's trip recordings, walked up to the ground station on
+    # their own thread and their own socket. Chunked, resumable and gated on the
+    # vessel being idle - see `trip_upload.py`. It costs one directory listing a
+    # minute when there is nothing to send, and nothing at all while the boat is
+    # armed. LIGMAX_TRIP_UPLOAD=0 turns it off.
+    trip_uploads = TripUploader.from_env()
+    log.info(
+        "trip recordings: %s -> %s (%s)",
+        trip_uploads.directory,
+        trip_uploads.url,
+        "enabled" if trip_uploads.enabled else "disabled",
+    )
+
     # No Pixhawk yet is not fatal - it is common on the bench, and even on the
     # water a disconnected autopilot is exactly when the E-stop and dashboard
     # link matter most. `master` is None until connect() succeeds, and drops
@@ -918,6 +946,10 @@ def main():
     last_scan = 0.0
     last_state = 0.0
     for_autopilot = []
+    # Mirrors of the autonomy node's recorder, for the trip uploader's gate.
+    autopilot_recording = False
+    autopilot_recording_file = None
+    last_autopilot_block = 0.0
 
     try:
         while True:
@@ -1235,6 +1267,34 @@ def main():
                         telemetry["autopilot"] = value
                     else:
                         frame[key] = value
+
+                # The trip uploader's two gates, refreshed from what this tick
+                # actually knows: whether the vehicle is armed (first-hand, off
+                # the HEARTBEAT) and whether the autonomy node has a recording
+                # open (second-hand, off the bridge - so it expires rather than
+                # latching, see AUTOPILOT_TELEMETRY_STALE_S).
+                if autopilot_block := telemetry.get("autopilot"):
+                    last_autopilot_block = now
+                    recording_block = autopilot_block.get("recording") or {}
+                    was_recording = autopilot_recording
+                    autopilot_recording = bool(recording_block.get("recording"))
+                    autopilot_recording_file = recording_block.get("file")
+                    if was_recording and not autopilot_recording:
+                        # Do not wait out the sweep period: the crew is standing
+                        # on the dock wanting this file, and it is the moment the
+                        # boat is least busy.
+                        trip_uploads.request("a recording just closed")
+                elif now - last_autopilot_block > AUTOPILOT_TELEMETRY_STALE_S:
+                    autopilot_recording = False
+                    autopilot_recording_file = None
+                trip_uploads.note_vessel(
+                    machine.armed, autopilot_recording, autopilot_recording_file
+                )
+                # Published after the frame is built, which is safe because
+                # `frame["telemetry"]` is this same dict - the uploader only
+                # serialises it at send time.
+                telemetry["trips"] = trip_uploads.telemetry()
+
                 if SCAN_PERIOD is None:
                     # The fast tick is switched off, so the plot rides this one
                     # rather than never going out at all.
@@ -1280,6 +1340,10 @@ def main():
             edge_link.close()
         if rtk is not None:
             rtk.close()
+        # Abandons whatever chunk is in flight rather than finishing the file.
+        # That costs nothing: the server keeps the `.part`, and the next start
+        # resumes from exactly where this left off.
+        trip_uploads.close()
         if master is not None:
             master.close()
         bus.close()

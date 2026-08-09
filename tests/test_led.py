@@ -3,18 +3,18 @@ import time
 
 PORT = "/dev/ttyAMA0"
 BAUD = 115200
-NUM_LEDS = 101
+NUM_LEDS = 100  # one LED in the strip was wired out after failing, 2026-08-10
 
 speed = 0
 print(f"Connecting to ESP32 on {PORT}...")
 
 def send_leds(leds):
-    # Join the list into a single 303-character string: one hex nibble per
+    # Join the list into a single 300-character string: one hex nibble per
     # channel (half the precision of a full RRGGBB), which is what halves the
     # DATA frame's wire time and buys the fps back.
     hex_string = "".join(leds)
 
-    # Format and send the command exactly as the ESP32 expects: "DATA <303_hex_chars>\n"
+    # Format and send the command exactly as the ESP32 expects: "DATA <300_hex_chars>\n"
     command = f"DATA {hex_string}\n"
     esp32.write(command.encode('ascii'))
 
@@ -28,18 +28,18 @@ try:
     print("Running moving green dot test... (Press Ctrl+C to stop)")
     
     while True:
-        # Create a list of 101 black LEDs (hex nibbles "000")
+        # Create a list of 100 black LEDs (hex nibbles "000")
         leds = ["000"] * NUM_LEDS
 
         # Set the current position to Bright Green ("0F0")
         leds[pos] = "0F0"
-        
+
         send_leds(leds)
-        
+
         # Update the position of the dot
         pos += direction
-        
-        # Reverse direction if it hits either end of the 101 LED array
+
+        # Reverse direction if it hits either end of the 100 LED array
         if pos == 0 or pos == (NUM_LEDS - 1):
             direction *= -1
         # Adjust this sleep value to change the dot's speed
