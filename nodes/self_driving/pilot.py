@@ -138,6 +138,7 @@ class Pilot:
             leg=self.plan.leg(state.origin, state.position),
             task="transit",
             clusters=clusters,
+            ceiling=self.commander.ceiling,
         )
 
         # A new waypoint means a new behaviour, and a fresh progress clock.

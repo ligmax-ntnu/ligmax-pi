@@ -159,6 +159,31 @@ def apply(points, rgb, keep):
     return out_points, colours[keep]
 
 
+def select(values, keep, n):
+    """One value per point, filtered by the same mask `apply()` used. Or None.
+
+    A second parallel array - `age_ms` today - that has to survive the mask
+    lined up with the returns it describes. Kept out of `apply()` so that
+    function's `(points, rgb)` contract does not change shape depending on what
+    the caller happened to pass, and given `n` explicitly because by the time it
+    is called the point array has usually already been filtered.
+
+    Returns None whenever the length does not match, which is the same rule
+    `apply()` follows for `rgb`: a parallel array off by one is worse than an
+    absent one, because it is wrong without ever looking wrong.
+    """
+    if values is None:
+        return None
+    arr = np.asarray(values).reshape(-1)
+    if arr.size != n:
+        return None
+    if keep is None or keep.shape[0] != n:
+        return arr
+    if keep.all():
+        return arr
+    return arr[keep]
+
+
 def describe():
     """What the masks are set to, for telemetry and the trip header."""
     return {

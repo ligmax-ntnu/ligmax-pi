@@ -414,8 +414,21 @@ class Dock(Behaviour):
         )
 
     def _something_close_ahead(self, ctx):
-        """The back of the berth, or anything else the bow is about to touch."""
+        """The back of the berth, or anything else the bow is about to touch.
+
+        Only things measured in the last second count. A remembered structure -
+        the world model now keeps established static marks indefinitely, with a
+        position uncertain by metres - would otherwise stop the approach dead a
+        boat-length short of a berth that is perfectly clear, and no amount of
+        looking at it would clear the belief. Inside a berth the lidar is a metre
+        or two from the walls and hitting them every sweep, so nothing real is
+        lost by insisting the evidence be current.
+        """
+        from .base import EMERGENCY_FRESH_S
+
         for track in ctx.world.all():
+            if track.age(ctx.now) > EMERGENCY_FRESH_S:
+                continue
             if abs(geo.relative_bearing(track.pos, ctx.boat, ctx.heading)) > 35.0:
                 continue
             if geo.distance(ctx.boat, track.pos) <= BERTH_END_M:

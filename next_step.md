@@ -28,6 +28,32 @@ pilot correctly refuses to drive with no GPS fix.
 **Not yet done on hardware:** anything involving the Pixhawk. It was unplugged
 the whole session - see §1.
 
+### Added 2026-08-09
+
+`ligmax-server` and `ligmax-edge` were **cloned for the first time** (DNS works
+from this Pi now) and this repo's assumptions were checked against them. See
+`repos.md` for what turned out to be right and what did not. Two findings are
+serious enough to have their own entries below: **§5.0** (the front lidar's
+mounting angle is known-wrong) and **§5.1** (the Jetson now colour-corrects, so
+`MIN_SATURATION` is calibrated against a distribution the boat no longer sends).
+
+Also landed on the Pi, in this repo:
+
+* **The world model remembers.** §4.5 below said it did not and that fixing it
+  was "a real upgrade and it is cheap" — it is now done. Established static
+  marks are kept indefinitely with a position uncertainty that grows to a 6 m
+  ceiling while unseen and collapses on the next sighting; vessels are never
+  remembered; and the map persists to disk in lat/lon so **attempt two starts
+  with attempt one's survey**.
+* **Clear-all and delete-one-object**, on the boat side (§2.1, §2.6).
+* **Trip recordings now carry everything** needed for a post-mortem, and are
+  bounded so they cannot fill the card (§2.7).
+* **A real bug fixed:** `recorder.start(label, plan=…)` raised `TypeError` on
+  **every** press of "Engage autonomy". The tick caught it, logged it and
+  disengaged — so the boat refused to go autonomous and the journal blamed the
+  tick. Also fixed a `NameError` on the origin-moved path in `world.py` and a
+  rate gate that silently recorded a 10 Hz loop at 6 Hz.
+
 ---
 
 ## 1. Hardware, before anything else
@@ -109,6 +135,39 @@ The two fallbacks exist if that check fails:
 * `LIGMAX_LATERAL_MODE=none` — honest, and it works: parallel docking degrades
   to an angled approach (`dock.Dock._crab`).
 
+### 1.5 The 5 knot speed limit — one gap is on the Pixhawk, not here
+
+**Done in software, 2026-08-09:** autonomous mode is held to 5 knots
+(2.5722 m/s), enforced in five independent places — see the block at the top of
+`nodes/self_driving/config.py`. The number is not overridable from the
+environment; every speed env var is clamped to it as it is read; a plan asking
+for more is refused at upload; and `io_manager/autopilot_bridge.py` clamps again
+in the last function before the value becomes a MAVLink message, so the limit
+does not depend on the autonomy node being correct.
+
+Verified by setting every speed variable to 99 and attacking the loopback
+control bus directly: nothing gets out above 5 kn, forward, astern, or as a
+forward+lateral resultant.
+
+**The gap this cannot close.** A MAVLink **MISSION run in AUTO** never routes a
+speed through this software at all — ArduPilot flies it from its own parameters.
+`mission.py` can upload one and `set_mode` can select AUTO, so if the boat is
+ever run that way the Pi-side cap is simply not in the loop.
+
+So set the limit on the flight controller too, once, and leave it:
+
+| Param | Set to | Why |
+|---|---|---|
+| `WP_SPEED` | ≤ 2.57 | Speed for AUTO/GUIDED waypoint navigation. |
+| `CRUISE_SPEED` | ≤ 2.57 | The default the throttle controller trims around. |
+| `MOT_THR_MAX` | as needed | Blunt backstop if the two above are not honoured on this frame. |
+
+Both are settable from the dashboard's existing `set_param` command, so this
+needs no code. Confirm with `CRUISE_SPEED` at 2.5 and a full-throttle GUIDED leg
+that the boat actually tops out where it should — an ArduPilot speed parameter
+is a controller target, not a governor, so the boat can overshoot it transiently
+on a following sea.
+
 ### 1.4 Measure and set
 
 | Env var | What | Why it matters |
@@ -143,7 +202,29 @@ human-readable result.
 | `autopilot_back` | - | Step back one — **NJORD §8.2's "re-enter behind the last passed waypoint"**. |
 | `autopilot_goto` | `{index}` | Jump the cursor. |
 | `record_start` / `record_stop` | `{label?}` | Record without engaging - useful for a manual run. |
-| `forget_world` | - | Clear the tracker between tasks. |
+| `forget_world` | - | Clear **everything** the boat has seen, the stored survey included. Between tasks. |
+| `forget_object` | `{id}` | **NEW.** Delete one tracked object by the `track_id` shown on the chart. Also removes it from the survey and refuses that spot for 30 s, so it does not come straight back. |
+| `careful_on` / `careful_off` | - | **NEW.** Careful mode: hold the boat to **1 knot**. Takes effect on the next tick and does not interrupt the run. |
+
+`careful_on` / `careful_off` want a **toggle in the autopilot panel**, not two
+buttons — it is a state, and the state is already in the telemetry
+(`telemetry.autopilot.commander.careful`, plus `speed_ceiling_kn` for what is
+actually in force). Server side that is one COMMANDS entry each, no args:
+
+```python
+"careful_on":  {"label": "Careful mode (1 kn)", "args": {}},
+"careful_off": {"label": "Normal speed",        "args": {}},
+```
+
+Worth showing the ceiling next to the speed readout whenever careful mode is on,
+because a boat that is inexplicably slow is the second most common thing a crew
+misdiagnoses under time pressure.
+
+`forget_object` is the only one of these the server does not offer yet — see
+§2.6. `forget_world` already exists at `ligmax_gui/server.py:204` and reaches the
+boat end to end; its behaviour has changed only in that it now clears the
+persisted survey too, which is what an operator pressing "clear everything"
+means and what stops it all reappearing after the next restart.
 
 ### 2.2 The plan format
 
@@ -221,6 +302,26 @@ Minimum useful UI, in priority order:
   - mirror `nodes/self_driving/obsticales.py`, and note the enum values are a
   wire format), `label`, `confidence`, `width_m`, `why`, and `velocity` for
   things that move. Draw them in their real colours; show `why` on hover.
+
+  **New since 2026-08-09, and no server change is needed for any of it** — every
+  one of these is already on `protocol.py`'s whitelist:
+
+  | field | meaning |
+  |---|---|
+  | `avoid_radius` | clearance **+ position uncertainty**, metres. The water the boat will actually give it. |
+  | `radius` | the position uncertainty alone, metres. |
+  | `age` | seconds since the object was last really measured. |
+  | `misses` | ageing steps with no measurement — "occluded" vs "never really there". |
+  | `why` | now ends with "remembered from N s ago, position good to about X m" when the boat is remembering rather than seeing. |
+
+  `avoid_radius` had **never been sent**: the Pi omitted it, so
+  `ligmax_gui/protocol.py:398` defaulted it to `0.0`, which means
+  `web/js/nogo.js::pointBlocked()` has never blocked anything and the map has
+  never drawn a no-go disc. It should simply start working. **Check it renders
+  sanely** — a remembered mark legitimately claims about 8 m (2 m clearance +
+  6 m uncertainty), which is correct but will look large the first time.
+  Same for `web/js/telemetry.js:627`, which counts tracks with
+  `avoid_radius > 0` as "blocked" and has therefore read 0 forever.
 * **`path`** with `kind: "reference"` - the plan, published on upload. The
   dashboard already draws this amber layer. §11.4 asks for the actual course
   over ground "compared against the ideal route" - that comparison is this layer
@@ -233,6 +334,90 @@ Minimum useful UI, in priority order:
 `telemetry.autopilot_bridge` says whether the node bus is delivering. "The
 autonomy node is not running" and "the bus is broken" look identical without it.
 
+`telemetry.autopilot.survey` is new: `{enabled, file, marks, age_s}`. So is
+`telemetry.autopilot.perception.established` / `.remembered` / `.restored`.
+Between attempts, **"the boat is starting with 7 marks it already knows"** is
+the single most useful sentence on the screen, and it is the only way to see
+that the survey actually loaded.
+
+`telemetry.autopilot.recording` now also carries `mb`, `free_mb` and
+`truncated`. `free_mb` is worth a small warning indicator — "the card filled up"
+is something the crew can act on from the dock and cannot otherwise see.
+
+### 2.6 Clear-all and delete-one on the map — **the remaining UI work**
+
+The boat side of both is done. What is missing is entirely in `ligmax-server`.
+
+**Clear all.** `forget_world` already exists in the COMMANDS table and
+`web/js/autopilot.js:198` renders it as a chip labelled "Clear what it has seen"
+— but only in the non-compact autopilot panel (`if (!this.compact)`). The ask
+was a button **on the map**. Add one to the map's control cluster in
+`web/js/map.js`, sending the same command through `autopilot.js`'s
+`send(name, args)`. The existing confirm text is still accurate.
+
+**Delete one object.** Two changes:
+
+1. `ligmax_gui/server.py`, in the COMMANDS table beside `forget_world`:
+
+   ```python
+   "forget_object": {"label": "Delete this object", "args": {"id": "float"}},
+   ```
+
+   `"float"` is how `autopilot_goto` declares its `index`, so it needs no new
+   validation machinery. The Pi accepts `id` or `track_id`.
+
+2. `web/js/map.js` — make tracks clickable. They are drawn at `map.js:952-1011`,
+   which already computes screen positions and maintains
+   `this.hovered?.track?.track_id`, so the hit-testing exists in all but name.
+   On click — or on a context menu, so it cannot fire during a pan — send
+   `forget_object` with `{id: track.track_id}`.
+
+   The id lines up on its own: the Pi sends `id`, and `protocol.py:393` maps it
+   with `raw.get("track_id", raw.get("id", index))`. What the operator clicks is
+   what the Pi will match.
+
+Confirm before deleting, because a mis-click removes a real mark. An undo is not
+needed: if the object is real the lidar puts it back, and the Pi's suppression
+window is exactly 30 s (`FORGET_SUPPRESS_S`).
+
+### 2.7 An endpoint to take trip recordings off the boat
+
+The server has ~200 GB free; the Pi has a 32 GB card with the OS on it.
+
+Measured 2026-08-09 on this Pi, worst case (synthetic incompressible data — real
+sweeps compress far better): a **15-minute attempt is 60 MB** on disk with
+everything recorded. The Pi keeps 40 trips or 3 GB, whichever bites first, and
+refuses to start a recording below 750 MB free. So the card is safe.
+
+But the recordings are stuck on the boat, and the run worth reviewing is often
+the one where the boat had to be carried back.
+
+There is **no bulk-upload route today** — `/api/ingest` takes JSON frames and
+`ligmax_gui/server.py:48` rejects a body over 4 MB. Proposed:
+
+* `POST /api/trip/<name>` — `Authorization: Bearer $LIGMAX_BOAT_KEY` (the same
+  ingest secret `nodes/io_manager/upload.py` already holds),
+  `Content-Type: application/gzip`, raw body, `Content-Range` for resume over a
+  4G link that drops.
+* Its own size limit, well above the frame limit — 256 MB.
+* Store as `trips/<boat>/<name>.jsonl.gz`, listed on a page so they can be
+  pulled in the tent.
+* `GET /api/trip` returning the names already held, so the Pi can skip what it
+  has already sent instead of re-uploading on every reconnect.
+
+The Pi side is deliberately **not written yet**: inventing a protocol against an
+endpoint that does not exist is how the two ends end up disagreeing. Once the
+route exists the uploader is small — `upload.py` already keeps a TLS connection
+alive and knows the boat key.
+
+Until then, by hand:
+
+```sh
+scp admin@ligmax-pi3.local:/home/admin/ligmax-trips/*.jsonl.gz .
+python3 tools/review_trip.py <file>
+python3 tools/review_trip.py <file> --html out.html
+```
+
 ---
 
 ## 3. Tuning, on the water, in this order
@@ -242,17 +427,24 @@ commit. `nodes/self_driving/config.py` documents each with where its default
 came from.
 
 1. **Colour thresholds - do this first, in the day's light.**
-   Measured on 6879 real returns on 2026-08-08: the Jetson's RGB is
-   **uncalibrated** (sensor-native, the colour matrix runs at the receiver), and
-   an indoor scene averaged (80, 48, 44) - a strong warm cast that made 46 of 49
-   clusters classify as RED. `MIN_SATURATION` was raised to 0.55 as a result,
-   which turns that scene into honest UNKNOWNs.
+   Measured on 6879 real returns on 2026-08-08: an indoor scene averaged
+   (80, 48, 44) - a strong warm cast that made 46 of 49 clusters classify as
+   RED. `MIN_SATURATION` was raised to 0.55 as a result, which turns that scene
+   into honest UNKNOWNs.
+
+   **That reasoning is now in doubt — see §5.1.** It assumed the Jetson sends
+   sensor-native RGB. Checked 2026-08-09: it does not. `fusion.py::_correct`
+   applies the OV5647 matrix before sending, on top of the ISP chroma gain in
+   the frame header's `saturation` field (default 2.0). If the 2026-08-08
+   capture predates that change, 0.55 is calibrated against a distribution the
+   boat no longer receives. **Re-derive it from a fresh capture. This is the
+   single highest-value tuning action available and it takes ten minutes.**
    * Put a real red and a real green buoy in front of the boat, on the water,
      and check `telemetry.autopilot.sees`.
-   * If a cast persists, try `LIGMAX_AP_WHITE_BALANCE=1` (grey-world, per sweep,
-     off by default because it fails when one colour fills the view).
-   * **The proper fix is white balance on the Jetson**, where the sensor is. See
-     §5.
+   * `LIGMAX_AP_WHITE_BALANCE=1` (grey-world, per sweep) is now **less likely to
+     be the right answer**, not more: the Jetson already corrects, and grey-world
+     on top of a correction is correcting twice. Try it only if a cast persists
+     after the threshold has been re-derived.
 2. **`LIGMAX_AP_BUOY_CLEARANCE_M`** - watch a pass and see if it looks tight.
 3. **`LIGMAX_AP_CRUISE_SPEED_MS` / `CAUTION_SPEED_MS`** - the time multiplier is
    worth at most 9 %; a broken autonomy run costs far more. Start slow.
@@ -285,10 +477,33 @@ Ordered by what they cost.
    pretending otherwise. A proper planner is next year's job.
 4. **The Otter's velocity is a finite difference of a smoothed track.** Good
    enough for a CPA at 20 m; it will lag a sharp turn by a second or so.
-5. **`world.py` has no map memory.** Marks are dropped after
-   `TRACK_DROP_AFTER_S` (6 s) unseen. Correct on a 3D fix; with **RTK fixed** it
-   would be worth remembering them for a whole leg, which would let the boat
-   plan a gate it can no longer see. That is a real upgrade and it is cheap.
+5. ~~**`world.py` has no map memory.**~~ **DONE, 2026-08-09.** Marks the boat has
+   properly studied are now kept indefinitely and survive a restart. What to
+   know about it:
+   * Promotion to permanent memory needs `TRACK_ESTABLISH_HITS` (12) sightings
+     spread over `TRACK_ESTABLISH_SPAN_S` (2 s) at `TRACK_ESTABLISH_CONF` (0.80),
+     and the type must be static. **The span is the test that matters**: a burst
+     off one wave crest can reach twelve hits in 300 ms and cannot reach them
+     across two seconds. A one-off stray return still dies after 6 s as before.
+   * A remembered mark's position uncertainty grows at
+     `TRACK_SIGMA_GROWTH_M_S` (0.05 m/s) to a `TRACK_SIGMA_MAX_M` (6 m) ceiling,
+     and collapses to 0.35 m the instant it is measured again. Every clearance
+     the boat uses adds it, so it automatically gives a half-remembered mark a
+     wide berth and a visible one a tight one.
+   * The survey persists to `/home/admin/.ligmax/survey.json` **in lat/lon**,
+     not grid metres — the grid origin is cached in `/run`, which is tmpfs, so
+     a reboot re-zeroes it and metres would silently describe somewhere else. A
+     survey older than `SURVEY_MAX_AGE_S` (2 days) is discarded, because marks
+     get re-laid between practice days.
+   * Vessels are never remembered. The Otter is the one object guaranteed to
+     have moved.
+   * `emergency_stop_needed` and docking's berth-end check now ignore tracks
+     older than 1 s, so a memory can never slam the brakes on for something that
+     is not there.
+
+   **Tune on the water:** `LIGMAX_AP_TRACK_SIGMA_MAX_M` is the honest guess at
+   how far a Njord mark drifts on its mooring, and nobody has measured it. If
+   the boat gives remembered marks a comically wide berth, that is the number.
 6. **Nothing uses the gate structure of Task 2.** `perception.split_by_gap`
    already finds 5 m pairs (§9.2) - the same function the berth finder uses - but
    `buoys.py` treats each mark individually. Steering explicitly at gate
@@ -302,25 +517,96 @@ Ordered by what they cost.
 
 ### `ligmax-edge` (the Jetson)
 
-1. **White-balance the RGB before it goes on the wire**, or send the gains
-   alongside it. This is the single change that would most improve buoy
-   classification, and it belongs there - that is where the sensor and its
-   colour matrix are. See §3.1 for the measurement.
-2. **Mask the front lidar's view of the boat** on that side, where `rig.json`
+#### 5.0 The front lidar's mounting angle is known-wrong — **BLOCKER**
+
+**`rig.json`, `lidar.yaw_deg`.** The file says so itself, at length:
+
+> "STALE since the unit was remounted upside down (2026-08-08) … This -45 was
+> measured for the OLD, right-side-up mount … **do not trust the front lidar's
+> bearing (or its colouring, which projects through this same geometry) until it
+> is remeasured.**"
+
+`angle_dir` was flipped to `-1` on the same date and the file states that has
+**not been run against hardware either**.
+
+Nothing on the Pi can compensate. Everything downstream is affected: cluster
+positions, the world model, the buoy rule's port/starboard decision, and now the
+survey carried into attempt two. A mirrored world is the failure most likely to
+survive a casual glance — the plot looks plausible and every mark is on the
+wrong side.
+
+`rig.json` gives the procedure:
+
+```
+put a target dead ahead, read its RAW reported_deg in
+test/test_lidar_overlay.py (angle_zero_deg is 0, so it needs no correction),
+and with angle_dir now -1,
+    yaw_deg = reported_deg_dead_ahead
+```
+
+Then check the sign: dead ahead should read near 0° in the overlay tool and near
+the top of the receiver's top-down plot.
+
+While in there: `cam0` is **port**-facing (`yaw -75`) and `cam1` **starboard**
+(`yaw +75`) — back to back, 150° apart, not both forward. The note says those
+two yaws are a hand-measured figure split evenly and asks for verification with
+`test/test_lidar_overlay.py --cam 0 --yaw N`. Same session, same rig.
+
+**Do this before any scored run.** It is the on-water equivalent of §1.1.
+
+#### 5.1 The Jetson already colour-corrects — the Pi assumed it did not
+
+~~White-balance the RGB before it goes on the wire.~~ **Already done, and the
+old advice was backwards.** `fusion.py::_correct` applies the OV5647 matrix
+before sending, on top of the ISP chroma gain reported in the frame header's
+`saturation` field (default 2.0, because JetPack ships no ISP tuning for this
+sensor and its untouched output is about a third of normal chroma). The edge's
+own docstring is explicit:
+
+> "Display them as they arrive … a consumer that boosts saturation to compensate
+> for raw sensor values is now correcting twice."
+
+This repo believed the opposite, and `config.MIN_SATURATION = 0.55` was chosen
+on that belief. Both `nodes/self_driving/config.py` and
+`perception/classify.py` now say so at the value itself. It has deliberately
+**not** been guessed downward: too high fails safe (everything reads UNKNOWN and
+is avoided on both sides) while too low is a confident wrong-side pass, which is
+the failure being scored.
+
+**Someone should run `git log -- fusion.py` in `ligmax-edge`** and establish
+whether the correction predates the 2026-08-08 capture. That settles whether
+0.55 was ever right, and it is a one-command answer.
+
+#### 5.2 The rest
+
+1. **Mask the front lidar's view of the boat** on that side, where `rig.json`
    lives. (Already planned per the 2026-08-08 conversation. `masks.mask_front`
    exists on the Pi as a backstop but defaults to `none` - two places correcting
    one occlusion is how a rig gets corrected twice.)
-3. `run.sh` still needs **`LIDAR=1`** by hand. Make it the default: nothing on
-   the boat works without it now.
-4. The lidar block sends `age_ms`, `dropped` and `stale` that
-   `edge_protocol.py` does not document. In the 2026-08-08 capture **179 of 269
-   points were `stale`** - coloured from a frame outside the freshness window.
-   Worth understanding; it may be costing colour accuracy.
+2. ~~`run.sh` still needs **`LIDAR=1`** by hand.~~ **Already the default** —
+   `run.sh:78` is `if [ "${LIDAR:-1}" = "0" ]`, so only `LIDAR=0` turns it off.
+   `repos.md` has been corrected.
+3. The lidar block sends `age_ms`, `dropped` and `stale` that the Pi's
+   `edge_protocol.py` **still does not document** (the *code* is byte-identical
+   to the edge's `protocol.py` — verified by diff — so the wire format is sound;
+   only the docstring is behind). In the 2026-08-08 capture **179 of 269 points
+   were `stale`**, coloured from a frame outside the freshness window.
+
+   The useful follow-up is on the Pi: weight a cluster's colour vote by each
+   point's `age_ms` instead of treating every coloured return equally. Worth
+   doing only **after** §5.1, which dominates it. Note also that `skew_ms` is now
+   a whole-sweep summary and no longer decides any individual point's colour,
+   and that `cam = -1` only appears with `--lidar-keep-unseen` — by default those
+   returns are dropped, so `n + dropped` is the rotation size and `n` alone is
+   not. The Pi is safe against the `cam` change (`scan.py:174` maps `cam < 0` to
+   the uncoloured sentinel either way).
 
 ### `ligmax-server`
 
-Everything in §2. Also: `tracks` and `path` are already being published, so the
-chart work can start before any of the UI.
+Everything in §2 — and §2.6 (the map's clear-all and delete-one buttons) and
+§2.7 (an endpoint to take trip recordings off the boat) are the two new ones.
+`tracks` and `path` are already being published, so the chart work can start
+before any of the UI.
 
 ---
 
@@ -336,6 +622,13 @@ chart work can start before any of the UI.
    the ack, check the amber route on the chart is the right shape.
 4. Drive to the start under remote control (the rules require this).
 5. **`autopilot_start`.** The timer starts when the boat goes autonomous.
+
+   For a **first pass down an unfamiliar course**, or the first run after
+   changing a threshold, send `careful_on` first: the boat is then held to
+   **1 knot** and can be walked alongside. `careful_off` releases it without
+   interrupting the run. The panel shows `speed_ceiling_kn` so there is never a
+   question about which is in force — and the boat is never above 5 kn either
+   way.
 6. Watch `mode` and `reason`. If `stuck` goes true, you have ~20 s before §8.2
    says take over.
 7. After the run: `autopilot_stop`, then
@@ -346,8 +639,38 @@ chart work can start before any of the UI.
    ```
 
    Read the waypoint table and the `tracked` list **before** attempt two. That is
-   what the recorder is for.
-8. Between tasks: `forget_world`, then `set_plan` for the next one.
+   what the recorder is for. Tracks marked `E` were established and are in the
+   survey; `R` means they were restored from a previous run.
+
+### Between the two attempts at the SAME task — new, and worth points
+
+The boat now keeps the marks it surveyed. **Do not press `forget_world` between
+attempt one and attempt two of the same task** — that is exactly the map you
+want to keep. Attempt two starts knowing roughly where every gate is, at ±6 m,
+tightening to ±0.35 m the moment the lidar sees each one again.
+
+Check it loaded: `telemetry.autopilot.survey.marks` and
+`telemetry.autopilot.perception.restored` should be non-zero at the start of
+attempt two, and the journal says so loudly:
+
+```
+restored 7 surveyed mark(s) from /home/admin/.ligmax/survey.json -
+each is good to about 6.0 m until the lidar sees it again
+```
+
+If a mark on the chart is wrong — a phantom off a wave, or something that has
+since been moved — delete that one (§2.6) rather than clearing everything.
+
+8. Between **different tasks**, on a different part of the course:
+   `forget_world` (which now clears the survey too), then `set_plan` for the
+   next one.
+
+**The one thing that invalidates the survey** is the grid origin moving: a
+reboot empties `/run/ligmax/grid-origin.json`, and the dashboard's
+`recentre_origin` drops it deliberately. The survey is stored in lat/lon so it
+survives both, and `world.py` rebuilds from it automatically — but if you press
+`recentre_origin` mid-task you will see the live tracks vanish and the surveyed
+ones reappear at their absolute positions. That is correct, not a fault.
 
 **If autonomy will not engage**, the reason is in `telemetry.autopilot.blocked`
 and it is one of seven things, in this order: not engaged / no state / comms lost

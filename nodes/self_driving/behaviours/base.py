@@ -65,11 +65,11 @@ class Context:
 
     __slots__ = (
         "state", "world", "plan", "config", "now", "waypoint", "leg", "task",
-        "clusters",
+        "clusters", "ceiling",
     )
 
     def __init__(self, state, world, plan, config, now, waypoint, leg, task,
-                 clusters=()):
+                 clusters=(), ceiling=None):
         self.state = state
         self.world = world
         self.plan = plan
@@ -84,6 +84,14 @@ class Context:
         # routing that measurement through the tracker would smooth away the
         # centimetres the 2 m berth is decided by.
         self.clusters = clusters
+        # The speed ceiling in force this tick, m/s - `commander.Commander`'s,
+        # which is the 5 kn vessel limit or careful mode's 1 kn. Passed in rather
+        # than read from config so that switching careful mode on takes effect on
+        # the next tick, and so that a behaviour *plans* at the slower speed
+        # instead of asking for more and being silently clamped on the way out.
+        self.ceiling = (
+            config.MAX_SPEED_MS if ceiling is None else float(ceiling)
+        )
 
     # -- the handful of derived figures every behaviour wants ---------------
 
@@ -110,10 +118,17 @@ class Context:
         return geo.distance(self.boat, target)
 
     def speed_limit(self, default):
-        """The waypoint's own speed if it set one, else `default`, else the cap."""
+        """The waypoint's own speed if it set one, else `default`, else the cap.
+
+        `self.ceiling` rather than `config.MAX_SPEED_MS`, so careful mode is
+        obeyed here - where the behaviour is deciding - rather than only at the
+        wire. The difference is visible: a behaviour that knows it is limited to
+        1 kn reports that speed in its telemetry and reasons about arrival times
+        with it, instead of reporting 1.2 m/s while the boat does 0.51.
+        """
         if self.waypoint is not None and self.waypoint.speed is not None:
-            return min(self.waypoint.speed, self.config.MAX_SPEED_MS)
-        return min(default, self.config.MAX_SPEED_MS)
+            return min(self.waypoint.speed, self.ceiling)
+        return min(default, self.ceiling)
 
     def acceptance_radius(self):
         if self.waypoint is not None and self.waypoint.radius is not None:
@@ -255,7 +270,16 @@ def deconflict(ctx, aim_xy, extra_clearance=0.0, ignore=()):
         for track in ctx.world.confirmed():
             if track.id in ignore:
                 continue
-            clearance = clearance_for(track.kind, ctx.config) + extra_clearance
+            # Plus however unsure we are of where it actually is. A mark the boat
+            # is looking at right now costs ~35 cm of extra room; one it is
+            # remembering from two minutes ago costs the full sigma ceiling. That
+            # is the whole behavioural difference between seeing and remembering,
+            # and it falls out of one addition rather than a special case.
+            clearance = (
+                clearance_for(track.kind, ctx.config)
+                + extra_clearance
+                + track.sigma_m
+            )
             position = _where(track, boat, ctx)
             t, along, cross = geo.project_onto_leg(position, boat, aim)
             if t <= 0.0 or along > geo.distance(boat, aim) + clearance:
@@ -294,6 +318,12 @@ def _where(track, boat, ctx):
     return track.predicted(min(ctx.config.COLREG_HORIZON_S, distance / own_speed))
 
 
+# An emergency stop is only ever triggered by something the boat can actually
+# see. A track older than this is a memory, and memories do not get to slam the
+# brakes on - see `emergency_stop_needed`.
+EMERGENCY_FRESH_S = 1.0
+
+
 def emergency_stop_needed(ctx):
     """Something too close to steer around. `(bool, why)`.
 
@@ -302,12 +332,24 @@ def emergency_stop_needed(ctx):
     track has to be confirmed over several sweeps before it exists, and
     something that appeared 1.5 m off the bow this instant does not get to wait
     three sweeps for confirmation.
+
+    Deliberately based on a **recent** return, too, and that qualifier arrived
+    with remembered marks. `world.all()` now includes established tracks that
+    have not been measured for minutes and whose position is uncertain by metres.
+    One of those, remembered a metre off the bow, would hold the boat stationary
+    against an obstacle that is not there and that no sweep can clear - the boat
+    would sit in open water insisting something was in front of it. So the test
+    is restricted to tracks measured within the last second: everything that was
+    ever going to fire this check still does, because anything genuinely 1.5 m
+    off the bow is being hit by the lidar continuously.
     """
     boat, heading = ctx.boat, ctx.heading
     if boat is None or heading is None:
         return False, ""
     limit = ctx.config.MIN_OBSTACLE_RANGE_M + 1.0
     for track in ctx.world.all():
+        if track.age(ctx.now) > EMERGENCY_FRESH_S:
+            continue
         distance = geo.distance(boat, track.pos)
         if distance > limit:
             continue

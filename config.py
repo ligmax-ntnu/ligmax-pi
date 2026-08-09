@@ -26,6 +26,36 @@ SELF_DRIVING_PORT = 5559
 LIGHT_SYSTEM_PORT = 5560
 
 
+# ---------------------------------------------------- the vessel's speed limit
+#
+# **5 knots, under autonomy. This is the one number both nodes have to agree on**
+# and it therefore lives here, in the module they both already import, rather
+# than in either of their own configs.
+#
+# It is enforced twice on purpose, at two different layers:
+#
+#   nodes/self_driving/config.py   clamps every configured speed to it, and
+#                                  `commander.py` clamps every command to it on
+#                                  the way out. That is the layer that makes the
+#                                  boat *behave*.
+#   nodes/io_manager/autopilot_bridge.py
+#                                  clamps again immediately before the value
+#                                  becomes a MAVLink message. That is the layer
+#                                  that makes the limit *true*.
+#
+# The second one is not redundancy for its own sake. io_manager takes control
+# messages off a loopback PUB/SUB socket and, until this existed, passed the
+# `speed`, `vx` and `vy` fields into MAVLink verbatim - so the limit held only
+# for as long as the autonomy node was the only thing on that bus and had no
+# bugs. A limit that depends on the correctness of the process it is limiting is
+# not a limit. The last hop before the wire enforces it independently.
+#
+# Not overridable from the environment, in either place. Raising it is a commit.
+KNOT_MS = 0.514444
+VESSEL_SPEED_LIMIT_KNOTS = 5.0
+VESSEL_SPEED_LIMIT_MS = VESSEL_SPEED_LIMIT_KNOTS * KNOT_MS  # 2.5722 m/s
+
+
 def resolve_serial(env_var, *candidates):
     """First candidate that exists, or the last one if none do.
 

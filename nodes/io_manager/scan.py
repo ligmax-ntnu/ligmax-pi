@@ -174,6 +174,16 @@ def front_scan(cloud):
         rgb[cams < 0] = NO_COLOUR
         scan["rgb"] = rgb.reshape(-1).tolist()
         scan["coloured"] = int((cams >= 0).sum())
+
+        # How mistimed each colour is. The Jetson colours every return from the
+        # nearest of a few buffered frames, so one sweep carries a spread of
+        # ages, and `classify.age_weights` uses this to let a well-timed return
+        # outvote one sampled a quarter-second away. Carried only alongside a
+        # colour that exists: an age without an RGB has nothing to weight.
+        ages = np.asarray(cloud.get("age_ms") or (), dtype=np.float64)
+        if ages.size == xs.size:
+            scan["age_ms"] = _round(ages)
+            scan["stale"] = int(cloud.get("stale") or 0)
     return scan
 
 

@@ -21,13 +21,31 @@ The colour map, which is the whole classifier
 
 Why hue and not RGB distance
 ----------------------------
-The values on the wire are **sensor-native, uncalibrated** - the OV5647's colour
-matrix runs at the receiver, so these are the raw numbers the detector's boxes
-were drawn from. Absolute RGB therefore drifts with exposure, with the time of
-day and between the two cameras. Hue survives all three: a red buoy in shade and
-the same buoy in sun differ enormously in *value* and barely at all in *hue*.
-Saturation then separates "a colour" from "a grey", and value separates white
-from black among the greys.
+Absolute RGB drifts with exposure, with the time of day and between the two
+cameras. Hue survives all three: a red buoy in shade and the same buoy in sun
+differ enormously in *value* and barely at all in *hue*. Saturation then
+separates "a colour" from "a grey", and value separates white from black among
+the greys.
+
+**What the values on the wire actually are - checked 2026-08-09, and not what
+this file used to say.** The Jetson now colour-corrects before sending: it
+applies the OV5647 matrix in `ligmax-edge/fusion.py::_correct`, on top of the
+chroma gain Argus's ISP has already applied (the `saturation` header field,
+default 2.0, because JetPack ships no ISP tuning for this sensor and its
+untouched output is about a third of normal chroma). So these are *corrected*
+values comparable to a corrected preview, **not** the sensor-native ones this
+docstring claimed for as long as the edge repo was unavailable to check against.
+
+That mattered for one number, `config.MIN_SATURATION`, which was raised to 0.55
+on the strength of a capture whose saturation statistics were read as a
+raw-sensor warm cast. The worry was that the capture predated the correction, in
+which case the threshold would be calibrated against a distribution the boat no
+longer receives. **It does not: settled by git 2026-08-09.** The capture carries
+`age_ms`, which first appears in ligmax-edge at 1b70dc4 (2026-08-08 18:04),
+while `_correct` landed at 15e8d7d (2026-08-08 17:19) - an hour earlier. The
+returns were already corrected, the measurement holds, and the warm cast in it
+is warm indoor light rather than an uncorrected sensor. `config.py` carries the
+full argument at the value itself.
 
 Njord's own paint codes make this workable: RAL 3001 signal red and neon green
 are about as far apart in hue as two colours get, and RAL 1003 yellow sits
@@ -115,8 +133,48 @@ def white_balance_gains(rgb, config):
     return tuple(float(min(limit, max(1.0 / limit, grey / m))) for m in means)
 
 
-def colour_votes(rgb, config, gains=None):
-    """Per-return colour names, as a `{name: count}` tally. Uncoloured ignored.
+def age_weights(age_ms, config):
+    """Per-return vote weight from `age_ms`, or None when there is no age.
+
+    Full weight inside the edge's freshness window, ramping linearly down to
+    `COLOUR_AGE_MIN_WEIGHT` by the age at which the edge stops colouring at all.
+    A return the Jetson could not colour carries -1 rather than an age; it is
+    dropped from the vote by the `lit` mask before this is ever consulted, so it
+    is given full weight here rather than special-cased twice.
+    """
+    if age_ms is None:
+        return None
+    ages = np.asarray(age_ms, dtype=np.float64).reshape(-1)
+    if ages.size == 0:
+        return None
+    fresh = float(config.COLOUR_AGE_FRESH_MS)
+    stale = float(config.COLOUR_AGE_STALE_MS)
+    floor = float(config.COLOUR_AGE_MIN_WEIGHT)
+    # A misconfigured pair (stale <= fresh) must not divide by zero or invert the
+    # ramp; it degrades to "everything inside fresh, full weight".
+    if not (stale > fresh):
+        return np.ones_like(ages)
+    over = np.clip((ages - fresh) / (stale - fresh), 0.0, 1.0)
+    weights = 1.0 - (1.0 - floor) * over
+    # -1 is "nothing coloured this", not "infinitely fresh".
+    return np.where(ages < 0.0, 1.0, weights)
+
+
+def colour_votes(rgb, config, gains=None, age_ms=None):
+    """Colour names for one cluster's returns.
+
+    Returns `(tally, coloured, weighted)`:
+
+        tally      `{name: count}` - raw returns of each colour, for the operator
+        coloured   how many returns had any colour at all
+        weighted   `{name: weight}` - the same tally with each return counted by
+                   how well-timed the frame that coloured it was (`age_weights`)
+
+    The two tallies are kept apart on purpose. `weighted` decides *which colour
+    wins and how confidently*; `tally` and `coloured` are what the boat says out
+    loud and what `MIN_COLOURED_POINTS` gates on, because "only 2 coloured
+    returns" has to keep meaning two actual returns. With no `age_ms` the two are
+    identical and nothing downstream can tell the difference.
 
     Names are the five the boat reasons in: "red", "green", "yellow", "white",
     "dark". Anything with a hue that is none of the three - a blue fender, the
@@ -126,13 +184,24 @@ def colour_votes(rgb, config, gains=None):
     """
     arr = np.asarray(rgb)
     if arr.size == 0:
-        return {}, 0
+        return {}, 0, {}
     if arr.ndim == 1:
         arr = arr.reshape(-1, 3)
     # A single -1 channel marks the whole return as uncoloured.
     lit = ~(arr <= NO_COLOUR).any(axis=1)
     if not lit.any():
-        return {}, 0
+        return {}, 0, {}
+
+    # Sliced by the same mask as the colours, before anything is counted: an
+    # age array that has slipped by one point relative to its RGB is worse than
+    # no age array at all, so a length mismatch drops the weighting entirely
+    # rather than mis-weighting the sweep.
+    weights = age_weights(age_ms, config)
+    if weights is not None and weights.shape[0] == lit.shape[0]:
+        weights = weights[lit]
+    else:
+        weights = None
+
     arr = arr[lit]
 
     if gains is not None:
@@ -162,6 +231,7 @@ def colour_votes(rgb, config, gains=None):
     # Everything that had a hue but not one of the three - blues, purples.
     other = strong & ~red & ~yellow & ~green
 
+    weighted = {}
     for name, mask in (
         ("red", red),
         ("green", green),
@@ -172,7 +242,10 @@ def colour_votes(rgb, config, gains=None):
         count = int(mask.sum())
         if count:
             tally[name] = count
-    return tally, int(arr.shape[0])
+            weighted[name] = (
+                float(weights[mask].sum()) if weights is not None else float(count)
+            )
+    return tally, int(arr.shape[0]), weighted
 
 
 def classify(cluster, config, context="transit", gains=None):
@@ -199,7 +272,9 @@ def classify(cluster, config, context="transit", gains=None):
             f"no camera colour ({cluster.source})",
         )
 
-    tally, coloured = colour_votes(cluster.rgb, config, gains)
+    tally, coloured, weighted = colour_votes(
+        cluster.rgb, config, gains, age_ms=cluster.age_ms
+    )
     if coloured < config.MIN_COLOURED_POINTS or not tally:
         return (
             ObstacleType.UNKNOWN,
@@ -208,8 +283,14 @@ def classify(cluster, config, context="transit", gains=None):
             f"only {coloured} coloured return(s)",
         )
 
-    winner, votes = max(tally.items(), key=lambda item: item[1])
-    fraction = votes / coloured
+    # The winner is decided on WEIGHT - a colour sampled from a well-timed frame
+    # outvotes one sampled from a frame a quarter-second away - but the fraction
+    # is measured against the weight actually cast, so a cluster whose returns
+    # are uniformly stale is not penalised for it. Only disagreement is.
+    winner = max(weighted, key=weighted.get)
+    total_weight = sum(weighted.values())
+    fraction = (weighted[winner] / total_weight) if total_weight > 0 else 0.0
+    votes = tally[winner]
     if fraction < config.COLOUR_VOTE_FRACTION:
         return (
             ObstacleType.UNKNOWN,
@@ -238,18 +319,30 @@ def classify(cluster, config, context="transit", gains=None):
             f"dark return at {cluster.range_m:.1f} m, most likely water",
         )
 
+    # Say so when the timing changed the answer. A cluster that reads green on
+    # weight but red on a straight count is the single most useful thing this
+    # module can tell an operator, because it is the case where the boat is about
+    # to pass on a side that the raw pixel counts do not support.
+    plurality = max(tally, key=tally.get)
+    aside = (
+        f", on freshness (raw count says {plurality})" if plurality != winner else ""
+    )
     return (
         kind,
         confidence,
         f"{winner} {cluster.width_m:.2f} m at {cluster.range_m:.1f} m, "
-        f"{votes}/{coloured} returns agree",
+        f"{votes}/{coloured} returns agree{aside}",
     )
 
 
 def _large(cluster, config, context, gains=None):
     """Something wider than a mark: a vessel, or a structure."""
-    tally, coloured = (
-        colour_votes(cluster.rgb, config, gains) if cluster.rgb is not None else ({}, 0)
+    # Colour is only a hint at this size - the decision below is made on width -
+    # so the raw tally is what gets shown, unweighted.
+    tally, _coloured, _weighted = (
+        colour_votes(cluster.rgb, config, gains, age_ms=cluster.age_ms)
+        if cluster.rgb is not None
+        else ({}, 0, {})
     )
     hint = f" ({_tally_text(tally)})" if tally else ""
 
@@ -339,7 +432,13 @@ class CardinalVote:
 
     def describe(self):
         if self.committed:
-            return f"{self.committed} cardinal ({self._votes[self.committed]} votes)"
+            # `.get`, not `[]`: a vote tally restored from the survey file can in
+            # principle name a committed direction it has no votes for, and this
+            # string is built on the 10 Hz tick inside `Track.telemetry()`.
+            return (
+                f"{self.committed} cardinal "
+                f"({self._votes.get(self.committed, 0)} votes)"
+            )
         if not self._votes:
             return "cardinal, no camera vote yet"
         return "cardinal, votes " + _tally_text(self._votes) + " - not committed"

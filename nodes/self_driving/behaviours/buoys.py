@@ -132,13 +132,18 @@ class Buoys(Transit):
             ObstacleType.RED: -1.0 if outbound else +1.0,
             ObstacleType.GREEN: +1.0 if outbound else -1.0,
         }
-        clearance = ctx.config.BUOY_CLEARANCE_M
 
         notes = []
         shifted = aim
         for track in ctx.world.marks():
             if track.kind not in BUOY_TYPES:
                 continue
+            # Per mark, not once for the leg: a remembered buoy has to be cleared
+            # by its own uncertainty as well as the rule's margin, or the boat
+            # passes what it believes is the legal side of a mark that is
+            # actually several metres the other way - which scores as passing on
+            # the wrong side, the exact failure this behaviour exists to avoid.
+            clearance = ctx.config.BUOY_CLEARANCE_M + track.sigma_m
             _t, along, cross = geo.project_onto_leg(track.pos, ctx.boat, shifted)
             if along < ENFORCE_AHEAD_M:
                 continue  # already passed it
@@ -222,7 +227,12 @@ class Buoys(Transit):
                 ctx.config.DOCK_SPEED_MS * 2.0,
             )
 
-        via = geo.offset_point(track.pos, safe_bearing, CARDINAL_OFFSET_M)
+        # The via-point is pushed out by the mark's own uncertainty too. A
+        # cardinal says which side of *it* is safe water, so being on the wrong
+        # side by the width of the position error is the whole failure.
+        via = geo.offset_point(
+            track.pos, safe_bearing, CARDINAL_OFFSET_M + track.sigma_m
+        )
         # Only route through the via-point while the boat is not yet past it;
         # after that the waypoint itself is the target again.
         if geo.distance(boat, via) < 2.0:

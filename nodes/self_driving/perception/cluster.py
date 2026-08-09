@@ -58,16 +58,17 @@ class Cluster:
         width_m     chord across the cluster
         n           returns in it
         rgb         `(n, 3)` uint8 array, or None for an uncoloured sensor
+        age_ms      `(n,)` of how mistimed each return's colour was, or None
         source      which sensor saw it, for the operator's log
     """
 
     __slots__ = (
         "centre", "nearest", "range_m", "bearing_deg", "width_m", "n", "rgb", "source",
-        "gains",
+        "gains", "age_ms",
     )
 
     def __init__(self, centre, nearest, range_m, bearing_deg, width_m, n, rgb, source,
-                 gains=None):
+                 gains=None, age_ms=None):
         self.centre = centre
         self.nearest = nearest
         self.range_m = range_m
@@ -75,6 +76,13 @@ class Cluster:
         self.width_m = width_m
         self.n = n
         self.rgb = rgb
+        # How far the camera frame that coloured each return sat from the return
+        # itself, in milliseconds (`edge_protocol.py`). Carried per point rather
+        # than per sweep because the Jetson colours each return from the nearest
+        # of several buffered frames, so one sweep genuinely holds a spread of
+        # ages. None for a sensor that sends no age, and for the aft unit, which
+        # sends no colour at all.
+        self.age_ms = age_ms
         self.source = source
         # The sweep's white-balance gains, carried here rather than recomputed
         # per cluster: a colour cast is a property of the whole scene, and a
@@ -89,7 +97,8 @@ class Cluster:
         )
 
 
-def cluster_sweep(points, rgb=None, source="lidar", *, config, coloured_mask=None):
+def cluster_sweep(points, rgb=None, source="lidar", *, config, coloured_mask=None,
+                  age_ms=None):
     """One sweep -> a list of `Cluster`. Never raises on odd input.
 
     `points` is an `(n, 2)` array-like of `[starboard, forward]` metres.
@@ -97,12 +106,17 @@ def cluster_sweep(points, rgb=None, source="lidar", *, config, coloured_mask=Non
     `coloured_mask` is an optional length-n boolean saying which points a camera
     actually saw - `scan.py` marks the rest `-1, -1, -1` rather than black,
     precisely so "no camera covered this" cannot be read as "this is dark".
+    `age_ms` is the optional length-n per-point colour age, which rides along
+    through every filter and reorder below so that a cluster's ages stay lined up
+    with its own returns; a mismatched length is dropped rather than carried,
+    because an age array off by one point is worse than none at all.
     """
     pts = np.asarray(points, dtype=np.float64)
     if pts.ndim != 2 or pts.shape[0] == 0 or pts.shape[1] != 2:
         return []
 
     colours = _as_rgb(rgb, pts.shape[0])
+    ages = _as_ages(age_ms, pts.shape[0])
     # Estimated once, over the whole sweep, before anything is split up.
     gains = white_balance_gains(colours, config) if colours is not None else None
     if colours is not None and coloured_mask is not None:
@@ -120,6 +134,8 @@ def cluster_sweep(points, rgb=None, source="lidar", *, config, coloured_mask=Non
     pts, ranges = pts[keep], ranges[keep]
     if colours is not None:
         colours = colours[keep]
+    if ages is not None:
+        ages = ages[keep]
 
     # Bearings, then sort into angular order. `arctan2(starboard, forward)` is
     # the relative-bearing convention used everywhere in this repo: 0 ahead,
@@ -129,6 +145,8 @@ def cluster_sweep(points, rgb=None, source="lidar", *, config, coloured_mask=Non
     pts, ranges, bearings = pts[order], ranges[order], bearings[order]
     if colours is not None:
         colours = colours[order]
+    if ages is not None:
+        ages = ages[order]
 
     # Distance between angular neighbours, and the range-dependent gap that
     # decides whether they belong to the same thing.
@@ -171,6 +189,7 @@ def cluster_sweep(points, rgb=None, source="lidar", *, config, coloured_mask=Non
                 width_m=width,
                 n=int(index.size),
                 rgb=(colours[index] if colours is not None else None),
+                age_ms=(ages[index] if ages is not None else None),
                 source=source,
                 gains=gains,
             )
@@ -205,6 +224,22 @@ def _as_rgb(rgb, n):
     if arr.ndim != 2 or arr.shape[0] != n or arr.shape[1] != 3:
         return None
     return arr.astype(np.int16)
+
+
+def _as_ages(age_ms, n):
+    """`(n,)` float array of per-point colour ages, or None.
+
+    Length is checked rather than trusted: this array only ever *weights* a vote,
+    so a silent misalignment would tilt colours towards whichever returns happen
+    to sit at the same index in a shorter array - a bias with no symptom. None is
+    the safe answer and costs only the weighting.
+    """
+    if age_ms is None:
+        return None
+    arr = np.asarray(age_ms, dtype=np.float64).reshape(-1)
+    if arr.size != n:
+        return None
+    return arr
 
 
 def split_by_gap(clusters, gap_m, tolerance_m):

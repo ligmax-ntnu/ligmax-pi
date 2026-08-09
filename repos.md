@@ -13,23 +13,29 @@ paths in every docstring (`../ligmax-server/web/js/map.js`) resolve.
 | Repo | Remote | Cloned here? | What it is |
 |---|---|---|---|
 | **ligmax-pi** | `github.com/ligmax-ntnu/ligmax-pi` | ✅ `/home/admin/ligmax-pi` | **This one.** The Raspberry Pi 5: MAVLink to the Pixhawk, telemetry uplink, aft lidar, BMS, lights, E-stop GPIO, and (new) the autonomy node. |
-| **ligmax-server** | *assumed* `github.com/ligmax-ntnu/ligmax-server` | ❌ not cloned | The ground-station dashboard at `live.ligmax.no`. Flask on 127.0.0.1:3338 behind Caddy behind Cloudflare. |
-| **ligmax-edge** | *assumed* `github.com/ligmax-ntnu/ligmax-edge` | ❌ not cloned | The Jetson: two cameras, YOLO buoy detector, the **front** RPLidar C1, and the camera↔lidar fusion that colours it. |
+| **ligmax-server** | `github.com/ligmax-ntnu/ligmax-server` | ✅ `/home/admin/ligmax-server` | The ground-station dashboard at `live.ligmax.no`. Flask on 127.0.0.1:3338 behind Caddy behind Cloudflare. ~1.6 MB, no submodules. |
+| **ligmax-edge** | `github.com/ligmax-ntnu/ligmax-edge` | ✅ `/home/admin/ligmax-edge` | The Jetson: two cameras, YOLO buoy detector, the **front** RPLidar C1, and the camera↔lidar fusion that colours it. |
 | firmware / ArduPilot scripting | unknown | ❌ not cloned | `amas.lua`, `battery_slider.lua` (run on the Pixhawk), `battery_slider.ino` (slider ESP32), the ama translator ESP32. May live inside one of the above. |
 | `andreasviner/ligmax-pi` | `github.com/andreasviner/ligmax-pi` | ✅ `/home/admin/ligmax-rpi` | An **older personal fork of this same repo**, plus `mav.parm` / `mav.tlog` captures and a `test.py` MAVLink scratchpad. Nothing unique except the parameter dump. Do not develop here. |
 
-### Cloning, when you have DNS
+### Re-cloning, or cloning onto a fresh Pi
 
-The Pi's shell in this environment cannot resolve `github.com`, so the two
-missing repos were **not** downloaded — everything below about them was
-reconstructed from the docstrings in this repo, which reference them by file and
-line throughout. Treat it as a good map, not as ground truth.
+DNS works from this Pi's shell now, and both siblings were pulled down on
+**2026-08-09**. Everything in the two sections below was written when they were
+*not* available and was reconstructed from this repo's docstrings; the parts
+that have since been checked against the real code are marked **VERIFIED**, and
+the parts that turned out to be wrong are marked **WRONG**. Anything unmarked is
+still only inference.
 
 ```sh
 cd /home/admin
 git clone https://github.com/ligmax-ntnu/ligmax-server.git
 git clone https://github.com/ligmax-ntnu/ligmax-edge.git
 ```
+
+Clone them as siblings of this checkout, i.e. into `/home/admin/`, or the
+relative paths in every docstring (`../ligmax-server/web/js/map.js`) stop
+resolving.
 
 ---
 
@@ -51,7 +57,16 @@ real files:
 * `web/js/map.js` — the chart. Draws a **metre grid**, not degrees; the amber
   "ideal route" layer is a `path` with `kind: "reference"`.
 * `web/js/geo.js` — grid metres ↔ lat/lon for the cursor readout. Uses
-  `METRES_PER_DEGREE_LAT = 111320.0`, which `navigation.py` must match exactly.
+  `METRES_PER_DEGREE_LAT = 111320`. **VERIFIED equal** in all three places:
+  here, `nodes/io_manager/navigation.py:99`, and
+  `nodes/self_driving/geo.py:38`.
+* `ligmax_gui/protocol.py:376-441` — `_normalise_track` is a **whitelist**. A
+  track field not on it is dropped silently. Accepted: `track_id` (our `id`
+  works — line 393 falls back to it), `position`, `type`, `confidence`,
+  `avoid_radius`, `heading`, `velocity`, `age`, `hits`, `misses`, `radius`,
+  `speed`, `width_m`, `source`, `label`, `why`, `cardinal`, `no_go`. Anything
+  else — `sigma_m`, `established` — never reaches the browser, so the Pi carries
+  the uncertainty in `radius`/`avoid_radius`/`age` and says the rest in `why`.
 * `web/js/status.js` — the status indicator, driven by the top-level `status`.
 * `/led_control` — the light pattern authoring page.
 * `.env` — holds `LIGMAX_BOAT_KEY` (per-boat ingest secret) and
@@ -72,17 +87,27 @@ in `nodes/io_manager/edge_protocol.py`, which is the authoritative copy on this
 end.
 
 * `rig.json` — hand-measured rig geometry. **The front lidar's rotation is
-  corrected here and nowhere else** (its zero mark is bolted 45° to port;
-  `yaw_deg: -45` takes that out). If front returns come out rotated, fix it
-  there, not in `scan.py`.
+  corrected here and nowhere else.** If front returns come out rotated, fix it
+  there, not in `scan.py`. **VERIFIED, and the news is bad:** `yaw_deg` is still
+  `-45`, which the file itself marks STALE — it was measured for the old,
+  right-side-up mount, and the unit was remounted upside down on 2026-08-08.
+  `angle_dir` was flipped to `-1` at the same time and has never been run against
+  hardware. Until both are remeasured the front lidar's bearings — and the
+  colouring, which projects through the same geometry — are not trustworthy.
+  See `next_step.md` §1; this blocks everything else on the water.
+* `cam0` is **PORT**-facing (`yaw -75`) and `cam1` **STARBOARD** (`yaw +75`) —
+  back to back, 150° apart, not both looking forward. Corrected in `rig.json` on
+  2026-08-08 after a green light shone into cam1 came out on the port half of
+  the plot.
 * `lidar.py` — the C1 driver `nodes/io_manager/lidar.py` was ported from.
 * `fusion.py` — colours lidar returns from the camera frames. Owns the yaw
   convention (positive to starboard, about +y/down) that `scan.py` copies.
 * `receiver.py` — had the bug the whole edge link is written around: it read
   `header["cam"]` without checking `kind` first, so every lidar sweep was filed
-  as camera 0. Hence `LIDAR=1` still being opt-in in `run.sh`.
-* `run.sh` — `PORT` defaults to 3401; **`LIDAR=1` must be passed by hand** to
-  get the front lidar on the wire.
+  as camera 0.
+* `run.sh` — **WRONG.** `PORT` defaults to 3401, but the front lidar is **on by
+  default**, not opt-in: `run.sh:78` is `if [ "${LIDAR:-1}" = "0" ]`, so only
+  `LIDAR=0 ./run.sh` turns it off. Verified 2026-08-09.
 * `cloud_camera.py` — pushes preview JPEGs straight to shore over HTTPS. The
   operator's camera image does **not** pass through the Pi.
 * `--buoy-diameter` — 0.40 m for Njord marks, used for range-from-apparent-size.
@@ -106,7 +131,11 @@ protocol and adds fields the docstring does not mention:
   the freshness window.
 * `y` is identically 0.0 — the C1 is a planar scanner, so the rig frame's
   vertical axis carries no information. 2-D is not an approximation here.
-* `rgb` is flat, 3·n long, sensor-native (uncalibrated) values.
+* `rgb` is flat, 3·n long. **WRONG about "sensor-native":** the Jetson runs the
+  OV5647 correction matrix (`fusion.py::_correct`) before sending, on top of the
+  ISP chroma gain in the frame header's `saturation` field (default 2.0). The
+  values arriving are *corrected*. This invalidates the reasoning behind
+  `config.MIN_SATURATION = 0.55` — see `next_step.md` §5.
 * Detections carry a `lidar` sub-block (`n n_used range_m sigma_m nearest_m
   spread_m mixed bearing_deg cam`) with bearing in the **rig** frame while the
   detection's own `bearing_deg` is in the **camera** frame. Do not mix them.

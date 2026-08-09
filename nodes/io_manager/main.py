@@ -1189,6 +1189,13 @@ def main():
                     # rather than never going out at all.
                     frame.update(scans.publish_fields())
                 uploader.publish(**frame)
+
+                # The same block down the node bus, for the autonomy node's trip
+                # recording. It goes out on the *next* state frame rather than
+                # now, so this tick is not made any longer - and the recording
+                # gets the battery, the BMS, the RTK link and the tuning, none of
+                # which the autonomy node can see any other way.
+                bridge.offer_telemetry(telemetry)
                 last_publish = now
 
             time.sleep(LOOP_SLEEP)

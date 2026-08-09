@@ -70,7 +70,13 @@ from .config import (
     LATERAL_RC_CENTRE,
     LATERAL_RC_CHAN,
     LATERAL_RC_SPAN,
+    CAREFUL_DEFAULT,
+    CAREFUL_SPEED_KNOTS,
+    CAREFUL_SPEED_MS,
+    KNOT_MS,
     MAX_SPEED_MS,
+    SPEED_LIMIT_KNOTS,
+    SPEED_LIMIT_MS,
     TARGET_REFRESH_S,
     YAW_DEADBAND_DEG,
     YAW_MAX_RATE,
@@ -203,6 +209,61 @@ def _clamp(value, low, high):
     return max(low, min(high, value))
 
 
+# ------------------------------------------------------------- the speed limit
+
+#: The ordinary ceiling every command out of this file is held to: the boat's own
+#: 5 kn limit, and whatever lower figure the tuning asks for. `min` of the two
+#: rather than trusting `MAX_SPEED_MS` alone, because that one is read from the
+#: environment and this one is not (`config.SPEED_LIMIT_MS`).
+CEILING_MS = min(SPEED_LIMIT_MS, MAX_SPEED_MS)
+
+#: The ceiling in careful mode. Never above the ordinary one - careful mode can
+#: only ever slow the boat down, so switching it on can never be the thing that
+#: makes the boat go faster, whatever the tuning says.
+CAREFUL_CEILING_MS = min(CEILING_MS, CAREFUL_SPEED_MS)
+
+
+def _limit(value, ceiling=CEILING_MS):
+    """One speed, held to the ceiling and to sanity. Always returns a number.
+
+    NaN is mapped to zero rather than clamped. A NaN speed on the wire is not a
+    fast boat, it is an undefined one - ArduPilot's behaviour on a NaN parameter
+    is not something to find out during a scored run - and "stop" is the only
+    safe reading of "no number".
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if out != out:  # NaN
+        return 0.0
+    return _clamp(out, -ceiling, ceiling)
+
+
+def _limit_pair(forward, starboard, ceiling=CEILING_MS):
+    """Forward and lateral, held to the ceiling **as a resultant**.
+
+    Clamping each axis on its own is not enough and the arithmetic says why: at
+    the 5 kn ceiling the forward term alone is 2.572 m/s, and adding the lateral
+    thruster's 0.35 m/s gives `hypot(2.572, 0.35)` = 2.596 m/s = **5.05 knots**.
+    Each axis is legal and the boat is over the limit, because speed through the
+    water is the magnitude of the vector and not either component of it.
+
+    So the pair is scaled down together when the resultant is too big, which
+    preserves the *direction* the behaviour asked for - a docking approach that
+    wanted to crab at 30 degrees still crabs at 30 degrees, just slower. Scaling
+    only one axis would silently rotate the commanded motion, which is a far
+    nastier failure than being a little slow.
+    """
+    forward = _limit(forward, ceiling)
+    starboard = _limit(starboard, ceiling)
+    resultant = math.hypot(forward, starboard)
+    if resultant <= ceiling or resultant <= 0.0:
+        return forward, starboard
+    scale = ceiling / resultant
+    return forward * scale, starboard * scale
+
+
 # ----------------------------------------------------------------- commander
 
 class Commander:
@@ -224,6 +285,45 @@ class Commander:
         self.engaged = False
         self.sent = 0
         self.last_intent = None
+        # Careful mode lives here rather than on the pilot because this is the
+        # file that enforces it, and a flag that lives anywhere other than its
+        # enforcement point eventually disagrees with it. `pilot.py` reads it
+        # through the commander so the behaviours plan at the slower speed
+        # instead of being clamped after the fact.
+        self.careful = bool(CAREFUL_DEFAULT)
+
+    # -------------------------------------------------------- careful mode
+
+    @property
+    def ceiling(self):
+        """The speed ceiling in force right now, m/s."""
+        return CAREFUL_CEILING_MS if self.careful else CEILING_MS
+
+    def set_careful(self, on):
+        """Switch careful mode. `(ok, message)` for the operator's ack."""
+        was = self.careful
+        self.careful = bool(on)
+        if was == self.careful:
+            state = "on" if self.careful else "off"
+            return True, f"careful mode was already {state}"
+        if self.careful:
+            log.warning(
+                "CAREFUL MODE ON - speed held to %.1f kn (%.2f m/s)",
+                CAREFUL_SPEED_KNOTS,
+                self.ceiling,
+            )
+            return True, (
+                f"careful mode ON - {CAREFUL_SPEED_KNOTS:.1f} kn "
+                f"({self.ceiling:.2f} m/s) maximum"
+            )
+        log.warning(
+            "careful mode OFF - speed back to the ordinary %.2f m/s ceiling",
+            self.ceiling,
+        )
+        return True, (
+            f"careful mode OFF - back to {self.ceiling / KNOT_MS:.1f} kn "
+            f"({self.ceiling:.2f} m/s) maximum"
+        )
 
     # ------------------------------------------------------------- engagement
 
@@ -311,7 +411,9 @@ class Commander:
             log.error("cannot send a position target without a grid origin")
             self._link.control(cmd="velocity_target", vx=0.0, vy=0.0, yaw_rate=0.0)
             return
-        speed = max(0.05, min(MAX_SPEED_MS, float(intent.speed or 0.0)))
+        # `_limit` before the 0.05 floor, so the floor can only ever raise a
+        # speed off zero and never lift one back over the ceiling.
+        speed = max(0.05, _limit(intent.speed or 0.0, self.ceiling))
         self._link.control(
             cmd="position_target",
             lat=position[0],
@@ -321,8 +423,9 @@ class Commander:
         )
 
     def _send_velocity(self, intent):
-        forward = _clamp(intent.vx, -MAX_SPEED_MS, MAX_SPEED_MS)
         starboard = _clamp(intent.vy, -LATERAL_MAX_MS, LATERAL_MAX_MS)
+        # Held to the ceiling as a resultant, not per axis - see `_limit_pair`.
+        forward, starboard = _limit_pair(intent.vx, starboard, self.ceiling)
         yaw = _clamp(intent.yaw_rate, -YAW_MAX_RATE, YAW_MAX_RATE)
         # vy goes out on the MAVLink command only when ArduPilot is the thing
         # driving the lateral thruster. In "rc" mode it would be a term the
@@ -376,6 +479,14 @@ class Commander:
         block = {"engaged": self.engaged, "commands_sent": self.sent}
         if self.last_intent is not None:
             block.update(self.last_intent.telemetry())
+        # The limit in force, in the units the rule is written in. On the panel
+        # because a jury asking "what stops it going faster than 5 knots" should
+        # get an answer off the screen, and in the trip recording because it is
+        # the number every commanded speed in that file has to be read against.
+        block["speed_limit_kn"] = SPEED_LIMIT_KNOTS
+        block["speed_ceiling_ms"] = round(self.ceiling, 3)
+        block["speed_ceiling_kn"] = round(self.ceiling / KNOT_MS, 2)
+        block["careful"] = self.careful
         block["lateral_mode"] = LATERAL_MODE
         if LATERAL_MODE == "rc" and not LATERAL_RC_CHAN:
             block["lateral_warning"] = (

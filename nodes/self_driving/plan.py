@@ -51,7 +51,7 @@ import os
 import time
 
 from . import geo
-from .config import PLAN_FILE
+from .config import PLAN_FILE, SPEED_LIMIT_KNOTS, SPEED_LIMIT_MS
 
 log = logging.getLogger("self_driving.plan")
 
@@ -424,7 +424,14 @@ def _waypoint(position, item, origin, default_bearing):
         lat,
         lon,
         role,
-        speed=_optional_float(item.get("speed"), 0.05, 3.0, position, "speed"),
+        # Upper bound is the vessel's 5 kn limit, not an arbitrary 3.0 m/s -
+        # which was 5.83 kn and would have let a plan ask for more than the boat
+        # is allowed to do. Refused at upload rather than quietly clamped: the
+        # operator finds out on the dock, with the ack in front of them, instead
+        # of wondering later why the boat would not hold the speed they typed.
+        speed=_optional_float(
+            item.get("speed"), 0.05, SPEED_LIMIT_MS, position, "speed"
+        ),
         radius=_optional_float(item.get("radius"), 0.3, 50.0, position, "radius"),
         hold_s=_optional_float(item.get("hold_s"), 0.0, 600.0, position, "hold_s"),
         channel_bearing=(
@@ -483,6 +490,15 @@ def _optional_float(value, low, high, position, field):
     if out is None:
         raise PlanError(f"waypoint {position + 1}: {field} is not a number")
     if not (low <= out <= high):
+        if field == "speed" and out > high:
+            # Named explicitly, because "outside 0.05..2.5722" tells an operator
+            # under time pressure nothing at all, and the number they typed is
+            # almost certainly in knots or was copied from a faster boat.
+            raise PlanError(
+                f"waypoint {position + 1}: speed {out} m/s is over the "
+                f"{SPEED_LIMIT_KNOTS:.0f} knot limit "
+                f"({SPEED_LIMIT_MS:.2f} m/s) - lower it"
+            )
         raise PlanError(
             f"waypoint {position + 1}: {field} of {out} is outside {low}..{high}"
         )

@@ -145,18 +145,31 @@ def summarise(header, rows, footer):
     seen = {}
     for row in samples:
         for track_row in row.get("tracks") or []:
-            seen.setdefault(track_row["id"], track_row)
+            # Last sighting wins, not the first: a track's kind and confidence
+            # change as evidence accumulates, and what it ended up being is the
+            # more useful answer than what it was first mistaken for.
+            seen[track_row["id"]] = track_row
     if seen:
+        established = sum(1 for t in seen.values() if t.get("established"))
         add("")
-        add(f"tracked   {len(seen)} object(s)")
+        add(f"tracked   {len(seen)} object(s), {established} established")
         for track_row in sorted(seen.values(), key=lambda t: t["id"])[:25]:
-            position = track_row.get("position") or [0, 0]
+            position = _track_position(track_row)
+            flags = "".join(
+                (
+                    "E" if track_row.get("established") else " ",
+                    "R" if track_row.get("restored") else " ",
+                )
+            )
+            sigma = track_row.get("sigma_m")
+            spread = f"+-{sigma:.1f} m  " if sigma is not None else ""
             add(
-                f"  #{track_row['id']:<4} {track_row.get('label', '?'):<20} "
+                f"  #{track_row['id']:<4}{flags} {_track_label(track_row):<20} "
                 f"({position[0]:7.1f}, {position[1]:7.1f}) m  "
                 f"conf {track_row.get('confidence', 0):.2f}  "
-                f"{str(track_row.get('why') or '')[:50]}"
+                f"{spread}{str(track_row.get('why') or '')[:50]}"
             )
+        add("          E = established (kept between attempts), R = restored from survey")
 
     if events:
         add("")
@@ -175,6 +188,23 @@ def summarise(header, rows, footer):
         add("")
         add("ended     NO FOOTER - the recording was cut off (crash, or power loss)")
     return "\n".join(out)
+
+
+def _track_position(entry):
+    """A track's position from either shape of row.
+
+    Recordings written before the debug dump carry `position` (the dashboard's
+    shape); newer ones carry `pos` (the recorder's full dump, which also has the
+    kind votes and the uncertainty). Old files are still worth reading, so both
+    are accepted rather than the older ones being rejected.
+    """
+    position = entry.get("pos") or entry.get("position") or [0.0, 0.0]
+    return [float(position[0]), float(position[1])]
+
+
+def _track_label(entry):
+    """A track's type in words, from either shape of row."""
+    return str(entry.get("label") or entry.get("kind") or "?")
 
 
 def _tally(values):
@@ -208,7 +238,7 @@ def to_html(header, rows, footer):
         for entry in row.get("tracks") or []:
             marks[entry["id"]] = entry
 
-    points = list(track) + [tuple(m["position"]) for m in marks.values() if m.get("position")]
+    points = list(track) + [tuple(_track_position(m)) for m in marks.values()]
     if not points:
         return "<p>nothing to plot - the run never got a position</p>"
 
@@ -242,14 +272,28 @@ def to_html(header, rows, footer):
         8: "#9aa5b1", 0: "#6b7280", 9: "#c471ed",
     }
     for entry in marks.values():
-        position = entry.get("position")
-        if not position:
-            continue
+        position = _track_position(entry)
         colour = colours.get(entry.get("type", 0), "#6b7280")
+        # The uncertainty as a ring around the marker. A mark the boat measured
+        # is a dot; one it was remembering is a dot inside a circle metres
+        # across, which is the single most useful thing to see on this plot when
+        # working out why the boat went where it did.
+        sigma = entry.get("sigma_m")
+        if sigma:
+            radius = abs(sx(position[0] + float(sigma)) - sx(position[0]))
+            if radius > 1.0:
+                parts.append(
+                    f"<circle cx='{sx(position[0]):.1f}' cy='{sy(position[1]):.1f}' "
+                    f"r='{radius:.1f}' fill='none' stroke='{colour}' "
+                    f"stroke-dasharray='3 3' opacity='0.5'/>"
+                )
         parts.append(
             f"<circle cx='{sx(position[0]):.1f}' cy='{sy(position[1]):.1f}' r='6' "
             f"fill='{colour}' opacity='0.85'><title>#{entry['id']} "
-            f"{entry.get('label')} conf {entry.get('confidence')}</title></circle>"
+            f"{_track_label(entry)} conf {entry.get('confidence')}"
+            f"{f' +-{sigma:.1f} m' if sigma else ''}"
+            f"{' (remembered)' if entry.get('established') else ''}"
+            f"</title></circle>"
         )
     parts.append("</svg>")
 

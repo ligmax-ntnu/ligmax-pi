@@ -44,11 +44,18 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 
 from pymavlink import mavutil
 
-from config import IO_PORT, SELF_DRIVING_PORT
+from config import (
+    IO_PORT,
+    KNOT_MS,
+    SELF_DRIVING_PORT,
+    VESSEL_SPEED_LIMIT_KNOTS,
+    VESSEL_SPEED_LIMIT_MS,
+)
 
 log = logging.getLogger("io_manager.autopilot")
 
@@ -69,6 +76,15 @@ AUTOPILOT_COMMANDS = frozenset(
         "record_start",
         "record_stop",
         "forget_world",
+        # Delete one tracked object, by the `track_id` the chart shows. Belongs
+        # to the autonomy node for the same reason `forget_world` does: it owns
+        # the world model, and it is the only thing that can answer whether the
+        # id existed.
+        "forget_object",
+        # Careful mode: hold the boat to 1 knot, and release it again. Owned by
+        # the autonomy node because the ceiling is enforced in its commander.
+        "careful_on",
+        "careful_off",
     }
 )
 
@@ -97,6 +113,53 @@ CHANNEL_COUNT = 18
 RC_RELEASE = 65535  # "leave this channel to whoever else is driving it"
 
 
+def _limited(value, what):
+    """One speed off the node bus, held to the vessel's limit. Never raises.
+
+    **This is the last thing between a number on the loopback bus and a number on
+    the MAVLink wire**, and it exists because everything upstream of it is only
+    as trustworthy as the process that wrote it. The autonomy node clamps its own
+    commands (`self_driving/commander.py`), but this socket is a PUB/SUB bind on
+    127.0.0.1 that any process on the Pi can publish to, and `_absorb` checks
+    only the message's *kind* and *age* - not its numbers. Until this existed, a
+    `{"cmd": "position_target", "speed": 9.0}` from anywhere on the machine, or
+    one bug in the autonomy node's clamp, put 9 m/s into DO_CHANGE_SPEED.
+
+    A limit enforced only by the process being limited is not a limit.
+
+    NaN becomes zero rather than being clamped: ArduPilot's behaviour on a NaN
+    parameter is not something to discover during a scored run, and "stop" is the
+    only safe reading of "not a number".
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if out != out:  # NaN
+        log.warning("refusing a NaN %s from the node bus - commanding 0", what)
+        return 0.0
+    if abs(out) > VESSEL_SPEED_LIMIT_MS:
+        # Loud, every time. If this ever fires in the field it means something
+        # upstream is wrong, and it is the kind of wrong that is invisible from
+        # the dashboard because the boat simply goes the speed it was allowed.
+        log.error(
+            "node bus asked for %s %.2f m/s (%.2f kn) - over the %.0f kn vessel "
+            "limit, clamping to %.2f m/s. Something upstream is not clamping.",
+            what,
+            out,
+            out / KNOT_MS,
+            VESSEL_SPEED_LIMIT_KNOTS,
+            VESSEL_SPEED_LIMIT_MS,
+        )
+        return math.copysign(VESSEL_SPEED_LIMIT_MS, out)
+    return out
+
+# How often the dashboard's telemetry block is forwarded to the autonomy node for
+# its trip recording. Matched to io_manager's own PUBLISH_PERIOD, which is the
+# rate the block is assembled at - sending it faster would just repeat one.
+SNAPSHOT_PERIOD = 1.0
+
+
 class AutopilotBridge:
     """State out, control in. Degrades to a no-op without pyzmq."""
 
@@ -117,6 +180,8 @@ class AutopilotBridge:
         self.last_control_at = None
         self.last_error = None
         self._rc = None              # (channel, pwm, last sent)
+        self._snapshot = None        # the dashboard's telemetry, for the recorder
+        self._snapshot_sent = 0.0
 
         try:
             import zmq
@@ -151,6 +216,17 @@ class AutopilotBridge:
 
     # ------------------------------------------------------------- state out
 
+    def offer_telemetry(self, snapshot):
+        """Hand over the dashboard's telemetry block for the autonomy node.
+
+        Called on io_manager's 1 Hz publish tick with the block it has just
+        assembled. It is not sent to the planner because a planner needs it - it
+        does not - but because the **trip recording** does: "the boat stopped
+        because the pack sagged under load" is unprovable from the autonomy
+        node's own state, and the autonomy node is what writes the recording.
+        """
+        self._snapshot = snapshot
+
     def publish_state(self, *, navigation, machine, relay, scans, master,
                       commands=()):
         """One state frame for the autonomy node. Called on the publish tick.
@@ -159,6 +235,11 @@ class AutopilotBridge:
         operator commands aimed at the autopilot. Everything else the dashboard
         gets - the battery, the tuning, the lights - is of no use to a planner
         and would cost 4G-shaped CPU to serialise ten times a second.
+
+        The one exception is the telemetry snapshot from `offer_telemetry`, and
+        it rides at **its own** rate rather than this frame's: at most once every
+        `SNAPSHOT_PERIOD`, which is the rate it is produced at anyway, so a
+        10 Hz state frame does not carry nine redundant copies of it.
         """
         if self._pub is None:
             return
@@ -181,6 +262,12 @@ class AutopilotBridge:
             frame["aft_scan"] = scans.aft_scan_for_planner()
         if commands:
             frame["commands"] = list(commands)
+        now = time.time()
+        if self._snapshot is not None and now - self._snapshot_sent >= SNAPSHOT_PERIOD:
+            self._snapshot_sent = now
+            # Stamped, so the recorder can tell a fresh snapshot from the same
+            # one arriving again and write each exactly once.
+            frame["telemetry"] = dict(self._snapshot, t=now)
         try:
             self._pub.send_string(
                 json.dumps(frame, separators=(",", ":"), allow_nan=False),
@@ -305,7 +392,7 @@ class AutopilotBridge:
         )
         speed = message.get("speed")
         if speed is not None:
-            self._change_speed(master, float(speed))
+            self._change_speed(master, _limited(speed, "a groundspeed"))
 
     def _change_speed(self, master, speed):
         """MAV_CMD_DO_CHANGE_SPEED, at most once a second.
@@ -333,6 +420,24 @@ class AutopilotBridge:
 
     def _velocity_target(self, master, message):
         """Body-frame velocity and yaw rate. Docking, holding, reversing."""
+        vx = _limited(message.get("vx") or 0.0, "a forward velocity")
+        vy = _limited(message.get("vy") or 0.0, "a lateral velocity")
+        resultant = math.hypot(vx, vy)
+        if resultant > VESSEL_SPEED_LIMIT_MS:
+            # Scaled together, so the commanded *direction* survives: a crab at
+            # 30 degrees stays a crab at 30 degrees, just slower. Scaling one
+            # axis alone would quietly rotate the manoeuvre, which is a worse
+            # failure than being slow.
+            scale = VESSEL_SPEED_LIMIT_MS / resultant
+            log.error(
+                "node bus asked for %.2f m/s resultant (%.2f kn) - over the "
+                "%.0f kn vessel limit, scaling both axes by %.3f",
+                resultant,
+                resultant / KNOT_MS,
+                VESSEL_SPEED_LIMIT_KNOTS,
+                scale,
+            )
+            vx, vy = vx * scale, vy * scale
         master.mav.set_position_target_local_ned_send(
             0,
             master.target_system,
@@ -340,8 +445,11 @@ class AutopilotBridge:
             mavutil.mavlink.MAV_FRAME_BODY_NED,
             VELOCITY_MASK,
             0.0, 0.0, 0.0,  # position, ignored by the mask
-            float(message.get("vx") or 0.0),   # forward
-            float(message.get("vy") or 0.0),   # starboard
+            # Clamped as a resultant, not per axis: speed through the water is
+            # the magnitude of the vector, and two individually-legal components
+            # can still put the boat over the limit.
+            vx,        # forward
+            vy,        # starboard
             0.0,
             0.0, 0.0, 0.0,  # acceleration, ignored by the mask
             0.0,

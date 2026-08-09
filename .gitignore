@@ -93,3 +93,6 @@ Thumbs.db
 *.parm
 *.tlog
 *.tlog.raw
+
+# Claude Code
+.claude/

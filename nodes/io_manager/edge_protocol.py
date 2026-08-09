@@ -37,6 +37,13 @@ Header fields (KIND_FRAME):
     full_w/full_h int   full sensor size, the frame `crop` is measured in
     refined      bool   whether the full-resolution frame was available, i.e.
                         whether width_method could be "refined_edges"
+    saturation   float  chroma gain Argus's ISP already applied, 0-2. Default 2.0,
+                        because JetPack ships no ISP tuning for the OV5647 and its
+                        untouched output is ~1/3 the chroma of a normal camera.
+                        A viewer that colour-corrects MUST read this and apply only
+                        the remainder (fusion.ccm_strength_for): a full matrix on
+                        top of a boosted frame clips about half of it. Absent on
+                        senders older than this field -- treat that as 1.0.
     jpeg_bytes   int    payload length
     fps          float  sender's measured rate, for display
     dets         list   see below
@@ -116,33 +123,63 @@ One per rotation, ~10 Hz (the C1's settled rate), `jpeg_bytes` 0. Beyond
 cloud -- parallel arrays, not a list of objects, because at ~400 points a sweep
 the repeated keys would be most of the bytes:
 
-    seq, n, coloured    sweep number, points, how many the cameras could colour
-    in_time             points measured close enough in time to a frame to be
-                        colourable at all. `n - in_time` is a TIMING shortfall;
-                        `in_time - coloured` is simply the part of the rotation
-                        no lens covers, which is most of it and expected.
+    seq, n, coloured    sweep number, points IN THESE ARRAYS, how many the
+                        cameras could colour
+    dropped             returns removed before sending because no camera could
+                        see them -- the arc outside both lenses, ~34 deg aft on
+                        this rig. `n + dropped` is the size of the rotation, and
+                        a returns-per-rev or Hz check wants that sum, not `n`.
+                        They were real obstacles: this is the sender saying
+                        something else watches that arc (--lidar-keep-unseen
+                        ships them uncoloured instead, and then `dropped` is 0
+                        and `cam` can be -1).
+    stale               of `coloured`, how many were sampled from a frame further
+                        away in time than --lidar-max-skew. They are coloured
+                        anyway -- a slightly mistimed colour beats none -- but
+                        they are the ones to distrust first, and `age_ms` says by
+                        how much for each. A handful is the frame buffer working
+                        at the edges of a rotation; most of the sweep is a drift
+                        between the cameras and the scanner worth investigating.
+    in_time             points measured close enough in time to SOME frame to be
+                        timely. `n - in_time` is a TIMING shortfall; `in_time -
+                        coloured` is simply the part of the rotation no lens
+                        covers. Since each point is coloured from the nearest
+                        buffered frame rather than one frame per sweep, `coloured`
+                        can now exceed `in_time`: the excess is `stale`.
     frame               "rig" -- +x starboard, +y DOWN, +z forward, origin at the
                         lidar unless rig.json moves it. NOT a camera frame.
     t_start, t_end      epoch seconds. A rotation takes ~100 ms -- LONGER than a
                         camera frame -- and is emphatically not an instant, which
                         is what dt_ms below is for
     hz                  measured rotation rate
-    skew_ms             [cam0, cam1] sweep-to-frame capture-time difference. The
-                        number to watch: colour is only meaningful while it is
-                        small, and past --lidar-max-skew the points ship with
-                        cam = -1 rather than a colour sampled from a frame that
-                        does not line up.
+    skew_ms             [cam0, cam1] sweep-midpoint-to-CURRENT-frame capture-time
+                        difference. A whole-sweep summary, and no longer what
+                        decides any individual point's colour: each return is
+                        coloured from the nearest of a few buffered frames, so
+                        `age_ms` is the per-point truth and this is the one
+                        readable number per camera for a stats line.
     x, y, z             metres in the rig frame, one entry per point
     dt_ms               ms after t_start that each point was measured, from its
                         angle around the rotation. Use it for anything geometric
                         on a moving boat, exactly as t_row is used per detection.
+    age_ms              how far the frame each point was coloured FROM sat from
+                        that point's own measurement, or -1 where nothing coloured
+                        it (never 0, which would read as a perfect match). This is
+                        what makes a mistimed colour safe to ship: weight a point
+                        by it, or drop points past your own threshold, but do not
+                        assume every colour in a sweep came from the same instant
+                        -- they deliberately do not.
     q                   the C1's own return-strength figure
-    cam                 0, 1, or -1 for a point no camera could see or colour
-    rgb                 FLAT r,g,b,r,g,b... so it is 3*n long, not n. Sensor-native
-                        values straight off the detector frame: the OV5647 colour
-                        matrix runs at the receiver, so these are not calibrated
-                        colours, they are the same numbers the boxes were drawn
-                        from. (0,0,0) where cam is -1.
+    cam                 0 or 1 -- which camera coloured the point. -1 (no camera
+                        could see it) only appears with --lidar-keep-unseen;
+                        by default those points are dropped, see `dropped`.
+    rgb                 FLAT r,g,b,r,g,b... so it is 3*n long, not n. Sampled off
+                        the detector frame -- the same pixels the boxes were drawn
+                        from -- and COLOUR-CORRECTED before sending (the OV5647
+                        matrix, `fusion._correct`). Display them as they arrive:
+                        they are comparable to a corrected preview, and a consumer
+                        that boosts saturation to compensate for raw sensor values
+                        is now correcting twice. (0,0,0) where cam is -1.
     det                 track id of the detection this return belongs to, or -1.
                         Only foreground returns are tagged, so the sea visible
                         through a box is not attributed to the buoy.

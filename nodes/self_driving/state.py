@@ -38,6 +38,7 @@ class BoatState:
         "t", "received_at", "origin", "position", "heading", "cog", "sog",
         "velocity", "lat", "lon", "fix", "satellites", "status", "estop",
         "mode", "armed", "aft_scan", "rc_link", "operator_link", "raw",
+        "telemetry",
     )
 
     def __init__(self, frame, received_at=None):
@@ -85,6 +86,14 @@ class BoatState:
         # side of the boat. The front one comes to this node directly off TCP
         # 3401 and never travels through a frame.
         self.aft_scan = self.raw.get("aft_scan")
+
+        # io_manager's whole dashboard telemetry block - battery, BMS, RTK,
+        # trim, tuning, lights, propulsion, safety - forwarded at 1 Hz. **No
+        # behaviour reads this**, deliberately: a planner that steers on the
+        # pack voltage is a planner nobody can reason about. It is here for the
+        # trip recording, which otherwise cannot answer why a boat stopped.
+        # Present only on the frames that carried it, so it can be None.
+        self.telemetry = self.raw.get("telemetry")
 
     # ------------------------------------------------------------------ query
 

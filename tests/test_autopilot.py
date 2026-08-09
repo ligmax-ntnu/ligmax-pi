@@ -382,12 +382,16 @@ def test_colour():
         ("white", (235, 235, 235)),
         ("dark", (18, 22, 30)),
     ):
-        tally, n = colour_votes([rgb] * 8, config)
+        tally, n, weighted = colour_votes([rgb] * 8, config)
         check(tally.get(name, 0) == 8, f"{rgb} reads as {name} ({tally})")
+        check(
+            weighted.get(name, 0) == 8,
+            f"{rgb} carries its full weight with no age on the wire",
+        )
 
     # Uncoloured returns must never read as dark - that is the whole reason
     # scan.py writes -1 rather than black.
-    tally, n = colour_votes([(-1, -1, -1)] * 6, config)
+    tally, n, weighted = colour_votes([(-1, -1, -1)] * 6, config)
     check(n == 0 and not tally, "uncoloured returns are ignored, not called dark")
 
     # A whole buoy: clustered, then classified.
@@ -428,6 +432,84 @@ def test_colour():
     if len(clusters) == 2:
         kinds = sorted(classify(c, config)[0].name for c in clusters)
         check(kinds == ["GREEN", "RED"], f"and they are told apart by colour {kinds}")
+
+
+def test_colour_age_weighting():
+    """A well-timed return outvotes a mistimed one (§5.2.3).
+
+    179 of 269 coloured points in the 2026-08-08 capture were `stale`, so the
+    question this answers is not academic: it is what happens when most of a
+    cluster's colour came from a frame a quarter-second away from the return.
+    """
+    section("colour votes weighted by how mistimed the colour is")
+
+    red, green = (200, 30, 30), (40, 220, 70)
+    fresh, stale = config.COLOUR_AGE_FRESH_MS, config.COLOUR_AGE_STALE_MS
+
+    # The whole point, in one case: five stale reds against three fresh greens.
+    # On a straight count red wins 5-3. On weight, 5 x 0.25 = 1.25 against
+    # 3 x 1.0 = 3.0, so green wins - and the raw tally still says red 5.
+    rgb = [red] * 5 + [green] * 3
+    ages = [stale] * 5 + [fresh] * 3
+    tally, n, weighted = colour_votes(rgb, config, age_ms=ages)
+    check(tally["red"] == 5 and tally["green"] == 3, f"the raw tally is unchanged {tally}")
+    check(n == 8, "and all eight returns still count as coloured")
+    check(
+        weighted["green"] > weighted["red"],
+        f"but fresh green outweighs stale red ({weighted['green']:.2f} "
+        f"vs {weighted['red']:.2f})",
+    )
+
+    # Same returns, same ages: with no age array the old behaviour must come
+    # back exactly, or this change has silently altered every existing sweep.
+    tally_flat, _n, weighted_flat = colour_votes(rgb, config)
+    check(
+        weighted_flat == {"red": 5.0, "green": 3.0} and tally_flat == tally,
+        "with no age_ms the weighted tally is the raw one, unchanged",
+    )
+
+    # A uniformly stale cluster must not be punished. Only disagreement is
+    # measured, and every return here agrees.
+    _t, _n, uniform = colour_votes([red] * 6, config, age_ms=[stale] * 6)
+    total = sum(uniform.values())
+    check(
+        abs(uniform["red"] / total - 1.0) < 1e-9,
+        "a uniformly stale cluster is still unanimous, not downgraded",
+    )
+
+    # A mismatched age array is dropped rather than applied to the wrong points.
+    _t, _n, mismatched = colour_votes(rgb, config, age_ms=[fresh] * 3)
+    check(
+        mismatched == {"red": 5.0, "green": 3.0},
+        "an age array of the wrong length is ignored, not misapplied",
+    )
+
+    # -1 is "nothing coloured this", not "infinitely fresh". Those returns are
+    # dropped by the lit mask, so what matters is that they do not drag a real
+    # return's weight with them when the arrays are sliced.
+    _t, n_lit, part = colour_votes(
+        [red] * 2 + [(-1, -1, -1)] * 4, config, age_ms=[fresh] * 2 + [-1.0] * 4
+    )
+    check(n_lit == 2 and part.get("red") == 2.0, "uncoloured returns carry no vote")
+
+    # And the whole chain: ages survive cluster_sweep's filter and sort, so a
+    # cluster's ages line up with its own returns rather than the sweep's.
+    points, rgb_sweep = fake_sweep(
+        (0.0, 0.0), 0.0, [Obstacle((0.0, 6.0), ObstacleType.RED, 0.2)]
+    )
+    n_points = len(points)
+    clusters = cluster_sweep(
+        points, rgb_sweep, source="front_lidar", config=config,
+        age_ms=[fresh] * n_points,
+    )
+    check(
+        bool(clusters) and clusters[0].age_ms is not None
+        and len(clusters[0].age_ms) == clusters[0].n,
+        "a cluster's ages are the same length as its returns",
+    )
+    if clusters:
+        kind, _c, why = classify(clusters[0], config)
+        check(kind == ObstacleType.RED, f"and a fresh red buoy still reads RED ({why})")
 
 
 def test_masks():
@@ -958,11 +1040,393 @@ def test_real_jetson_sample():
     print(f"  info  {dets} real detections in the capture")
 
 
+def test_memory():
+    """Remembering marks: what earns it, what it costs, and how it is cleared.
+
+    The four properties the feature is supposed to have, each checked against the
+    failure it exists to prevent:
+
+      * a mark seen properly is kept indefinitely (attempt two starts with
+        attempt one's map);
+      * its position uncertainty grows while it is unseen and collapses the
+        instant it is measured again (a remembered buoy must not claim to be
+        somewhere exact);
+      * a one-off stray return is NOT kept (the "one random green point, once"
+        that must never become a permanent phantom);
+      * a vessel is never kept at all (the Otter has moved).
+    """
+    section("remembering marks between attempts")
+
+    from nodes.self_driving.perception.world import Track
+    from nodes.self_driving.survey import Survey
+
+    class _Store:
+        """A survey that lives in memory, so the test touches no disk."""
+
+        path = "<memory>"
+
+        def __init__(self):
+            self.rows = []
+
+        def entries(self):
+            return list(self.rows)
+
+        def write(self, entries, origin=None):
+            self.rows = list(entries)
+            return True
+
+        def clear(self):
+            self.rows = []
+            return True
+
+    store = _Store()
+    world = WorldModel(config, survey=store)
+    world.set_origin(ORIGIN)
+
+    # A buoy the boat looks at properly: 26 sweeps spanning 2.5 s, comfortably
+    # past both TRACK_ESTABLISH_HITS and TRACK_ESTABLISH_SPAN_S.
+    t = 1000.0
+    for i in range(26):
+        t = 1000.0 + i * 0.1
+        world.observe(
+            [_fake_cluster((3.0, 10.0), "green")], (0.0, 0.0), 0.0, t, "buoys"
+        )
+    marks = world.marks()
+    check(len(marks) == 1, f"the buoy is tracked ({len(marks)} mark(s))")
+    buoy = marks[0]
+    check(buoy.established, "26 sightings over 2.5 s establishes it")
+
+    # The span is the test that actually kills a stray, so check it bites: the
+    # same number of hits crammed into 300 ms must NOT establish anything.
+    burst = WorldModel(config)
+    for i in range(26):
+        burst.observe(
+            [_fake_cluster((3.0, 10.0), "green")],
+            (0.0, 0.0), 0.0, 5000.0 + i * 0.012, "buoys",
+        )
+    check(
+        not any(tr.established for tr in burst.all()),
+        "26 hits crammed into 300 ms does NOT establish - a wave crest cannot "
+        "buy permanent memory",
+    )
+    check(
+        abs(buoy.sigma_m - config.TRACK_SIGMA_M) < 1e-6,
+        f"freshly seen, it is certain to {buoy.sigma_m:.2f} m",
+    )
+
+    # A single stray return, once, never again. The thing that must NOT persist.
+    world.observe(
+        [_fake_cluster((-6.0, 8.0), "green")], (0.0, 0.0), 0.0, t + 0.1, "buoys"
+    )
+    strays = [tr for tr in world.all() if not tr.established]
+    check(len(strays) == 1, "the stray is tracked at first, like anything else")
+
+    # Now nothing is seen for a long time. Well past TRACK_DROP_AFTER_S.
+    far = t + 300.0
+    world.observe([], (0.0, 0.0), 0.0, far, "buoys")
+    kept = world.all()
+    check(
+        len(kept) == 1 and kept[0].established,
+        f"after 300 s unseen only the established mark survives ({len(kept)})",
+    )
+    check(
+        abs(kept[0].sigma_m - config.TRACK_SIGMA_MAX_M) < 1e-6,
+        f"...and its uncertainty is at the {config.TRACK_SIGMA_MAX_M:.0f} m ceiling",
+    )
+    check(
+        kept[0].confidence >= config.TRACK_ESTABLISH_FLOOR - 1e-9,
+        "...held up by the established confidence floor rather than decayed away",
+    )
+
+    # Seeing it again collapses the uncertainty, and does NOT make a second track.
+    before = len(world.all())
+    world.observe(
+        [_fake_cluster((3.4, 10.3), "green")], (0.0, 0.0), 0.0, far + 0.1, "buoys"
+    )
+    check(
+        len(world.all()) == before,
+        "re-acquiring a remembered mark re-uses its track instead of duplicating it",
+    )
+    check(
+        abs(world.all()[0].sigma_m - config.TRACK_SIGMA_M) < 1e-6,
+        "...and its uncertainty collapses back to sensor accuracy",
+    )
+
+    # A vessel is never established, however long it is watched: it has moved.
+    vessels = WorldModel(config)
+    for i in range(40):
+        vessels.observe(
+            [_fake_cluster((0.0, 12.0), "white", width=2.0)],
+            (0.0, 0.0), 0.0, 2000.0 + i * 0.1, "colregs",
+        )
+    boats = [tr for tr in vessels.all() if tr.kind == ObstacleType.BOAT]
+    check(bool(boats), "the Otter is tracked")
+    check(
+        not any(tr.established for tr in boats),
+        "a vessel is never established - it will have moved by attempt two",
+    )
+
+    # The survey round trips through lat/lon, which is the whole point of it
+    # being in degrees: the grid origin does not survive a reboot.
+    world.save_survey()
+    check(len(store.rows) == 1, f"the established mark is written ({len(store.rows)})")
+    check(
+        "lat" in store.rows[0] and "lon" in store.rows[0],
+        "...as lat/lon, not grid metres",
+    )
+    restored = WorldModel(config, survey=store)
+    restored.set_origin(ORIGIN)
+    back = restored.all()
+    check(len(back) == 1, f"it comes back on the next run ({len(back)})")
+    if back:
+        moved = geo.distance(back[0].pos, world.all()[0].pos)
+        check(moved < 0.5, f"...within {moved:.2f} m of where it was left")
+        check(back[0].established, "...still established")
+        check(
+            back[0].sigma_m >= config.TRACK_SIGMA_MAX_M - 1e-6,
+            "...and honest about not having been seen since",
+        )
+
+    # A survey written against one origin must land in the right place when the
+    # grid has been re-zeroed somewhere else - the reboot case in survey.py.
+    shifted = WorldModel(config, survey=store)
+    shifted.set_origin({"lat": ORIGIN["lat"] + 0.0009, "lon": ORIGIN["lon"]})
+    if shifted.all() and back:
+        offset = shifted.all()[0].pos[1] - back[0].pos[1]
+        check(
+            abs(offset + 100.0) < 2.0,
+            f"a moved origin shifts the restored mark by the right amount "
+            f"({offset:.1f} m for a 100 m move)",
+        )
+
+    # Deleting one object, which is what the dashboard's per-object button does.
+    ok, message = restored.forget_track(back[0].id)
+    check(ok, f"one object can be deleted: {message}")
+    check(not restored.all(), "...and it is gone from the model")
+    check(not store.rows, "...and from the survey, so it stays gone after a restart")
+
+    # ...and it does not come straight back off the next sweep.
+    restored.observe(
+        [_fake_cluster((3.0, 10.0), "green")], (0.0, 0.0), 0.0, far + 1.0, "buoys"
+    )
+    check(
+        not restored.all(),
+        "a deleted object is not re-created by the very next sweep",
+    )
+
+    # Clear-all takes the survey with it, or it all returns on the next start.
+    world.forget("unit test")
+    check(not world.all() and not store.rows, "clear-all empties model and survey")
+
+
+def test_speed_limit():
+    """The 5 knot vessel limit, and careful mode's 1 knot, at every seam.
+
+    Written as an attack rather than as a demonstration: each check is a way
+    somebody could plausibly get the boat over the limit, and asserts that they
+    cannot. The limit is on the vessel, so "the default happens to be lower" is
+    not a defence - every one of these sets the tuning as high as it will go.
+    """
+    section("the 5 knot speed limit")
+
+    from nodes.self_driving import commander as cm
+
+    limit = config.SPEED_LIMIT_MS
+    check(
+        abs(config.SPEED_LIMIT_KNOTS - 5.0) < 1e-9,
+        f"the limit is {config.SPEED_LIMIT_KNOTS} knots ({limit:.4f} m/s)",
+    )
+
+    # Every configured speed is already inside it.
+    over = [
+        name for name in dir(config)
+        if name.endswith(("_SPEED_MS", "_MAX_MS")) and name.isupper()
+        and isinstance(getattr(config, name), float)
+        and getattr(config, name) > limit + 1e-9
+    ]
+    check(not over, f"no configured speed exceeds the limit (offenders: {over})")
+
+    class _Link:
+        def __init__(self):
+            self.sent = []
+
+        def control(self, **fields):
+            self.sent.append(fields)
+
+    def commanded(intent, careful=False):
+        """The speed actually put on the wire for one intent, m/s."""
+        link = _Link()
+        commander = cm.Commander(link, config)
+        commander.careful = careful
+        state = BoatState(
+            {"origin": ORIGIN, "boat": {"position": [0.0, 0.0], "heading_deg": 0.0}}
+        )
+        commander.send(intent, state)
+        speeds = []
+        for message in link.sent:
+            if message.get("cmd") == "position_target":
+                speeds.append(float(message.get("speed") or 0.0))
+            elif message.get("cmd") == "velocity_target":
+                speeds.append(
+                    math.hypot(
+                        float(message.get("vx") or 0.0),
+                        float(message.get("vy") or 0.0),
+                    )
+                )
+        return max(speeds) if speeds else 0.0
+
+    # A behaviour asking for an absurd speed.
+    fast = commanded(cm.goto((100.0, 0.0), 99.0, "attack"))
+    check(fast <= limit + 1e-6, f"a goto at 99 m/s goes out at {fast:.3f} m/s")
+
+    # ...and in body-velocity form, forwards and astern.
+    fwd = commanded(cm.move(forward=99.0, reason="attack"))
+    check(fwd <= limit + 1e-6, f"a 99 m/s forward velocity goes out at {fwd:.3f} m/s")
+    astern = commanded(cm.move(forward=-99.0, reason="attack"))
+    check(
+        astern <= limit + 1e-6,
+        f"the limit is symmetric - 99 m/s astern goes out at {astern:.3f} m/s",
+    )
+
+    # The resultant, which is the one a per-axis clamp misses: forward at the
+    # ceiling plus the lateral thruster is over the limit while each axis is
+    # legal on its own.
+    both = commanded(
+        cm.move(forward=limit, starboard=config.LATERAL_MAX_MS, reason="attack")
+    )
+    naive = math.hypot(limit, config.LATERAL_MAX_MS)
+    check(
+        naive > limit,
+        f"per-axis clamping would allow {naive / config.KNOT_MS:.2f} kn - so the "
+        f"resultant test is not hypothetical",
+    )
+    check(
+        both <= limit + 1e-6,
+        f"forward + lateral resolves to {both:.3f} m/s "
+        f"({both / config.KNOT_MS:.2f} kn), inside the limit",
+    )
+
+    # A NaN speed is a stop, not an undefined command to ArduPilot.
+    nan = commanded(cm.move(forward=float("nan"), reason="attack"))
+    check(nan == 0.0, f"a NaN velocity goes out as {nan:.3f} m/s, not as NaN")
+
+    # A plan cannot ask for more than the limit, and is refused in words.
+    try:
+        Plan.parse(
+            {
+                "name": "fast",
+                "waypoints": [
+                    {"name": "1", "lat": ORIGIN["lat"], "lon": ORIGIN["lon"],
+                     "role": "transit", "speed": 3.0}
+                ],
+            },
+            ORIGIN,
+        )
+        check(False, "a 3.0 m/s waypoint should have been refused")
+    except PlanError as exc:
+        check(
+            "knot" in str(exc).lower(),
+            f"a 3.0 m/s waypoint is refused in the operator's words: {exc}",
+        )
+
+    ok_plan = Plan.parse(
+        {
+            "name": "legal",
+            "waypoints": [
+                {"name": "1", "lat": ORIGIN["lat"], "lon": ORIGIN["lon"],
+                 "role": "transit", "speed": 2.5}
+            ],
+        },
+        ORIGIN,
+    )
+    check(ok_plan.waypoints[0].speed == 2.5, "a 2.5 m/s waypoint is still accepted")
+
+    # ---------------------------------------------------------- careful mode
+    section("careful mode (1 knot)")
+
+    careful = config.CAREFUL_SPEED_MS
+    check(
+        abs(config.CAREFUL_SPEED_KNOTS - 1.0) < 1e-9,
+        f"careful mode is {config.CAREFUL_SPEED_KNOTS} knot ({careful:.4f} m/s)",
+    )
+    check(careful < limit, "careful mode is slower than the vessel limit")
+
+    slow = commanded(cm.goto((100.0, 0.0), 99.0, "attack"), careful=True)
+    check(
+        slow <= careful + 1e-6,
+        f"in careful mode a goto at 99 m/s goes out at {slow:.3f} m/s "
+        f"({slow / config.KNOT_MS:.2f} kn)",
+    )
+    slow_vel = commanded(
+        cm.move(forward=99.0, starboard=99.0, reason="attack"), careful=True
+    )
+    check(
+        slow_vel <= careful + 1e-6,
+        f"...and a body velocity at {slow_vel:.3f} m/s",
+    )
+
+    # Even a waypoint that legally asks for 2.5 m/s is held to 1 kn.
+    link = _Link()
+    commander = cm.Commander(link, config)
+    ok, message = commander.set_careful(True)
+    check(ok and commander.careful, f"careful mode switches on: {message}")
+    ctx_speed = None
+    from nodes.self_driving.behaviours.base import Context
+
+    ctx = Context(
+        state=None, world=None, plan=None, config=config, now=0.0,
+        waypoint=ok_plan.waypoints[0], leg=None, task="transit",
+        ceiling=commander.ceiling,
+    )
+    ctx_speed = ctx.speed_limit(config.CRUISE_SPEED_MS)
+    check(
+        ctx_speed <= careful + 1e-9,
+        f"a behaviour PLANS at {ctx_speed:.3f} m/s, rather than asking for more "
+        f"and being clamped on the way out",
+    )
+
+    ok, message = commander.set_careful(False)
+    check(
+        ok and not commander.careful and commander.ceiling > careful,
+        f"careful mode switches off again: {message}",
+    )
+
+    # Careful mode can only ever slow the boat, never speed it up.
+    check(
+        cm.CAREFUL_CEILING_MS <= cm.CEILING_MS,
+        "careful mode's ceiling can never exceed the ordinary one",
+    )
+
+
+def _fake_cluster(centre, colour, width=0.4):
+    """One `Cluster` of the given colour at the given boat-frame point."""
+    from nodes.self_driving.perception.cluster import Cluster
+
+    rgb = {
+        "green": (20, 200, 60),
+        "red": (210, 30, 30),
+        "white": (230, 230, 230),
+    }[colour]
+    n = 6
+    range_m = math.hypot(*centre)
+    return Cluster(
+        centre=(float(centre[0]), float(centre[1])),
+        nearest=(float(centre[0]), float(centre[1])),
+        range_m=range_m,
+        bearing_deg=math.degrees(math.atan2(centre[0], centre[1])),
+        width_m=width,
+        n=n,
+        rgb=np.tile(np.array(rgb, dtype=np.int64), (n, 1)),
+        source="front_lidar",
+    )
+
+
 def main():
     start = time.time()
     for test in (
         test_geo,
         test_colour,
+        test_colour_age_weighting,
         test_masks,
         test_plan,
         test_transit,
@@ -975,6 +1439,8 @@ def main():
         test_safety,
         test_commander,
         test_recorder,
+        test_memory,
+        test_speed_limit,
         test_real_jetson_sample,
     ):
         try:

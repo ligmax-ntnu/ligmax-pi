@@ -51,6 +51,7 @@ from __future__ import annotations
 import logging
 import signal
 import time
+import traceback
 
 import numpy as np
 
@@ -64,6 +65,7 @@ from .perception import cluster_sweep, masks
 from .perception.world import WorldModel
 from .pilot import Pilot
 from .recorder import TripRecorder
+from .survey import Survey
 
 log = logging.getLogger("self_driving")
 
@@ -96,7 +98,8 @@ class Node:
     def __init__(self):
         self.link = NodeLink()
         self.commander = Commander(self.link, config)
-        self.world = WorldModel(config)
+        self.survey = Survey(config)
+        self.world = WorldModel(config, survey=self.survey)
         self.pilot = Pilot(config, self.commander)
         self.recorder = TripRecorder(config)
         self.edge = EdgeLink(port=config.EDGE_PORT) if config.OWN_EDGE_LINK else None
@@ -108,6 +111,12 @@ class Node:
         self._last_relay = 0.0
         self._last_heartbeat_log = 0.0
         self.ticks = 0
+        # Loop health, recorded every sample and published on the panel. A
+        # planner that fell behind its own 10 Hz and one that decided the wrong
+        # thing look identical in a recording unless the timing is in it.
+        self._last_tick_s = 0.0
+        self._overruns = 0
+        self._tick_errors = 0
 
     # ------------------------------------------------------------------ setup
 
@@ -132,14 +141,29 @@ class Node:
 
     def close(self):
         self.recorder.stop("node shutting down")
+        # Write the map out before going away. The node is normally stopped
+        # between the two attempts - by the dashboard's update button, or by
+        # somebody power-cycling the boat on the dock - which is exactly the
+        # moment the survey is worth the most and the only moment it can be lost.
+        self.survey_save("node shutting down")
         self.commander.disengage("node shutting down")
         if self.edge is not None:
             self.edge.close()
         self.link.close()
 
+    def survey_save(self, why):
+        """Persist the surveyed marks now, and say so. Never raises."""
+        try:
+            self.world.save_survey()
+        except Exception as exc:  # noqa: BLE001 - losing the map is not fatal
+            log.warning("could not save the survey (%s): %s", why, exc)
+            return
+        log.info("survey saved (%s): %s", why, self.survey.telemetry())
+
     # ------------------------------------------------------------------- tick
 
     def tick(self, now):
+        started = time.monotonic()
         self.link.poll()
         state = self.link.latest_state()
 
@@ -149,9 +173,50 @@ class Node:
         if state is not None:
             self.commander.send(intent, state)
 
-        self.recorder.sample(state, self.world, self.pilot, intent, scans, now)
+        self.recorder.sample(
+            state,
+            self.world,
+            self.pilot,
+            intent,
+            scans,
+            now,
+            clusters=self._cluster_debug(),
+            edge=(self.edge.telemetry() if self.edge is not None else None),
+            commander=self.commander,
+            perf=self._perf(started),
+            survey=self.survey.telemetry(),
+        )
         self._publish(state, scans, now)
         self.ticks += 1
+        self._last_tick_s = time.monotonic() - started
+
+    def _perf(self, started):
+        """This tick's timing. Cheap, and the only record of falling behind.
+
+        `late_ms` is measured against the tick period rather than against the
+        previous tick, so it says "this tick overran" rather than "the loop is
+        running at some rate", which is the question asked afterwards.
+        """
+        elapsed = time.monotonic() - started
+        return {
+            "tick_ms": round(elapsed * 1000.0, 2),
+            "last_tick_ms": round(self._last_tick_s * 1000.0, 2),
+            "late_ms": round(max(0.0, elapsed - config.TICK_PERIOD) * 1000.0, 2),
+            "ticks": self.ticks,
+            "overruns": self._overruns,
+            "tick_errors": self._tick_errors,
+        }
+
+    def _cluster_debug(self):
+        """This tick's clusters and how each classified, for the recording.
+
+        Taken straight from the world model, which computed them on this very
+        tick: `classify` is the expensive part of the loop and re-running it here
+        would both double that cost and risk recording a *different* answer from
+        the one the boat acted on. The per-point `rgb` is deliberately not
+        repeated - the sweep it came from is written alongside at the same rate.
+        """
+        return self.world.last_measurements
 
     # -------------------------------------------------------------- perception
 
@@ -169,6 +234,13 @@ class Node:
 
         heading = state.heading if state is not None else None
         boat = state.position if state is not None else None
+
+        # Where grid (0, 0) is, so the world model can read and write the survey
+        # - which is in lat/lon, because the origin itself does not survive a
+        # reboot (`survey.py`). Every tick, because the origin can genuinely
+        # change under a running node.
+        if state is not None and state.origin:
+            self.world.set_origin(state.origin)
 
         self._front_clusters = self._cluster(front, "front_lidar")
         self._aft_clusters = self._cluster(aft, "aft_lidar")
@@ -209,14 +281,22 @@ class Node:
             self._front_scan = None
             return None
 
-        points, rgb = masks.apply(
-            scan["points"], scan.get("rgb"), masks.mask_front(scan["points"])
-        )
+        keep = masks.mask_front(scan["points"])
+        points, rgb = masks.apply(scan["points"], scan.get("rgb"), keep)
+        # The per-point colour ages ride through the same mask as the colours
+        # they describe. Filtering one and not the other would shift every age
+        # relative to its return, which shows up as nothing at all - just a vote
+        # quietly weighted by the wrong numbers.
+        ages = masks.select(scan.get("age_ms"), keep, len(scan["points"]))
         scan = dict(scan, points=_listify(points))
         if rgb is not None:
             scan["rgb"] = _flatten(rgb)
         else:
             scan.pop("rgb", None)
+        if ages is not None:
+            scan["age_ms"] = [float(a) for a in ages]
+        else:
+            scan.pop("age_ms", None)
         self._front_scan = scan
         return scan
 
@@ -242,7 +322,11 @@ class Node:
             return []
         try:
             return cluster_sweep(
-                scan["points"], scan.get("rgb"), source=source, config=config
+                scan["points"],
+                scan.get("rgb"),
+                source=source,
+                config=config,
+                age_ms=scan.get("age_ms"),
             )
         except Exception as exc:  # noqa: BLE001 - a bad sweep must not stop the tick
             log.warning("could not cluster the %s sweep: %s", source, exc)
@@ -285,6 +369,18 @@ class Node:
                     str(args.get("why") or "operator stopped autonomy")
                 )
                 self.recorder.stop("operator stopped autonomy")
+                # End of an attempt: this is the map attempt two starts from.
+                self.survey_save("attempt finished")
+            elif name in ("careful_on", "careful_off"):
+                # A speed ceiling the operator can drop to 1 kn and back while
+                # the boat is running. Takes effect on the next tick and does not
+                # interrupt the run - the point is to slow a pass down, not to
+                # stop it. `args.on` is accepted too so a single toggle command
+                # works from a dashboard that would rather send one name.
+                on = name == "careful_on"
+                if "on" in args:
+                    on = bool(args.get("on"))
+                ok, result = self.commander.set_careful(on)
             elif name == "autopilot_pause":
                 ok, result = self.pilot.pause()
             elif name == "autopilot_resume":
@@ -306,8 +402,21 @@ class Node:
                 path = self.recorder.stop("operator stopped the recording")
                 ok, result = True, path or "was not recording"
             elif name == "forget_world":
-                self.world.forget()
-                ok, result = True, "world model cleared"
+                # The dashboard's "Clear what it has seen". Clears the live
+                # tracks *and* the stored survey - see `WorldModel.forget`,
+                # which explains why clearing only one of them is a trap.
+                _count, result = self.world.forget(
+                    f"operator command {command_id}"
+                )
+                ok = True
+            elif name == "forget_object":
+                # Delete one object by id. The id is the `track_id` the chart
+                # draws next to the marker, which is `Track.id` here - the
+                # server's protocol.py maps our `id` onto `track_id` on the way
+                # through, so what the operator clicks is what arrives.
+                ok, result = self.world.forget_track(
+                    args.get("id", args.get("track_id"))
+                )
             else:
                 continue  # not ours - io_manager handles it and acks it
 
@@ -356,18 +465,18 @@ class Node:
                 "perception": {
                     "front_clusters": len(self._front_clusters),
                     "aft_clusters": len(self._aft_clusters),
-                    "tracks": len(self.world.all()),
-                    "confirmed": len(self.world.confirmed()),
+                    **self.world.stats(now),
                     "edge": (
                         "connected"
                         if self.edge is not None and self.edge.connected
                         else "no Jetson"
                     ),
                 },
+                "survey": self.survey.telemetry(),
                 "bus": self.link.stats(),
                 "ticks": self.ticks,
             },
-            tracks=self.world.telemetry(),
+            tracks=self.world.telemetry(now=now),
         )
 
     def _publish_route(self, state):
@@ -429,6 +538,16 @@ def main():
                 node.tick(time.time())
             except Exception as exc:  # noqa: BLE001 - one bad tick is not the run
                 log.exception("tick failed: %s", exc)
+                node._tick_errors += 1
+                # Into the recording too, with the traceback. A tick that raised
+                # is the single most valuable line in a trip file and it was
+                # previously only in the journal, which is not what gets copied
+                # off the boat afterwards.
+                node.recorder.event(
+                    "tick_error",
+                    error=repr(exc),
+                    traceback=traceback.format_exc()[-2000:],
+                )
                 # Never carry on driving through an unexplained failure. The
                 # supervisor restarts this node, and the boat should be stopped
                 # when it does rather than still holding its last target.
@@ -442,6 +561,7 @@ def main():
                 # Fell behind - a slow tick, or the clock stepped. Re-base
                 # rather than trying to catch up, which would run a burst of
                 # ticks back to back on identical sensor data.
+                node._overruns += 1
                 next_tick = time.monotonic()
     except KeyboardInterrupt:
         pass
