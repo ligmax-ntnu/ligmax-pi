@@ -139,6 +139,7 @@ class Pilot:
             task="transit",
             clusters=clusters,
             ceiling=self.commander.ceiling,
+            run=self.commander.run,
         )
 
         # A new waypoint means a new behaviour, and a fresh progress clock.

@@ -46,7 +46,7 @@ class Hold(Behaviour):
                 # and an overshoot at the finish is visible to the jury.
                 remaining = ctx.distance_to_target or 0.0
                 speed = min(
-                    ctx.speed_limit(ctx.config.CRUISE_SPEED_MS),
+                    ctx.cruise_speed,
                     max(ctx.config.DOCK_SPEED_MS, remaining * 0.35),
                 )
                 self.note(to_run_m=round(remaining, 1))

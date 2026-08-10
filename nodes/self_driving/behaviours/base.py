@@ -49,6 +49,7 @@ import math
 from .. import geo
 from ..commander import goto, move, stop
 from ..obsticales import ObstacleType, clearance_for
+from ..profiles import PROFILES, NORMAL
 
 # How many times to push the aim point before accepting it. Each pass moves it
 # clear of the worst offender; three is enough for the counts involved here and
@@ -59,17 +60,46 @@ DECONFLICT_PASSES = 3
 # geometry says. Without it the boat swerves for a buoy it is already abeam of.
 AHEAD_CONE_DEG = 100.0
 
+# Below this a corner is a kink rather than a turn and the limiter stays out of
+# it. Also the guard on the division in `corner_speed_limit`, where the radius
+# goes to infinity as the turn goes to zero.
+MIN_TURN_DEG = 12.0
+
+
+def speed_for_radius(ctx, radius_m):
+    """The fastest the boat can hold a turn of `radius_m`, m/s.
+
+    Two laws, and the tighter one wins, because they bind at opposite ends of the
+    speed range:
+
+        v = sqrt(A * R)     grip. A turn needs `v^2 / R` of lateral acceleration
+                            and the hull only supplies so much. This is what binds
+                            at the fast profile's speeds, and it is the law the
+                            first version of this file got wrong.
+        v = omega * R       yaw authority. At a walking pace the acceleration law
+                            would allow a turn on the spot; what actually stops
+                            that is how much yaw moment the thrusters make.
+
+    They cross at `R = A / omega^2`. Above that radius grip is the limit, below it
+    the thrusters are, and taking the minimum is correct on both sides of the
+    crossing without a special case.
+    """
+    radius_m = max(0.0, float(radius_m))
+    grip = math.sqrt(ctx.config.TURN_LATERAL_ACCEL_MS2 * radius_m)
+    authority = ctx.config.TURN_YAW_RATE * radius_m
+    return max(ctx.config.CORNER_MIN_SPEED_MS, min(grip, authority))
+
 
 class Context:
     """Everything a behaviour may read. Built fresh each tick by `pilot.py`."""
 
     __slots__ = (
         "state", "world", "plan", "config", "now", "waypoint", "leg", "task",
-        "clusters", "ceiling",
+        "clusters", "ceiling", "run",
     )
 
     def __init__(self, state, world, plan, config, now, waypoint, leg, task,
-                 clusters=(), ceiling=None):
+                 clusters=(), ceiling=None, run=None):
         self.state = state
         self.world = world
         self.plan = plan
@@ -92,8 +122,37 @@ class Context:
         self.ceiling = (
             config.MAX_SPEED_MS if ceiling is None else float(ceiling)
         )
+        # The run mode in force - which profile, and the optional switches that
+        # go with it (`profiles.RunMode`). Passed in for the same reason
+        # `ceiling` is: so a behaviour plans at the speed it will actually get.
+        # Defaulted rather than required, so a `Context` built by hand in a test
+        # or a replay tool behaves like an ordinary run without having to know
+        # this exists.
+        self.run = run
 
     # -- the handful of derived figures every behaviour wants ---------------
+
+    @property
+    def profile(self):
+        """The speed profile in force. Never None."""
+        if self.run is not None:
+            return self.run.profile
+        return PROFILES[NORMAL]
+
+    @property
+    def cruise_speed(self):
+        """What to ask for on an open leg, this profile, this waypoint."""
+        return self.speed_limit(self.profile.cruise_ms)
+
+    @property
+    def caution_speed(self):
+        """What to ask for among marks, this profile, this waypoint."""
+        return self.speed_limit(self.profile.caution_ms)
+
+    @property
+    def alternation(self):
+        """Whether the cardinal alternation prior is switched on."""
+        return bool(self.run is not None and self.run.alternation)
 
     @property
     def boat(self):
@@ -245,6 +304,208 @@ def obstacles_ahead(ctx, kinds=None, within=None):
     return [track for _distance, track in found]
 
 
+def dynamic_clearance(ctx):
+    """Extra metres of room for the speed the boat is being driven at.
+
+    A clearance is a time budget wearing metres. `BUOY_CLEARANCE_M` is 2 m, which
+    at the 0.8 m/s caution speed is two and a half seconds to notice a mark is
+    not where it was believed to be and steer off it - and at 2.5 m/s is eight
+    tenths of a second, which is less than one tick plus the thrusters. A static
+    clearance therefore means the boat gets progressively less safe the faster it
+    goes while the disc on the operator's chart says it has not changed.
+
+    So the profile carries metres-per-m/s (`profiles.py`), and it is **zero on
+    every profile but `fast`**: Task 2's gates are 5 m across and any speed term
+    at all would have the boat refuse a gate it is meant to drive through. See
+    `config.FAST_CLEARANCE_PER_MS`.
+
+    Measured against the *larger* of what the boat is doing and what the profile
+    intends, not against the speedometer alone. A boat accelerating down a leg
+    would otherwise widen its berth as it went, which puts the correction late -
+    the whole value of a wide berth is that it is decided at the top of the leg
+    and steered once, rather than discovered next to the mark.
+    """
+    gain = ctx.profile.clearance_per_ms
+    if gain <= 0.0:
+        return 0.0
+    speed = 0.0
+    if ctx.state is not None:
+        try:
+            speed = abs(float(ctx.state.speed or 0.0))
+        except (TypeError, ValueError):
+            speed = 0.0
+    speed = max(speed, ctx.profile.caution_ms)
+    return min(ctx.config.CLEARANCE_SPEED_MAX_M, gain * speed)
+
+
+def lookahead_for(ctx, remaining):
+    """How far along the leg to aim, metres. Pure pursuit's one parameter.
+
+    A fixed distance is the wrong shape. What governs whether pure pursuit is
+    stable is how much *time* the lookahead represents: 6 m is five seconds at
+    the 1.2 m/s cruise and two and a third at 2.5 m/s, and a lookahead that short
+    relative to the speed makes the boat correct harder than it can turn,
+    overshoot, and weave down the leg with the jury watching the trace.
+
+    So it is the larger of the fixed distance and `LOOKAHEAD_TIME_S` of travel -
+    which changes nothing below about 1.5 m/s and gives the fast profile the
+    longer rein it needs.
+
+    Measured against the profile's intended cruise rather than the speedometer,
+    deliberately. The lookahead moves the aim point, so a lookahead that tracked
+    the measured speed would jitter the aim with every ripple in the log, and
+    would also lengthen exactly when the corner limiter had just shortened the
+    speed for a turn - which is when a long lookahead cuts the corner. The
+    `remaining * 0.8` cap is what actually pulls the aim in on the run-up to a
+    mark, and it does it on geometry rather than on a noisy input.
+    """
+    config = ctx.config
+    distance = max(config.LOOKAHEAD_M, ctx.cruise_speed * config.LOOKAHEAD_TIME_S)
+    return max(config.LOOKAHEAD_MIN_M, min(distance, remaining * 0.8))
+
+
+# ------------------------------------------------------- how fast a corner allows
+
+def next_leg(ctx):
+    """`(bearing, length_m)` of the leg after this one, or None.
+
+    None at the last waypoint, without a plan, or when the next waypoint is on
+    top of this one - all three mean "there is no corner here", which is the
+    answer the limiter wants rather than an error.
+    """
+    plan, waypoint = ctx.plan, ctx.waypoint
+    if plan is None or waypoint is None or ctx.state is None:
+        return None
+    following = waypoint.index + 1
+    if following >= len(plan.waypoints):
+        return None
+    here = ctx.target
+    there = plan.waypoints[following].world(ctx.state.origin)
+    if here is None or there is None:
+        return None
+    length = geo.distance(here, there)
+    if length < 0.5:
+        return None
+    return geo.bearing_to(here, there), length
+
+
+def corner_speed_limit(ctx, speed):
+    """Hold `speed` down to what the turn at the end of this leg allows.
+
+    `(speed, note)`. The note is a sentence for the operator, empty when nothing
+    was limited.
+
+    The Monday course is a slalom - three corners over 100 degrees on legs of
+    10-17 m (`plans/README.md`) - and a turn radius is `speed / yaw rate`. At
+    2.5 m/s and a yaw rate of 0.5 rad/s that is a 5 m radius, which on a 123
+    degree corner cuts inside the mark by more than the 3 m acceptance radius:
+    the boat misses the waypoint it is being scored on passing, at speed, and
+    looks decisive doing it. The fix is not a slower plan, it is a speed that
+    follows the geometry - full pace on the straights, whatever the corner allows
+    at the corner.
+
+    Two constraints, and the tighter one wins.
+
+    **The turn must fit inside the acceptance radius.** A circular arc of radius
+    `R` tangent to both legs passes `R * (sec(turn/2) - 1)` from the corner, so
+    the largest radius that still counts as passing the waypoint is
+    `radius / (sec(turn/2) - 1)`.
+
+    **The turn-in must fit on the leg.** That arc starts `R * tan(turn/2)` before
+    the corner. On this course that is the binding one: a 104 degree turn at the
+    end of a 5 m leg has room for a 2 m radius, not the 4.8 m the acceptance
+    radius alone would allow. Half the shorter of the two legs is the budget,
+    which leaves the other half for the previous corner's exit.
+
+    Then the boat is allowed as much speed as it can still shed in the distance
+    left - `v^2 = v_corner^2 + 2*a*d` - so a long leg into a tight corner runs at
+    full pace and brakes late rather than crawling the whole way down it.
+
+    **It looks one corner ahead, not two.** Where two tight corners share a short
+    leg the exit from the first eats into the entry to the second, and this will
+    be a little optimistic about the pair. The 5 m leg between waypoints 1 and
+    1.1 is the one place on Monday's course that happens; `CORNER_MIN_SPEED_MS`
+    and the operator's eye are what cover it.
+    """
+    following = next_leg(ctx)
+    if following is None or ctx.leg is None or ctx.boat is None:
+        return speed, ""
+    bearing, length = following
+    turn = abs(geo.angle_diff(bearing, geo.bearing_to(ctx.leg[0], ctx.leg[1])))
+    if turn < MIN_TURN_DEG:
+        return speed, ""
+
+    # Clamped short of 90 degrees so `cos` cannot reach zero: a 180 degree turn
+    # is a real entry in a plan (a course that doubles back) and it must limit
+    # hard rather than divide by zero.
+    half = min(math.radians(turn) * 0.5, math.radians(89.0))
+    radius = ctx.acceptance_radius() / (1.0 / math.cos(half) - 1.0)
+
+    leg_length = geo.distance(ctx.leg[0], ctx.leg[1])
+    budget = min(leg_length, length) * 0.5
+    radius = min(radius, budget / math.tan(half))
+
+    corner = speed_for_radius(ctx, radius)
+    remaining = max(0.0, ctx.distance_to_target or 0.0)
+    allowed = math.sqrt(
+        corner * corner + 2.0 * ctx.config.TURN_DECEL_MS2 * remaining
+    )
+    if allowed >= speed:
+        return speed, ""
+    allowed = max(ctx.config.CORNER_MIN_SPEED_MS, allowed)
+    return allowed, (
+        f"{turn:.0f} deg turn at {ctx.waypoint.name} in {remaining:.0f} m - "
+        f"easing to {allowed:.1f} m/s"
+    )
+
+
+def heading_speed_limit(ctx, speed, aim_xy):
+    """Hold `speed` down while the boat is pointing the wrong way. `(speed, note)`.
+
+    The reactive half of the pair, and it covers what `corner_speed_limit` cannot.
+    That one is anticipatory - it reads the plan and slows *before* a corner so
+    the boat can get round it. This one reads the boat and slows while the boat is
+    *already* crosswise, which happens for reasons no amount of looking ahead
+    predicts:
+
+      * coming out of a corner. A 115 degree turn is not instant, so for a second
+        or two after the waypoint the boat is on the new leg pointing across it,
+        and full cruise there is what swings it wide of the *next* mark - which is
+        exactly how Monday's course loses waypoint 3.4 having made 3.3 perfectly.
+      * a deconflict swerve, which moves the aim point without warning.
+      * the moment autonomy is engaged, when the boat is pointing wherever the
+        remote pilot left it.
+
+    The bound is the same piece of physics as the corner limiter's, run the other
+    way round: turning through `error` on a radius `R` takes `R * error` of arc,
+    that arc has to fit in the distance to the aim point, so the largest usable
+    radius is `reach / error` - and `speed_for_radius` says how fast the boat may
+    go on it. A boat 6 m from an aim point 115 degrees off may do about 1.5 m/s;
+    one 20 degrees off is not limited at all.
+
+    Applied in `steer_towards`, so every behaviour that steers gets it without
+    having to remember to.
+    """
+    boat, heading = ctx.boat, ctx.heading
+    if boat is None or heading is None or aim_xy is None:
+        return speed, ""
+    error = abs(geo.angle_diff(geo.bearing_to(boat, aim_xy), heading))
+    if error < MIN_TURN_DEG:
+        return speed, ""
+    # Floored at the minimum lookahead: an aim point half a metre away with a
+    # large heading error would otherwise demand a crawl, and at that range the
+    # boat is turning on the spot anyway.
+    reach = max(ctx.config.LOOKAHEAD_MIN_M, geo.distance(boat, aim_xy))
+    allowed = speed_for_radius(ctx, reach / math.radians(error))
+    if allowed >= speed:
+        return speed, ""
+    allowed = max(ctx.config.CORNER_MIN_SPEED_MS, allowed)
+    return allowed, (
+        f"{error:.0f} deg off the aim - holding {allowed:.1f} m/s while it "
+        f"turns onto it"
+    )
+
+
 def deconflict(ctx, aim_xy, extra_clearance=0.0, ignore=()):
     """Push `aim_xy` sideways until the line to it is clear. `(aim, notes)`.
 
@@ -265,6 +526,10 @@ def deconflict(ctx, aim_xy, extra_clearance=0.0, ignore=()):
 
     notes = []
     aim = aim_xy
+    # Once per call rather than per track per pass: it is the same figure for
+    # every obstacle, and computing it inside the loop would make the corridor
+    # depend on how many things are in it.
+    for_speed = dynamic_clearance(ctx)
     for _pass in range(DECONFLICT_PASSES):
         worst = None
         for track in ctx.world.confirmed():
@@ -279,6 +544,7 @@ def deconflict(ctx, aim_xy, extra_clearance=0.0, ignore=()):
                 clearance_for(track.kind, ctx.config)
                 + extra_clearance
                 + track.sigma_m
+                + for_speed
             )
             position = _where(track, boat, ctx)
             t, along, cross = geo.project_onto_leg(position, boat, aim)
@@ -362,13 +628,23 @@ def emergency_stop_needed(ctx):
 
 
 def steer_towards(ctx, aim_xy, speed, reason):
-    """The ordinary way a behaviour drives: a deconflicted position target."""
+    """The ordinary way a behaviour drives: a deconflicted position target.
+
+    The heading limit goes last, after `deconflict` has had its say, because a
+    swerve round an obstacle is one of the things that leaves the boat crosswise
+    to where it is going - limiting against the aim point the behaviour asked for
+    rather than the one it is actually being sent to would miss exactly the case
+    that matters.
+    """
     ok, why = emergency_stop_needed(ctx)
     if ok:
         return stop(why)
     aim, notes = deconflict(ctx, aim_xy)
     if notes:
         reason = f"{reason}; avoiding {notes[0]}"
+    speed, turning = heading_speed_limit(ctx, speed, aim)
+    if turning:
+        reason = f"{reason}; {turning}"
     return goto(aim, speed, reason)
 
 

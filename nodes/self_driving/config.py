@@ -214,6 +214,65 @@ CAREFUL_DEFAULT = _b("LIGMAX_AP_CAREFUL", False)
 MAX_SPEED_MS = _speed("LIGMAX_AP_MAX_SPEED_MS", 1.6)
 
 
+# ------------------------------------------------------------- the fast run
+#
+# NJORD gives two attempts (§8.2), and the marks do not move between them. So
+# the two attempts are not the same run twice: the first one is slow enough for
+# the lidar to survey every mark properly, and the second one is driven off that
+# survey (`survey.py`) at whatever speed the course geometry actually allows.
+#
+# That is a real trade and it is worth being explicit about which way it goes.
+# Going faster costs sightings - a mark 10 m off subtends 2.3 deg, and at 2.5 m/s
+# it is inside the C1's useful range for a couple of seconds rather than ten, so
+# `TRACK_ESTABLISH_HITS` sweeps of it may simply never happen. The fast attempt
+# is therefore only honest when there IS a survey to fall back on, which is why
+# it is a mode an operator selects rather than a default.
+#
+# **The 5 kn limit still applies**, through `_speed` here and through all five
+# enforcement points listed above it. What the fast profile changes is which of
+# the *lower* ceilings the boat holds itself to, never the vessel limit itself.
+FAST_CEILING_MS = _speed("LIGMAX_AP_FAST_CEILING_MS", SPEED_LIMIT_MS)
+
+# What the fast profile asks for on an open leg and around marks. Both are below
+# the ceiling on purpose: the ceiling is what the boat may not exceed, these are
+# what it aims for, and leaving room between the two is what lets the corner
+# limiter below give speed back on a straight without ever touching the limit.
+FAST_CRUISE_SPEED_MS = _speed("LIGMAX_AP_FAST_CRUISE_MS", 2.2)
+FAST_CAUTION_SPEED_MS = _speed("LIGMAX_AP_FAST_CAUTION_MS", 1.6)
+
+# Extra metres of clearance per m/s the boat is doing, on top of the static
+# `BUOY_CLEARANCE_M` and the mark's own position uncertainty.
+#
+# A clearance is really a *time* budget wearing metres: it is the room needed to
+# notice a mark is not where it was believed to be and to steer off it. At the
+# 0.8 m/s caution speed 2 m is two and a half seconds; at 2.5 m/s the same 2 m is
+# eight tenths of a second, which is less than one autonomy tick plus the
+# thrusters' response. So the static figure alone means the boat is progressively
+# less safe the faster it goes, while the number on the dashboard says otherwise.
+#
+# 1.0 m per m/s restores roughly the same time budget across the range: 2.5 m/s
+# buys 2.5 m of extra water, and the total clearance at full speed is about
+# 4.5 m plus uncertainty.
+#
+# **Zero on every profile but `fast`**, and that is deliberate rather than
+# cautious defaulting. Task 2's gates are red/green pairs 5 m apart (NJORD §9.2)
+# - half of that is 2.5 m, and `BUOY_CLEARANCE_M` at 2.0 m plus the 0.35 m
+# tracking sigma already very nearly fills it. Any speed term at all would make
+# the boat refuse a gate it is supposed to drive through. Task 1's buoys are
+# standalone (NJORD §9.1: "no red/green gate pairs are used in this task"), so
+# the wide berth is free there and only there.
+FAST_CLEARANCE_PER_MS = _f("LIGMAX_AP_FAST_CLEARANCE_PER_MS", 1.0)
+
+# ...and a ceiling on that term, so a runaway speed reading cannot make the boat
+# claim half the course as its own.
+CLEARANCE_SPEED_MAX_M = _f("LIGMAX_AP_CLEARANCE_SPEED_MAX_M", 3.0)
+
+# Which profile the node boots into. "normal" unless somebody says otherwise:
+# booting into `fast` would mean a boat that comes up after a mid-competition
+# reboot doing 5 kn on a course it has not surveyed.
+DEFAULT_PROFILE = _s("LIGMAX_AP_PROFILE", "normal").strip().lower()
+
+
 # -------------------------------------------------------------------- speeds
 
 # NJORD §9.2 sets the collision-avoidance task speed at 2 knots and requires the
@@ -260,6 +319,74 @@ USE_PASSING_PLANE = _b("LIGMAX_AP_PASSING_PLANE", True)
 # distance ahead on the track makes it converge onto it. TUNE.
 LOOKAHEAD_M = _f("LIGMAX_AP_LOOKAHEAD_M", 6.0)
 LOOKAHEAD_MIN_M = _f("LIGMAX_AP_LOOKAHEAD_MIN_M", 2.5)
+
+# ...and the same distance expressed as time, which is the form that actually
+# governs whether pure pursuit is stable. A fixed 6 m lookahead is five seconds
+# of travel at the 1.2 m/s cruise and two and a third at 2.5 m/s, and a lookahead
+# that short relative to the speed is the classic pure-pursuit oscillation: the
+# boat corrects harder than it can turn, overshoots, and weaves down the leg with
+# the jury watching the trace (NJORD §11.4). The lookahead used is the LARGER of
+# the two, so nothing changes at survey speed and the fast run gets the longer
+# rein it needs. TUNE.
+LOOKAHEAD_TIME_S = _f("LIGMAX_AP_LOOKAHEAD_TIME_S", 4.0)
+
+
+# ---------------------------------------------------- how fast a corner allows
+#
+# The Monday Task 1 course is a slalom: five of its twelve corners are over 85
+# degrees and three are over 100, on legs of 10-17 m (`plans/README.md`). A turn
+# radius is `speed / yaw rate`, so speed is what decides whether the boat can get
+# round a corner at all - and, more to the point, whether it passes inside the
+# acceptance radius of the waypoint at the corner, which is what it is scored on.
+#
+# Rather than hand-tuning a speed per waypoint on a competition morning, the
+# geometry is read off the plan and the speed follows from it: fast where the
+# course is straight, slow where it is not, with no plan field to get wrong.
+#
+# How hard the boat can turn, as lateral acceleration in m/s^2. **This is the one
+# number here that must be measured on the water**, and everything the corner
+# limiter does rests on it.
+#
+# Lateral acceleration rather than a yaw rate, and the difference is not
+# academic. A turn of radius `R` at speed `v` needs `v^2 / R` of lateral
+# acceleration, and a hull can only supply so much before it stops turning and
+# starts sliding sideways. So the radius a boat can hold grows with the SQUARE of
+# its speed:
+#
+#     R = v^2 / A          v = sqrt(A * R)
+#
+# Model it as a constant yaw rate instead - `R = v / omega` - and you have a boat
+# whose turning circle only doubles when its speed doubles, which is far too
+# flattering and which will happily plan a 5 knot pass through a corner it cannot
+# physically make. That mistake was in this file's first version of the limiter
+# and the simulation caught it: at a plausible hull capability the paced run
+# missed the same waypoints as the unpaced one, because the pacing had been
+# computed from a law that let it keep almost all of its speed.
+#
+# **How to measure it**: put the boat in a full-lock turn at a known speed and
+# time one revolution. `A = v * 2*pi / period`. Do it at the fast profile's speed,
+# not at idle - the number falls off as the hull loads up. 0.8 m/s^2 is a
+# conservative guess for a light trimaran on differential thrust; guessing low
+# costs a slow corner, guessing high costs the waypoint. TUNE.
+TURN_LATERAL_ACCEL_MS2 = _f("LIGMAX_AP_TURN_LATERAL_ACCEL", 0.8)
+
+# The yaw rate the hull can hold at low speed, rad/s, which is the OTHER end of
+# the same curve. The lateral-acceleration law above says a boat doing 0.3 m/s
+# could hold a 0.11 m radius, i.e. spin on the spot, and it cannot - below a knot
+# or so what limits the turn is how much yaw moment the thrusters make, not grip.
+# The limiter takes whichever of the two laws is tighter, so this governs the slow
+# end and the acceleration governs the fast one. 0.5 rad/s is 29 deg/s. TUNE.
+TURN_YAW_RATE = _f("LIGMAX_AP_TURN_YAW_RATE", 0.5)
+
+# How hard the boat can shed speed, m/s^2, for working out how early to start
+# slowing for a corner. A displacement hull with reversible thrusters stops
+# faster than it accelerates; this is the conservative half of that. TUNE.
+TURN_DECEL_MS2 = _f("LIGMAX_AP_TURN_DECEL_MS2", 0.5)
+
+# The corner limiter may never ask for less than this. A boat that creeps round
+# every bend is its own failure mode, and below this speed the steering authority
+# of a differential-thrust hull starts falling away anyway.
+CORNER_MIN_SPEED_MS = _speed("LIGMAX_AP_CORNER_MIN_SPEED_MS", 0.4)
 
 
 # ------------------------------------------------------------------ obstacles
@@ -466,9 +593,29 @@ TRACK_SIGMA_GROWTH_M_S = _f("LIGMAX_AP_TRACK_SIGMA_GROWTH_M_S", 0.05)
 
 # ...and where it stops. Past this the answer is "somewhere in this circle" and
 # waiting longer does not make it worse: a moored buoy has a watch circle, it
-# does not wander off. 6 m at 0.05 m/s is reached after about two minutes unseen,
-# and is also what a track restored from a previous run starts at.
+# does not wander off. 6 m at 0.05 m/s is reached after about two minutes unseen.
 TRACK_SIGMA_MAX_M = _f("LIGMAX_AP_TRACK_SIGMA_MAX_M", 6.0)
+
+# What a mark restored from the survey file is worth, before the lidar has seen
+# it again. **Not `TRACK_SIGMA_MAX_M`**, which is what it used to get by falling
+# through the growth ramp with an hour-old `last_seen`, and that was wrong in a
+# way that quietly defeated the whole point of surveying.
+#
+# The two cases are not the same uncertainty. A mark that went out of view during
+# a run has been unobserved for an unknown reason and could be anywhere in its
+# watch circle; a mark in the survey file was measured deliberately, over
+# `TRACK_ESTABLISH_HITS` sweeps, against an RTK fix, and has since been sitting
+# on the same mooring. Its error is the survey's own accuracy plus how far a
+# moored buoy swings - not two minutes of "we have no idea".
+#
+# The number matters because every consumer adds it to a clearance. At the old
+# 6 m every remembered mark claimed 8 m of water, which on a course whose legs
+# are 10-17 m long meant the second attempt would swerve round its own map and
+# very likely fail to thread it at all. At 1.2 m the boat gives a remembered mark
+# a sane berth, and the instant the lidar actually sees it the figure collapses
+# to `TRACK_SIGMA_M` like any other measurement. TUNE against how far the marks
+# had moved between attempt one and attempt two, which the trip files will show.
+SURVEY_SIGMA_M = _f("LIGMAX_AP_SURVEY_SIGMA_M", 1.2)
 
 
 # --------------------------------------------- what earns permanent memory
@@ -542,6 +689,53 @@ SURVEY_MAX_TRACKS = _i("LIGMAX_AP_SURVEY_MAX_TRACKS", 200)
 # wrong side of a mark, which is the whole point of the task.
 CARDINAL_VOTES_REQUIRED = _i("LIGMAX_AP_CARDINAL_VOTES", 4)
 CARDINAL_MIN_CONF = _f("LIGMAX_AP_CARDINAL_MIN_CONF", 0.55)
+
+
+# ------------------------------------------- the alternation prior, OFF by default
+#
+# A fallback for the case the cardinal vote is designed around and cannot fix: the
+# camera never commits, the mark is 15 m away and closing, and the boat has to
+# pass it on one side or the other.
+#
+# The prior is a general fact about how marks are laid in a channel, not a fact
+# about any Njord course: **consecutive marks along a run alternate the side you
+# pass them on.** A mark that pushes you the same way as the one before it does
+# not constrain anything the previous one had not already settled, so nobody lays
+# one there. Two marks in a row, and the second is far more likely to be the
+# opposite hand than the same one.
+#
+# `behaviours/alternation.py` applies exactly that and nothing else. It reads the
+# sides the boat has *already established for itself* - a red or green mark's
+# lateral rule, or an earlier cardinal the camera did commit - and expects the
+# next mark to be the other hand. It is not permitted to name a specific course,
+# a specific mark, or a specific task, and it never overrides evidence: a
+# committed camera vote always wins, and disagreement is reported rather than
+# resolved.
+#
+# **Off unless switched on**, by `LIGMAX_AP_ALTERNATION=1` or the operator's
+# `alternation` command. It is an inference from a pattern, the pattern can be
+# wrong, and a boat that quietly guesses sides is not one whose telemetry can be
+# trusted at the moment it matters. Switched on it is worth roughly the
+# difference between a coin flip and a considered guess - which is a great deal
+# when the alternative is a coin flip, and nothing at all when the camera works.
+ALTERNATION_DEFAULT = _b("LIGMAX_AP_ALTERNATION", False)
+
+# How far off the leg's axis a cardinal's safe side has to point before the prior
+# will name it. The prior can only ever say "pass this one to port" or "...to
+# starboard"; turning that back into a compass direction needs the safe bearing
+# to have a real sideways component. On a leg running north, east and west are
+# unambiguous and north and south say nothing at all - 0.5 is sin(30 deg), so a
+# safe side within 30 degrees of straight up or down the leg is declined rather
+# than guessed at.
+ALTERNATION_MIN_SIN = _f("LIGMAX_AP_ALTERNATION_MIN_SIN", 0.5)
+
+# How far apart two marks may be and still count as consecutive. Beyond this the
+# second one is not "the next mark in the run", it is a mark on another part of
+# the course that happens to lie ahead, and the alternation says nothing about
+# it. The Monday course's marks sit on legs of 10-17 m; 40 m is generous enough
+# to survive a mark being missed entirely and tight enough to not reach across
+# the basin.
+ALTERNATION_MAX_GAP_M = _f("LIGMAX_AP_ALTERNATION_MAX_GAP_M", 40.0)
 
 
 # ------------------------------------------------------------------- COLREG

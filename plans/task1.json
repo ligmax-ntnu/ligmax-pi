@@ -1,0 +1,94 @@
+{
+  "name": "task1",
+  "channel_bearing": 0,
+  "waypoints": [
+    {
+      "name": "1",
+      "lat": 63.4408028,
+      "lon": 10.4233944,
+      "role": "transit",
+      "notes": "GPS 1 - autonomy is engaged here, timer starts"
+    },
+    {
+      "name": "1.1",
+      "lat": 63.4408,
+      "lon": 10.4232944,
+      "role": "transit"
+    },
+    {
+      "name": "1.2",
+      "lat": 63.4407389,
+      "lon": 10.4233389,
+      "role": "transit"
+    },
+    {
+      "name": "1.3",
+      "lat": 63.4407,
+      "lon": 10.4233472,
+      "role": "transit"
+    },
+    {
+      "name": "1.4",
+      "lat": 63.4406722,
+      "lon": 10.42325,
+      "role": "transit"
+    },
+    {
+      "name": "1.5",
+      "lat": 63.4406722,
+      "lon": 10.4230389,
+      "role": "transit"
+    },
+    {
+      "name": "2",
+      "lat": 63.4405139,
+      "lon": 10.4230583,
+      "role": "transit",
+      "notes": "GPS 2"
+    },
+    {
+      "name": "3",
+      "lat": 63.4404167,
+      "lon": 10.4233361,
+      "role": "buoys",
+      "channel_bearing": 27,
+      "notes": "GPS 3 - part 2 restart point. Vision from here on."
+    },
+    {
+      "name": "3.1",
+      "lat": 63.4404944,
+      "lon": 10.4234222,
+      "role": "buoys",
+      "channel_bearing": 27
+    },
+    {
+      "name": "3.2",
+      "lat": 63.4405833,
+      "lon": 10.4233167,
+      "role": "buoys",
+      "channel_bearing": 27
+    },
+    {
+      "name": "3.3",
+      "lat": 63.4405694,
+      "lon": 10.4236389,
+      "role": "buoys",
+      "channel_bearing": 27
+    },
+    {
+      "name": "3.4",
+      "lat": 63.4406583,
+      "lon": 10.4235694,
+      "role": "buoys",
+      "channel_bearing": 27
+    },
+    {
+      "name": "4",
+      "lat": 63.4407333,
+      "lon": 10.4237,
+      "role": "hold",
+      "hold_s": 0,
+      "notes": "GPS 4 - stop here and stay stationary, NJORD 9.1"
+    }
+  ]
+}

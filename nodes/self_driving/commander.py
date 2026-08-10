@@ -64,6 +64,7 @@ import math
 import time
 
 from . import geo
+from . import profiles
 from .config import (
     LATERAL_MAX_MS,
     LATERAL_MODE,
@@ -285,19 +286,48 @@ class Commander:
         self.engaged = False
         self.sent = 0
         self.last_intent = None
-        # Careful mode lives here rather than on the pilot because this is the
-        # file that enforces it, and a flag that lives anywhere other than its
+        # How hard the boat is being driven, and the switches that go with it.
+        # It lives here rather than on the pilot because this is the file that
+        # enforces the speed part, and a flag that lives anywhere other than its
         # enforcement point eventually disagrees with it. `pilot.py` reads it
-        # through the commander so the behaviours plan at the slower speed
+        # through the commander so the behaviours plan at the profile's speed
         # instead of being clamped after the fact.
-        self.careful = bool(CAREFUL_DEFAULT)
+        self.run = profiles.RunMode(config)
+        if CAREFUL_DEFAULT:
+            self.run.set_profile(profiles.SURVEY)
 
     # -------------------------------------------------------- careful mode
 
     @property
     def ceiling(self):
-        """The speed ceiling in force right now, m/s."""
-        return CAREFUL_CEILING_MS if self.careful else CEILING_MS
+        """The speed ceiling in force right now, m/s.
+
+        The profile's, held to the vessel limit. `SPEED_LIMIT_MS` rather than
+        `CEILING_MS` is the right bound here and the difference is the whole
+        point of the fast profile: `CEILING_MS` folds in `MAX_SPEED_MS`, which is
+        the *normal* profile's self-imposed 1.6 m/s and not a limit on the
+        vessel. A profile is allowed to spend the boat's own margin up to 5
+        knots; nothing is allowed past 5 knots. `profiles.Profile` clamps to the
+        same figure on the way in, so this is the second of the two.
+        """
+        return min(SPEED_LIMIT_MS, self.run.profile.ceiling_ms)
+
+    @property
+    def careful(self):
+        """The one-knot ceiling, under the name the dashboard already sends."""
+        return self.run.careful
+
+    @careful.setter
+    def careful(self, on):
+        self.run.set_profile(profiles.SURVEY if on else profiles.NORMAL)
+
+    def set_profile(self, name):
+        """Select a run profile by name. `(ok, message)` for the ack."""
+        return self.run.set_profile(name)
+
+    def set_alternation(self, on):
+        """Switch the cardinal alternation prior. `(ok, message)`."""
+        return self.run.set_alternation(on)
 
     def set_careful(self, on):
         """Switch careful mode. `(ok, message)` for the operator's ack."""
@@ -366,15 +396,25 @@ class Commander:
 
     # ---------------------------------------------------------------- sending
 
-    def send(self, intent, state):
+    def send(self, intent, state, now=None):
         """Put one intent on the wire. Returns what was actually sent.
 
         Re-sends an unchanged intent every `TARGET_REFRESH_S` as a keepalive
         against ArduPilot's guided-command timeout, and sends immediately
         whenever the intent changes, so a stop is never a refresh period late.
+
+        `now` is the tick's clock, and passing it rather than reading
+        `time.time()` here is what makes the keepalive testable. `main.py` already
+        ticks on `time.time()`, so in production the two are the same value; in a
+        simulation or a replay they are emphatically not, and a `send` that reads
+        the wall clock silently stops keeping alive - two thousand simulated ticks
+        go by inside one real second, `due` is never true, and a boat whose aim
+        point happens to sit still coasts in a straight line off the course while
+        every assertion about the run passes. That is not a hypothetical: it is
+        what this argument was added to fix.
         """
         self.last_intent = intent
-        now = time.time()
+        now = time.time() if now is None else float(now)
         signature = self._signature(intent)
         due = now - self._last_sent >= TARGET_REFRESH_S
         if signature == self._last_signature and not due:
@@ -486,7 +526,10 @@ class Commander:
         block["speed_limit_kn"] = SPEED_LIMIT_KNOTS
         block["speed_ceiling_ms"] = round(self.ceiling, 3)
         block["speed_ceiling_kn"] = round(self.ceiling / KNOT_MS, 2)
-        block["careful"] = self.careful
+        # The whole run mode, not just the careful flag: which profile is
+        # selected is the first thing anybody watching a fast pass wants to see,
+        # and the first thing anybody reading the trip file afterwards needs.
+        block.update(self.run.telemetry())
         block["lateral_mode"] = LATERAL_MODE
         if LATERAL_MODE == "rc" and not LATERAL_RC_CHAN:
             block["lateral_warning"] = (

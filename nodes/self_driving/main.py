@@ -171,7 +171,7 @@ class Node:
         scans = self._perceive(state, now)
         intent = self.pilot.tick(state, self.world, self._front_clusters, now)
         if state is not None:
-            self.commander.send(intent, state)
+            self.commander.send(intent, state, now)
 
         self.recorder.sample(
             state,
@@ -381,6 +381,23 @@ class Node:
                 if "on" in args:
                     on = bool(args.get("on"))
                 ok, result = self.commander.set_careful(on)
+            elif name == "run_profile":
+                # Which of the two attempts this is. `survey` for the slow first
+                # pass that builds the map, `fast` for the second one that is
+                # driven off it (`profiles.py`). Like careful mode it takes
+                # effect on the next tick and does not interrupt a run, so the
+                # speed can be dropped mid-pass if the course turns out tighter
+                # than it looked from the dock.
+                ok, result = self.commander.set_profile(
+                    args.get("profile") or args.get("name")
+                )
+            elif name == "alternation":
+                # The cardinal alternation prior, off by default. See
+                # `behaviours/alternation.py` - it is an inference, and switching
+                # it on is a decision somebody makes knowing that.
+                ok, result = self.commander.set_alternation(
+                    bool(args.get("on", True))
+                )
             elif name == "autopilot_pause":
                 ok, result = self.pilot.pause()
             elif name == "autopilot_resume":

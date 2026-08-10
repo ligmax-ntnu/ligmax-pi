@@ -26,6 +26,7 @@ dynamics has to be checked on the water regardless.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -140,10 +141,31 @@ def _ray_disc(origin, direction, centre, radius):
 
 
 class FakeBoat:
-    """First-order kinematics. Enough to catch a sign error, not a hull model."""
+    """First-order kinematics. Enough to catch a sign error, not a hull model.
 
-    MAX_YAW = 0.7  # rad/s
-    ACCEL = 1.5    # m/s^2
+    **A command is held until the next one replaces it**, and that is not a
+    detail - it is what ArduPilot does with a GUIDED target, and it is the whole
+    reason `TARGET_REFRESH_S` exists. An earlier version of this class turned and
+    accelerated only on the ticks a message happened to arrive on, which quietly
+    made the boat's turn rate a property of `Commander`'s re-send logic rather
+    than of the hull: a run whose aim point sat still for a few ticks turned at
+    8 deg/s instead of 40, and the simulated boat swung wide of corners for a
+    reason no real boat would. Anything measured about how the boat handles a
+    corner is meaningless without this.
+    """
+
+    MAX_YAW = 0.7      # rad/s, at low speed
+    ACCEL = 1.5        # m/s^2
+    # The reason a fast boat cannot turn like a slow one. A turn is lateral
+    # acceleration - `v * yaw_rate` - and a hull can only supply so much of it
+    # before it slides sideways instead of turning. Modelling the yaw rate as a
+    # constant regardless of speed, as this class used to, gives a boat whose turn
+    # radius shrinks in proportion to its speed: it rounds a 123 degree corner at
+    # 5 knots as tidily as at 1, no speed limit is ever needed, and the whole
+    # question this suite exists to answer is answered wrongly. 1.0 m/s^2 is a
+    # guess of the right order for a light trimaran and, like `TURN_YAW_RATE`, is
+    # a number to replace with a measurement.
+    MAX_LATERAL_ACCEL = 1.0  # m/s^2
 
     def __init__(self, xy=(0.0, 0.0), heading=0.0):
         self.xy = list(xy)
@@ -153,6 +175,9 @@ class FakeBoat:
         self.mode = "GUIDED"
         self.armed = True
         self.sent = []
+        # The standing order: `("position", target_xy, speed)` or
+        # `("velocity", yaw_rate, vx)`. None until the first one arrives.
+        self.holding = None
 
     def apply(self, message, dt):
         """Consume one control message from the fake node bus."""
@@ -165,20 +190,41 @@ class FakeBoat:
             self.armed = bool(message.get("arm"))
             return
         if command == "position_target":
-            target = geo.to_world(message["lat"], message["lon"], ORIGIN)
-            wanted = geo.bearing_to(self.xy, target)
-            self._turn(wanted, dt)
-            self._accelerate(message.get("speed", 0.5), dt)
+            self.holding = (
+                "position",
+                geo.to_world(message["lat"], message["lon"], ORIGIN),
+                float(message.get("speed") or 0.5),
+            )
             return
         if command == "velocity_target":
-            yaw = float(message.get("yaw_rate") or 0.0)
-            self.heading = geo.wrap360(self.heading + math.degrees(yaw) * dt)
-            self._accelerate(float(message.get("vx") or 0.0), dt, signed=True)
+            self.holding = (
+                "velocity",
+                float(message.get("yaw_rate") or 0.0),
+                float(message.get("vx") or 0.0),
+            )
             self.lateral = float(message.get("vy") or 0.0)
+
+    def _obey(self, dt):
+        """Keep doing whatever was last commanded, for one tick."""
+        if self.holding is None:
+            return
+        kind = self.holding[0]
+        if kind == "position":
+            _kind, target, speed = self.holding
+            if target is not None and geo.distance(self.xy, target) > 0.05:
+                self._turn(geo.bearing_to(self.xy, target), dt)
+            self._accelerate(speed, dt)
+            return
+        _kind, yaw, forward = self.holding
+        self.heading = geo.wrap360(self.heading + math.degrees(yaw) * dt)
+        self._accelerate(forward, dt, signed=True)
 
     def _turn(self, wanted, dt):
         error = geo.angle_diff(wanted, self.heading)
-        rate = math.degrees(self.MAX_YAW) * dt
+        yaw = min(
+            self.MAX_YAW, self.MAX_LATERAL_ACCEL / max(0.1, abs(self.speed))
+        )
+        rate = math.degrees(yaw) * dt
         self.heading = geo.wrap360(self.heading + max(-rate, min(rate, error)))
 
     def _accelerate(self, target, dt, signed=False):
@@ -188,6 +234,7 @@ class FakeBoat:
             self.speed = max(0.0, self.speed)
 
     def step(self, dt):
+        self._obey(dt)
         forward = geo.boat_to_world(0.0, self.speed, self.heading)
         side = geo.boat_to_world(self.lateral, 0.0, self.heading)
         self.xy[0] += (forward[0] + side[0]) * dt
@@ -237,21 +284,30 @@ class FakeLink:
 
 
 def run(plan, obstacles, start=(0.0, 0.0), heading=0.0, seconds=180.0, dt=0.1,
-        moving=(), watch=None):
+        moving=(), watch=None, profile=None, alternation=False, world=None):
     """Fly a plan. Returns `(pilot, boat, track, ticks)`.
 
     `watch(pilot, world, boat, now)` is called every tick, for the assertions
     that are about what happened *during* the run rather than where it ended -
     a track that was committed and then aged out, a docking phase that was
     entered and left, are invisible from the final state.
+
+    `profile` selects a run profile the way the operator's command does, and
+    `world` lets a run start from a world model an earlier run left behind -
+    which is the whole two-attempt story (`profiles.py`) and cannot be tested
+    without flying one run into the next.
     """
     boat = FakeBoat(start, heading)
     link = FakeLink(boat)
     commander = commander_module.Commander(link, config)
+    if profile is not None:
+        ok, why = commander.set_profile(profile)
+        assert ok, why
+    commander.run.alternation = bool(alternation)
     pilot = Pilot(config, commander)
     pilot.plan = plan
     pilot.start()
-    world = WorldModel(config)
+    world = WorldModel(config) if world is None else world
 
     track = []
     now = 1000.0
@@ -272,7 +328,7 @@ def run(plan, obstacles, start=(0.0, 0.0), heading=0.0, seconds=180.0, dt=0.1,
         world.observe(clusters, boat.xy, boat.heading, now, task)
 
         intent = pilot.tick(state, world, clusters, now)
-        commander.send(intent, state)
+        commander.send(intent, state, now)
         for message in link.messages:
             boat.apply(message, dt)
         link.messages.clear()
@@ -704,7 +760,7 @@ def test_cardinal():
             if entry.kind == ObstacleType.EAST:
                 ever_committed = True
         intent = pilot.tick(state, world, clusters, now)
-        commander.send(intent, state)
+        commander.send(intent, state, now)
         for message in link.messages:
             boat.apply(message, dt)
         link.messages.clear()
@@ -1182,9 +1238,27 @@ def test_memory():
         moved = geo.distance(back[0].pos, world.all()[0].pos)
         check(moved < 0.5, f"...within {moved:.2f} m of where it was left")
         check(back[0].established, "...still established")
+        # Less certain than a mark under the lidar right now, and far more
+        # certain than one that merely drifted out of view - the two are
+        # different kinds of not-knowing and `Track.refresh` keeps them apart.
+        # This one was measured deliberately and has been on its mooring since.
         check(
-            back[0].sigma_m >= config.TRACK_SIGMA_MAX_M - 1e-6,
-            "...and honest about not having been seen since",
+            abs(back[0].sigma_m - config.SURVEY_SIGMA_M) < 1e-6,
+            f"...carrying the survey's own uncertainty, {back[0].sigma_m:.2f} m, "
+            f"not the {config.TRACK_SIGMA_MAX_M:.0f} m of a mark nobody can "
+            f"account for",
+        )
+        check(
+            config.TRACK_SIGMA_M < back[0].sigma_m < config.TRACK_SIGMA_MAX_M,
+            "...which sits between a fresh measurement and a lost one",
+        )
+        # The number that made this worth changing: clearance is the static
+        # figure plus this, and the Monday course's legs are 10-17 m long.
+        room = config.BUOY_CLEARANCE_M + back[0].sigma_m
+        check(
+            room * 2.0 < 10.0,
+            f"a remembered mark claims {room:.1f} m, so two of them still leave "
+            f"a gap on a 10 m leg ({room * 2.0:.1f} m of the 10)",
         )
 
     # A survey written against one origin must land in the right place when the
@@ -1398,6 +1472,577 @@ def test_speed_limit():
     )
 
 
+# ------------------------------------------------ the two attempts, and the course
+
+def real_course():
+    """Monday's Task 1 course out of `plans/task1.json`, in local metres.
+
+    Translated so GPS point 1 sits on the test origin, which is a 2 km shift and
+    changes no geometry that matters at this latitude - the point is to fly the
+    *actual* handout rather than a tidy invention, because the thing that makes
+    this course hard is not something anybody would have thought to invent: legs
+    of 4 to 17 m with three corners over 100 degrees.
+
+    Returns `(plan_payload, points)`, points being `[(east, north), ...]`.
+    """
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(here, "plans", "task1.json"), encoding="utf-8") as handle:
+        course = json.load(handle)
+
+    first = course["waypoints"][0]
+    metres_per_lat = 111320.0
+    metres_per_lon = 111320.0 * math.cos(math.radians(first["lat"]))
+    points, waypoints = [], []
+    for entry in course["waypoints"]:
+        east = (entry["lon"] - first["lon"]) * metres_per_lon
+        north = (entry["lat"] - first["lat"]) * metres_per_lat
+        points.append((east, north))
+        moved = dict(entry)
+        moved.pop("lat", None)
+        moved.pop("lon", None)
+        moved["x"] = east
+        moved["y"] = north
+        waypoints.append(moved)
+    return (
+        dict(course, waypoints=waypoints),
+        points,
+    )
+
+
+def seconds_to_finish(track, points, radius, dt=0.1):
+    """How long the track took to reach the last point. `None` if it never did.
+
+    Not the tick count: the last waypoint on Task 1 is `hold` with `hold_s` 0 -
+    "stop at GPS point 4 and stay stationary" (NJORD §9.1) - so the plan is never
+    *finished* and a run always uses its whole time budget. The figure the task
+    time multiplier is scored on is when the boat got there.
+    """
+    for index, position in enumerate(track):
+        if math.dist(position, points[-1]) <= radius:
+            return index * dt
+    return None
+
+
+def worst_miss(track, points):
+    """`(index, metres)` of the waypoint the track came closest to missing.
+
+    The measure the jury actually applies: the boat is scored on *passing* the
+    waypoints, and `has_arrived`'s passing-plane test will happily retire one the
+    boat swept 5 m wide of. So this asks the track, not the plan.
+    """
+    worst = (None, 0.0)
+    for index, point in enumerate(points):
+        closest = min_distance(track, point)
+        if closest > worst[1]:
+            worst = (index, closest)
+    return worst
+
+
+def test_profiles():
+    section("run profiles - the slow attempt and the fast one")
+
+    from nodes.self_driving import profiles
+
+    limit = config.SPEED_LIMIT_MS
+    for name, profile in sorted(profiles.PROFILES.items()):
+        check(
+            profile.ceiling_ms <= limit + 1e-9,
+            f"the {name} profile's ceiling is inside the 5 kn vessel limit "
+            f"({profile.ceiling_kn:.2f} kn)",
+        )
+        check(
+            profile.cruise_ms <= profile.ceiling_ms + 1e-9
+            and profile.caution_ms <= profile.ceiling_ms + 1e-9,
+            f"...and the {name} profile never plans above its own ceiling",
+        )
+
+    fast = profiles.PROFILES[profiles.FAST]
+    check(
+        abs(fast.ceiling_ms - limit) < 1e-9,
+        f"the fast profile goes all the way to the limit and no further "
+        f"({fast.ceiling_kn:.2f} kn)",
+    )
+    survey = profiles.PROFILES[profiles.SURVEY]
+    check(
+        abs(survey.ceiling_ms - config.CAREFUL_SPEED_MS) < 1e-9,
+        f"the survey profile is careful mode's 1 kn ({survey.ceiling_ms:.2f} m/s)",
+    )
+
+    # The property Task 2 depends on, stated as a test rather than as a comment.
+    # A gate is a red/green pair 5 m apart (NJORD 9.2), so the boat has 2.5 m to
+    # play with either side of the centreline; a speed term on the normal profile
+    # would eat it and the boat would refuse a gate it is meant to drive through.
+    for name in (profiles.NORMAL, profiles.SURVEY):
+        check(
+            profiles.PROFILES[name].clearance_per_ms == 0.0,
+            f"the {name} profile adds no speed term to clearance, so a 5 m gate "
+            f"stays passable",
+        )
+    gate_half = 5.0 / 2.0
+    normal_room = config.BUOY_CLEARANCE_M + config.TRACK_SIGMA_M
+    check(
+        normal_room < gate_half,
+        f"a freshly seen gate buoy claims {normal_room:.2f} m of the {gate_half:.1f} m "
+        f"half-gate",
+    )
+    check(fast.clearance_per_ms > 0.0, "the fast profile does add one")
+
+    # What that term is worth where it is switched on.
+    at_speed = min(
+        config.CLEARANCE_SPEED_MAX_M, fast.clearance_per_ms * fast.ceiling_ms
+    )
+    check(
+        at_speed > 1.5,
+        f"at full speed the fast profile buys {at_speed:.1f} m of extra water "
+        f"round every mark",
+    )
+
+    # Selection, and refusing to select nonsense.
+    mode = profiles.RunMode(config)
+    check(mode.profile.name == profiles.NORMAL, "a fresh node is in the normal profile")
+    check(not mode.alternation, "...with the alternation prior off")
+    ok, message = mode.set_profile("fast")
+    check(ok and mode.profile.name == profiles.FAST, f"fast selects: {message}")
+    ok, message = mode.set_profile("ludicrous")
+    check(
+        not ok and "fast" in message and mode.profile.name == profiles.FAST,
+        f"an unknown profile is refused and changes nothing: {message}",
+    )
+    ok, _message = mode.set_profile("survey")
+    check(ok and mode.careful, "the survey profile IS careful mode, not a rival to it")
+
+    # ...and that the ceiling is real on the wire, not just in the object.
+    class _Link:
+        def __init__(self):
+            self.sent = []
+
+        def control(self, **fields):
+            self.sent.append(fields)
+
+    def wire_speed(profile_name):
+        link = _Link()
+        commander = commander_module.Commander(link, config)
+        commander.set_profile(profile_name)
+        state = BoatState(
+            {"origin": ORIGIN, "boat": {"position": [0.0, 0.0], "heading_deg": 0.0}}
+        )
+        commander.send(commander_module.goto((100.0, 0.0), 99.0, "attack"), state)
+        return max(
+            float(m.get("speed") or 0.0)
+            for m in link.sent
+            if m.get("cmd") == "position_target"
+        )
+
+    check(
+        abs(wire_speed("fast") - limit) < 1e-6,
+        f"in the fast profile a 99 m/s request goes out at {wire_speed('fast'):.3f} m/s "
+        f"- the vessel limit, not more",
+    )
+    check(
+        wire_speed("normal") <= config.MAX_SPEED_MS + 1e-6,
+        "in the normal profile it is still held to the tuned 1.6 m/s",
+    )
+    check(
+        wire_speed("survey") <= config.CAREFUL_SPEED_MS + 1e-6,
+        "and in the survey profile to 1 kn",
+    )
+
+
+def test_corner_speed():
+    section("how fast a corner allows")
+
+    from nodes.self_driving.behaviours.base import Context, corner_speed_limit
+    from nodes.self_driving import profiles
+
+    payload, points = real_course()
+
+    def limit_at(index, distance_out, profile=profiles.FAST):
+        """The speed allowed `distance_out` metres before waypoint `index`."""
+        plan = Plan.parse(payload, ORIGIN)
+        plan.index = index
+        start, end = points[index - 1], points[index]
+        bearing = geo.bearing_to(start, end)
+        boat = geo.offset_point(end, bearing + 180.0, distance_out)
+        state = BoatState(
+            {
+                "origin": ORIGIN,
+                "boat": {"position": list(boat), "heading_deg": bearing},
+            }
+        )
+        run_mode = profiles.RunMode(config)
+        run_mode.set_profile(profile)
+        ctx = Context(
+            state=state, world=None, plan=plan, config=config, now=0.0,
+            waypoint=plan.current, leg=(start, end), task="buoys",
+            ceiling=run_mode.profile.ceiling_ms, run=run_mode,
+        )
+        return corner_speed_limit(ctx, ctx.cruise_speed)
+
+    # Waypoint 9 is `3.2`, where the course turns 123 degrees - the tightest
+    # corner on it. Probed from just short of the mark, which is where the
+    # limiter has to have finished its work.
+    tight, note = limit_at(9, 0.3)
+    check(
+        tight < config.FAST_CRUISE_SPEED_MS * 0.8,
+        f"the 123 deg corner at 3.2 holds the fast profile down to "
+        f"{tight:.2f} m/s ({tight / config.KNOT_MS:.1f} kn): {note}",
+    )
+    check("deg turn" in note, f"...and says why, in words: {note}")
+
+    # The same corner from far enough back that the boat can still brake into it.
+    far, _note = limit_at(9, 11.0)
+    check(
+        far > tight,
+        f"from 11 m out it may still run at {far:.2f} m/s and brake late, rather "
+        f"than crawling the whole leg",
+    )
+
+    # A gentle corner does not limit at all. Waypoint 3 (`1.2` -> `1.3`) turns 13
+    # degrees, which is a kink.
+    gentle, note = limit_at(3, 2.0)
+    check(
+        abs(gentle - config.FAST_CRUISE_SPEED_MS) < 1e-9 and note == "",
+        f"a 13 deg kink is not a corner and is not slowed ({gentle:.2f} m/s)",
+    )
+
+    # The survey profile is already below every corner's limit, so the limiter
+    # never fires - the slow attempt is not made slower still.
+    slow, note = limit_at(10, 2.0, profile=profiles.SURVEY)
+    check(
+        abs(slow - config.CAREFUL_SPEED_MS) < 1e-9,
+        f"at 1 kn the corner limiter has nothing to do ({slow:.2f} m/s)",
+    )
+
+    # A plan that doubles back on itself is a 180 degree turn, and `sec(90)` is
+    # where a naive version divides by zero.
+    reversing = Plan.parse(
+        {
+            "waypoints": [
+                {"name": "out", "x": 0.0, "y": 20.0, "role": "transit"},
+                {"name": "back", "x": 0.0, "y": 0.0, "role": "transit"},
+            ]
+        },
+        ORIGIN,
+    )
+    state = BoatState(
+        {"origin": ORIGIN, "boat": {"position": [0.0, 20.0], "heading_deg": 0.0}}
+    )
+    ctx = Context(
+        state=state, world=None, plan=reversing, config=config, now=0.0,
+        waypoint=reversing.current, leg=((0.0, 0.0), (0.0, 20.0)), task="transit",
+    )
+    about_turn, note = corner_speed_limit(ctx, 2.5)
+    check(
+        about_turn <= config.CORNER_MIN_SPEED_MS + 0.05,
+        f"a 180 deg about-turn limits to the floor rather than dividing by zero "
+        f"({about_turn:.2f} m/s): {note}",
+    )
+
+
+def test_fast_course():
+    """Monday's actual course, flown fast. The question the whole plan rests on.
+
+    The course is a slalom - three corners over 100 degrees on legs of 10-17 m -
+    and the failure this is written to catch is the specific one that a fast
+    attempt invites: the boat holds its speed into a corner, turns as hard as it
+    can, and sweeps past the waypoint several metres wide. It finishes the plan,
+    it looks confident, and it has missed the marks it is scored on passing.
+    """
+    section("the real Task 1 course, flown fast")
+
+    from nodes.self_driving.behaviours import transit as transit_module
+    from nodes.self_driving import profiles
+
+    payload, points = real_course()
+    radius = config.WAYPOINT_RADIUS_M
+
+    _pilot, _boat, slow_track, _ticks = run(
+        Plan.parse(payload, ORIGIN), [], seconds=600.0, profile=profiles.SURVEY
+    )
+    index, missed = worst_miss(slow_track, points)
+    check(
+        missed <= radius,
+        f"at 1 kn every waypoint is passed inside the {radius:.0f} m radius "
+        f"(worst was #{index} at {missed:.1f} m)",
+    )
+    slow_s = seconds_to_finish(slow_track, points, config.ARRIVAL_RADIUS_M)
+    check(slow_s is not None, f"...and it reaches GPS 4, in {slow_s} s")
+
+    _pilot, _boat, fast_track, _ticks = run(
+        Plan.parse(payload, ORIGIN), [], seconds=600.0, profile=profiles.FAST
+    )
+    index, missed = worst_miss(fast_track, points)
+    check(
+        missed <= radius,
+        f"and in the fast profile too (worst was #{index} at {missed:.1f} m)",
+    )
+    fast_s = seconds_to_finish(fast_track, points, config.ARRIVAL_RADIUS_M)
+    check(
+        fast_s is not None and slow_s is not None and fast_s < slow_s,
+        f"the fast attempt is actually faster: {fast_s:.0f} s against "
+        f"{slow_s:.0f} s to GPS 4, a "
+        f"{1.0 - (fast_s / slow_s if slow_s else 1.0):.0%} saving",
+    )
+
+    # What the pacing is actually worth, and it is not what it looks like.
+    #
+    # With the hull as capable as `TURN_LATERAL_ACCEL_MS2` assumes, pure pursuit's
+    # own lookahead clamp already pulls the aim in on the run-up to a mark and the
+    # pacing barely changes the trace - so a straight paced/unpaced comparison at
+    # the nominal hull proves nothing either way. The pacing is *margin*, and
+    # margin only shows up when something is worse than assumed.
+    #
+    # So the control degrades the simulated hull to below what the config believes,
+    # which is the failure actually worth insuring against: nobody has measured
+    # this boat's lateral acceleration yet, the number in `config.py` is a guess,
+    # and a guess that turns out 25 % optimistic is entirely likely.
+    #
+    # None of this is evidence about the real boat. It is evidence that the pacing
+    # buys margin against the parameter being wrong, which is the only claim the
+    # simulation can support.
+    from nodes.self_driving.behaviours import base as base_module
+    from nodes.self_driving.behaviours import buoys as buoys_module
+
+    def fly_with_hull(lateral_accel, paced):
+        was = FakeBoat.MAX_LATERAL_ACCEL
+        FakeBoat.MAX_LATERAL_ACCEL = lateral_accel
+        saved = (
+            transit_module.corner_speed_limit,
+            buoys_module.corner_speed_limit,
+            base_module.heading_speed_limit,
+        )
+        if not paced:
+            unpaced = lambda ctx, speed, *rest: (speed, "")  # noqa: E731
+            transit_module.corner_speed_limit = unpaced
+            buoys_module.corner_speed_limit = unpaced
+            base_module.heading_speed_limit = unpaced
+        eased = [0]
+
+        def count(pilot, _world, _boat, _now):
+            if "deg turn at" in pilot.reason or "off the aim" in pilot.reason:
+                eased[0] += 1
+
+        try:
+            _p, _b, flown, _t = run(
+                Plan.parse(payload, ORIGIN), [], seconds=600.0,
+                profile=profiles.FAST, watch=count,
+            )
+        finally:
+            (
+                transit_module.corner_speed_limit,
+                buoys_module.corner_speed_limit,
+                base_module.heading_speed_limit,
+            ) = saved
+            FakeBoat.MAX_LATERAL_ACCEL = was
+        return flown, eased[0]
+
+    _flown, eased = fly_with_hull(FakeBoat.MAX_LATERAL_ACCEL, True)
+    check(
+        eased > 0,
+        f"the pacing is live on this course, not dead code - it eased the boat on "
+        f"{eased} ticks of the fast run",
+    )
+
+    weak = config.TURN_LATERAL_ACCEL_MS2 * 0.75
+    limp_paced, _eased = fly_with_hull(weak, True)
+    limp_loose, _eased = fly_with_hull(weak, False)
+    paced_s = seconds_to_finish(limp_paced, points, config.ARRIVAL_RADIUS_M)
+    loose_s = seconds_to_finish(limp_loose, points, config.ARRIVAL_RADIUS_M)
+    check(
+        paced_s is not None,
+        f"a hull 25 % less capable than assumed ({weak:.2f} m/s^2) still reaches "
+        f"GPS 4 when the boat paces itself, in {paced_s} s",
+    )
+    check(
+        loose_s is None or loose_s > (paced_s or 0.0),
+        f"...and does not, unpaced (reached GPS 4 at {loose_s} s)",
+    )
+    _index, limp_missed = worst_miss(limp_paced, points)
+    _index, loose_missed = worst_miss(limp_loose, points)
+    check(
+        limp_missed < loose_missed,
+        f"and it holds a tighter line doing it: {limp_missed:.1f} m worst miss "
+        f"against {loose_missed:.1f} m",
+    )
+
+
+def test_fast_clearance():
+    section("clearance at speed")
+
+    from nodes.self_driving import profiles
+
+    # One buoy sitting beside a straight 40 m leg. The only thing that changes
+    # between the two runs is the profile.
+    def pass_distance(profile):
+        mark = Obstacle((2.2, 20.0), ObstacleType.RED, 0.2)
+        plan = make_plan([(0.0, 40.0)], role="buoys")
+        _pilot, _boat, track, _ticks = run(
+            plan, [mark], seconds=300.0, profile=profile
+        )
+        return min_distance(track, mark.xy)
+
+    careful = pass_distance(profiles.SURVEY)
+    quick = pass_distance(profiles.FAST)
+    check(
+        careful > config.BUOY_CLEARANCE_M * 0.75,
+        f"at survey speed the mark is cleared by {careful:.1f} m",
+    )
+    check(
+        quick > careful + 0.5,
+        f"at speed the same mark is given {quick:.1f} m instead of {careful:.1f} m "
+        f"- clearance is a time budget, and speed spends it",
+    )
+
+
+def test_alternation():
+    """The optional prior: what it says, when it refuses, and what it never does."""
+    section("the cardinal alternation prior (optional, off by default)")
+
+    from nodes.self_driving.behaviours import alternation
+    from nodes.self_driving.behaviours.base import Context
+    from nodes.self_driving import profiles
+
+    class _Mark:
+        def __init__(self, mark_id, kind, pos):
+            self.id = mark_id
+            self.kind = kind
+            self.pos = pos
+
+    class _World:
+        def __init__(self, marks):
+            self._marks = marks
+
+        def marks(self):
+            return list(self._marks)
+
+    def context(marks, leg=((0.0, 0.0), (0.0, 60.0)), on=True):
+        state = BoatState(
+            {"origin": ORIGIN, "boat": {"position": [0.0, 0.0], "heading_deg": 0.0}}
+        )
+        plan = make_plan([(leg[1][0], leg[1][1])], role="buoys")
+        mode = profiles.RunMode(config)
+        mode.alternation = on
+        return Context(
+            state=state, world=_World(marks), plan=plan, config=config, now=0.0,
+            waypoint=plan.current, leg=leg, task="buoys", run=mode,
+        )
+
+    # A leg running due north. A red mark 10 m up it: sailing with the buoyage,
+    # red is kept to port, so the mark sits to port of the line and the boat goes
+    # up its starboard side. The next mark in the run should therefore be the one
+    # that pushes the other way - which on a northbound leg is a WEST cardinal
+    # (safe water to its west puts the mark to starboard of us).
+    red = _Mark(1, ObstacleType.RED, (0.0, 10.0))
+    unknown = _Mark(2, ObstacleType.CARDINAL, (0.0, 25.0))
+    ctx = context([red, unknown])
+    guess, why = alternation.resolve(ctx, unknown, outbound=True)
+    check(
+        guess == ObstacleType.WEST,
+        f"a red mark before it implies the next cardinal is WEST, got "
+        f"{guess.name if guess else None}: {why}",
+    )
+    check("#1" in why, f"...and it names the mark it reasoned from: {why}")
+
+    # Switch the lateral sense and the answer must switch with it. This is the
+    # sign error the whole file is exposed to, so it gets its own check.
+    flipped, _why = alternation.resolve(ctx, unknown, outbound=False)
+    check(
+        flipped == ObstacleType.EAST,
+        f"sailing against the buoyage the same pair implies EAST, got "
+        f"{flipped.name if flipped else None}",
+    )
+
+    # Off by default is not a comment, it is behaviour.
+    quiet = context([red, unknown], on=False)
+    silent, _why = alternation.resolve(quiet, unknown, outbound=True)
+    check(silent is None, "with the prior switched off it says nothing at all")
+
+    # Nothing to reason from.
+    alone = context([unknown])
+    nothing, why = alternation.resolve(alone, unknown, outbound=True)
+    check(
+        nothing is None and "says nothing" in why,
+        f"with no settled mark before it, it declines and explains: {why}",
+    )
+
+    # A mark too far back is not "the previous mark in the run".
+    distant = _Mark(3, ObstacleType.RED, (0.0, -60.0))
+    far = context([distant, unknown])
+    none_yet, _why = alternation.resolve(far, unknown, outbound=True)
+    check(
+        none_yet is None,
+        f"a mark {config.ALTERNATION_MAX_GAP_M:.0f} m back is a different part of "
+        f"the course and is not reasoned from",
+    )
+
+    # The geometric refusal: on a leg running north, north and south cardinals
+    # say nothing about which way to go round, and the prior must not invent an
+    # answer. Rig it so the only candidates would be N/S by asking directly.
+    kind, margin = alternation.best_cardinal(+1.0, 0.0, config)
+    check(
+        kind == ObstacleType.WEST and margin > 0.99,
+        f"on a northbound leg 'keep the mark to starboard' means WEST, squarely "
+        f"({margin:.2f})",
+    )
+    side, margin = alternation.cardinal_side(
+        ObstacleType.NORTH, 0.0, config.ALTERNATION_MIN_SIN
+    )
+    check(
+        side is None and margin < 1e-9,
+        "...and a NORTH cardinal on a northbound leg is refused, not guessed",
+    )
+
+    # It never overrides the camera. A committed EAST where the pattern wanted
+    # WEST is obeyed, and the disagreement is reported instead.
+    committed = _Mark(2, ObstacleType.EAST, (0.0, 25.0))
+    ctx = context([red, committed])
+    clash = alternation.disagreement(ctx, committed, outbound=True)
+    check(
+        "obeying the camera" in clash and "west" in clash,
+        f"a committed vote that contradicts the pattern is reported, not "
+        f"overruled: {clash}",
+    )
+    agreed = _Mark(2, ObstacleType.WEST, (0.0, 25.0))
+    check(
+        alternation.disagreement(context([red, agreed]), agreed, outbound=True) == "",
+        "...and agreement is not worth a sentence",
+    )
+
+    # End to end: an uncommitted cardinal beside a red mark, flown. With the
+    # prior off the boat holds the planned line; with it on it goes round.
+    def fly(on):
+        marks = [
+            Obstacle((0.0, 12.0), ObstacleType.RED, 0.2),
+            Obstacle((0.0, 26.0), ObstacleType.CARDINAL, 0.2),
+        ]
+        plan = Plan.parse(
+            {
+                "channel_bearing": 0,
+                "waypoints": [{"name": "n", "x": 0.0, "y": 50.0, "role": "buoys"}],
+            },
+            ORIGIN,
+        )
+        _pilot, _boat, track, _ticks = run(
+            plan, marks, seconds=300.0, alternation=on
+        )
+        return track, marks[1].xy
+
+    track_on, cardinal_xy = fly(True)
+    track_off, _xy = fly(False)
+    closest_on = min(track_on, key=lambda p: math.dist(p, cardinal_xy))
+    closest_off = min(track_off, key=lambda p: math.dist(p, cardinal_xy))
+    check(
+        closest_on[0] < closest_off[0],
+        f"with the prior on the boat commits to the west side of the unresolved "
+        f"cardinal (x={closest_on[0]:.1f}) rather than holding the line "
+        f"(x={closest_off[0]:.1f})",
+    )
+    check(
+        min_distance(track_on, cardinal_xy) > 1.0,
+        "and it does not touch it either way",
+    )
+
+
 def _fake_cluster(centre, colour, width=0.4):
     """One `Cluster` of the given colour at the given boat-frame point."""
     from nodes.self_driving.perception.cluster import Cluster
@@ -1441,6 +2086,11 @@ def main():
         test_recorder,
         test_memory,
         test_speed_limit,
+        test_profiles,
+        test_corner_speed,
+        test_fast_course,
+        test_fast_clearance,
+        test_alternation,
         test_real_jetson_sample,
     ):
         try:

@@ -60,7 +60,11 @@ What it does:
     `set_ride_height` walks the amas up or down as an RC override on channel 14
     (`pixhalwk.py`), refreshed here every loop because the autopilot expires
     one that goes quiet, and `release_ride_height` hands that channel back to
-    the receiver - a separate command because it is not a stop.
+    the receiver - a separate command because it is not a stop;
+    `safety_on`/`safety_off` press the Pixhawk's own safety switch and
+    `compass_cal` runs ArduPilot's large-vehicle mag cal from one known
+    heading (`preflight.py`), both acked from the autopilot's COMMAND_ACK
+    rather than from the send, because nothing in telemetry reports either.
     Every command is acked, so the dashboard's
     command list shows what actually happened on the vessel - though
     `set_mode`/`arm`/`disarm` can only ack that the message was *sent*, not
@@ -97,6 +101,7 @@ from .lights import Lights
 from .mission import MissionUploader, parse_waypoints
 from .navigation import Navigation
 from .pixhalwk import RideHeight
+from .preflight import Preflight
 from .propulsion import PropulsionWatch
 from .rtk import ENABLED as RTK_ENABLED, RtkClient, inject as inject_rtcm
 from .scan import ScanPublisher
@@ -447,6 +452,7 @@ def handle_commands(
     lights=None,
     bridge=None,
     ride_height=None,
+    preflight=None,
 ):
     """Run the operator's queued commands and ack each one.
 
@@ -465,13 +471,15 @@ def handle_commands(
     here, because the autonomy node acks them itself and two answers to one
     command is worse than none.
 
-    Four commands are the exception to acking here, because each rides on an
+    Seven commands are the exception to acking here, because each rides on an
     exchange that can span several loop ticks: `update` starts a `git pull` on a
     worker thread and is acked later by `finish_update()`; `set_mission` and
     `clear_waypoints` start a MAVLink mission exchange and are acked later by
     `finish_mission()`; `set_param` waits for the autopilot to echo back the
-    value it stored and is acked by `finish_tuning()`. None of them may block the
-    loop that owes the autopilot its 1 Hz heartbeat.
+    value it stored and is acked by `finish_tuning()`; `safety_on`, `safety_off`
+    and `compass_cal` wait for the autopilot's COMMAND_ACK and are acked by
+    `finish_preflight()`. None of them may block the loop that owes the autopilot
+    its 1 Hz heartbeat.
     """
     for_autopilot = []
     for command in uploader.commands():
@@ -652,6 +660,59 @@ def handle_commands(
             else:
                 lights.set_fps(args.get("fps"))
                 ok, result = True, "fps updated"
+        elif name in ("safety_on", "safety_off"):
+            # The Pixhawk's own safety switch, pressed from the dashboard.
+            # ArduPilot forces the board's safety state directly for this
+            # command, so it does what walking up and holding the button does -
+            # and unlike the button it is not gated by BRD_SAFETYOPTION.
+            #
+            # Two commands rather than one with an argument, the same split
+            # `careful_on`/`careful_off` uses, and here the reason is the words:
+            # "safety on" INHIBITS the motor outputs and "safety off" makes them
+            # live, which is the opposite of what both phrases sound like. A
+            # single toggle carrying a boolean would put that inversion inside
+            # an argument nobody reads in the audit list.
+            #
+            # Not acked here: `preflight.py` waits for the autopilot's
+            # COMMAND_ACK, because a refused safety-off acked as "sent" would
+            # tell an operator the outputs are inhibited while they are live.
+            if preflight is None:
+                ok, result = False, "no preflight handler on this node"
+            else:
+                started, why = preflight.set_safety(
+                    master, command_id, safe=(name == "safety_on")
+                )
+                if started:
+                    log.warning("%s: %s", name, why)
+                    continue  # acked by finish_preflight() on the COMMAND_ACK
+                ok, result = False, why
+        elif name == "compass_cal":
+            # ArduPilot's large-vehicle mag cal: point the hull along a heading
+            # known from something other than the compass, send that heading,
+            # and the autopilot solves the offsets against the world magnetic
+            # model. The tumble calibration every quadcopter uses needs the
+            # vehicle rotated through all three axes, which is not available to
+            # a boat in the water - see `preflight.py`.
+            #
+            # Refused while armed. The offsets are rewritten under the EKF, and
+            # a heading taken while the hull is under way is a heading measured
+            # at one moment and applied to another.
+            if preflight is None:
+                ok, result = False, "no preflight handler on this node"
+            elif machine is not None and machine.armed:
+                ok, result = False, "refused: disarm before calibrating the compass"
+                log.warning("compass_cal %s", result)
+            else:
+                started, why = preflight.compass_cal(
+                    master,
+                    command_id,
+                    args.get("heading"),
+                    position=navigation.position if navigation is not None else None,
+                )
+                if started:
+                    log.warning("compass_cal: %s", why)
+                    continue  # acked by finish_preflight() on the COMMAND_ACK
+                ok, result = False, why
         elif name == "get_params":
             # Re-read the lot. Automatic on connect and once a minute anyway;
             # this is the button for after someone has been in Mission Planner.
@@ -747,6 +808,21 @@ def finish_tuning(uploader, tuning):
     dashboard can present this as saving rather than as sending.
     """
     while (outcome := tuning.take()) is not None:
+        command_id, ok, message = outcome
+        uploader.ack(command_id, "acked" if ok else "failed", message)
+
+
+def finish_preflight(uploader, preflight):
+    """Ack the safety switch and the compass swing, mirroring `finish_tuning()`.
+
+    "acked" here means the flight controller itself answered MAV_RESULT_ACCEPTED,
+    not that the message left the Pi - which is the whole reason these two do not
+    ack at the point of sending. A refusal comes back in ArduPilot's own terms
+    ("unsupported", "denied"), because on a dock the difference between firmware
+    that is too old and a board with no safety switch fitted is the difference
+    between two entirely different next moves.
+    """
+    while (outcome := preflight.take()) is not None:
         command_id, ok, message = outcome
         uploader.ack(command_id, "acked" if ok else "failed", message)
 
@@ -911,6 +987,12 @@ def main():
     # 14 at all and the receiver owns it, exactly as before this was wired up.
     ride_height = RideHeight()
 
+    # The Pixhawk's safety switch and the large-vehicle compass calibration -
+    # the two dockside actions that change something on the flight controller
+    # rather than on this Pi, and the only commands here acked from the
+    # autopilot's own COMMAND_ACK (`preflight.py`). Inert until asked.
+    preflight = Preflight()
+
     # RTK corrections, pulled from the caster on the ground station and injected
     # into the autopilot for forwarding to the GNSS. Its own thread and its own
     # socket; the loop only drains a deque. Off if LIGMAX_RTK_ENABLED=0, and a
@@ -1028,6 +1110,14 @@ def main():
                             # on this link, so this is the one message type that
                             # can arrive in bulk from something else entirely.
                             tuning.handle(message)
+                        elif kind == "COMMAND_ACK":
+                            # The safety switch and the compass swing are the
+                            # only two things this node waits for an answer to
+                            # (`preflight.py`). Every other command's ack -
+                            # arm, mode, and anything a second GCS on this link
+                            # sent - is ignored here, which is what it has
+                            # always been.
+                            preflight.handle(master, message)
                         elif not navigation.handle(message):
                             # Position, course and mission progress, then a mission
                             # upload/clear exchange in flight, then the servo rail.
@@ -1041,6 +1131,11 @@ def main():
                     # queued forever - cheap to check even when nothing is
                     # pending.
                     mission.check_timeout()
+
+                    # Same idea for a safety-switch or compass command the
+                    # autopilot never answered: the operator's row must not sit
+                    # at "sent" forever when the outcome is genuinely unknown.
+                    preflight.check_timeout()
 
                     # One parameter message per tick at most, paced inside: the
                     # background re-read, and whatever the operator has just
@@ -1081,6 +1176,11 @@ def main():
                     trim.link_down()
                     mission.link_down()
                     tuning.link_down()
+                    # A safety-switch state believed a moment ago says nothing
+                    # about a flight controller we can no longer see - it may
+                    # have rebooted, which puts the switch back where
+                    # BRD_SAFETY_DEFLT says. Back to "unknown".
+                    preflight.link_down()
                     machine.note_link_down()
                     # Not just lost telemetry: the Pixhawk shares the rail the
                     # E-stop cuts, so on this boat a dropped link is itself
@@ -1132,6 +1232,7 @@ def main():
                 lights,
                 bridge,
                 ride_height,
+                preflight,
             )
             if finish_update(uploader, updater):
                 # Leave the loop the ordinary way: the `finally` below flushes the
@@ -1140,6 +1241,7 @@ def main():
                 break
             finish_mission(uploader, mission)
             finish_tuning(uploader, tuning)
+            finish_preflight(uploader, preflight)
 
             # Who is in charge, evaluated every loop rather than every publish: the
             # lights should follow the boat's actual state at loop rate, not at the
@@ -1200,6 +1302,13 @@ def main():
                     # pressed E-stop from a kicked CAN cable.
                     "propulsion": propulsion.telemetry(),
                     "lights": lights.telemetry(),
+                    # Where the Pixhawk's safety switch was last put from here,
+                    # and when the compass was last swung. Neither is a
+                    # read-back - nothing in ArduPilot's telemetry reports
+                    # either - so `safety_switch_seen` says whether the word
+                    # beside it was observed or is just the default
+                    # (`preflight.py`).
+                    "preflight": preflight.telemetry(),
                 }
                 if rtk is not None:
                     # This link only: bytes in, bytes injected, correction age.

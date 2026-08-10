@@ -28,7 +28,13 @@ line is a leg with a buoy sitting on the line.
 
 from .. import geo
 from ..commander import stop
-from .base import Behaviour, has_arrived, steer_towards
+from .base import (
+    Behaviour,
+    corner_speed_limit,
+    has_arrived,
+    lookahead_for,
+    steer_towards,
+)
 
 
 class Transit(Behaviour):
@@ -48,18 +54,18 @@ class Transit(Behaviour):
             return stop(f"waypoint {ctx.waypoint.name} reached: {why}")
 
         aim = self._aim(ctx)
-        speed = self._speed(ctx)
+        speed, pacing = self._speed(ctx)
+        reason = f"running to {ctx.waypoint.name}, {ctx.distance_to_target:.0f} m"
+        if pacing:
+            reason = f"{reason}; {pacing}"
         self.note(
             to_run_m=round(ctx.distance_to_target or 0.0, 1),
             cross_track_m=round(self._cross_track(ctx), 2),
             aim=[round(aim[0], 1), round(aim[1], 1)],
+            speed_ms=round(speed, 2),
+            pacing=pacing or "clear ahead",
         )
-        return steer_towards(
-            ctx,
-            aim,
-            speed,
-            f"running to {ctx.waypoint.name}, {ctx.distance_to_target:.0f} m",
-        )
+        return steer_towards(ctx, aim, speed, reason)
 
     # ------------------------------------------------------------------ parts
 
@@ -68,29 +74,38 @@ class Transit(Behaviour):
         if ctx.leg is None:
             return ctx.target
         remaining = ctx.distance_to_target or 0.0
-        # Shrink the lookahead on the run-in so the boat converges on the mark
-        # rather than on a point beyond it.
-        lookahead = max(
-            ctx.config.LOOKAHEAD_MIN_M, min(ctx.config.LOOKAHEAD_M, remaining * 0.8)
+        return geo.lookahead_point(
+            ctx.boat, ctx.leg[0], ctx.leg[1], lookahead_for(ctx, remaining)
         )
-        return geo.lookahead_point(ctx.boat, ctx.leg[0], ctx.leg[1], lookahead)
 
     def _speed(self, ctx):
-        """Cruise, easing off for the last few metres so the arrival is clean.
+        """`(speed, note)`. Cruise, paced by the corner and by the arrival.
 
-        Not for elegance: a boat that arrives at a settle waypoint with way on
+        Three things pull it down and the smallest wins:
+
+        **The corner ahead** (`base.corner_speed_limit`). On a slalom this is
+        what makes a fast attempt possible at all - the straights get the knots
+        and the turns do not.
+
+        **The arrival.** A boat that reaches a settle waypoint with way on
         overshoots it, and NJORD §9.1 scores the boat being stationary at GPS
-        point 4.
+        point 4. Not elegance: points.
+
+        **The profile's own cruise**, which is where it starts.
         """
-        cruise = ctx.speed_limit(ctx.config.CRUISE_SPEED_MS)
+        cruise = ctx.cruise_speed
+        speed, pacing = corner_speed_limit(ctx, cruise)
         remaining = ctx.distance_to_target
         if remaining is None:
-            return cruise
+            return speed, pacing
         slow_from = max(ctx.acceptance_radius() * 2.0, 4.0)
         if remaining >= slow_from:
-            return cruise
+            return speed, pacing
         floor = ctx.config.DOCK_SPEED_MS if ctx.waypoint.settles else cruise * 0.5
-        return max(floor, cruise * (remaining / slow_from))
+        arriving = max(floor, cruise * (remaining / slow_from))
+        if arriving < speed:
+            return arriving, f"{remaining:.0f} m to run - easing off for the arrival"
+        return speed, pacing
 
     def _cross_track(self, ctx):
         """Metres off the ideal route - the figure NJORD §11.4 asks to be shown."""

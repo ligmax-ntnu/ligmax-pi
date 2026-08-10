@@ -56,7 +56,14 @@ from ..obsticales import (
     CARDINAL_SAFE_BEARING,
     ObstacleType,
 )
-from .base import Behaviour, has_arrived, steer_towards
+from . import alternation
+from .base import (
+    Behaviour,
+    corner_speed_limit,
+    dynamic_clearance,
+    has_arrived,
+    steer_towards,
+)
 from .transit import Transit
 
 # How far past a cardinal's safe side to aim. The mark is 40 cm across; this is
@@ -90,7 +97,7 @@ class Buoys(Transit):
             return stop(f"waypoint {ctx.waypoint.name} reached: {why}")
 
         aim = self._aim(ctx)
-        speed = ctx.speed_limit(ctx.config.CAUTION_SPEED_MS)
+        speed = ctx.caution_speed
         reason = f"running to {ctx.waypoint.name} under buoy rules"
 
         # A cardinal is a stronger constraint than a lateral mark, so it is
@@ -107,10 +114,20 @@ class Buoys(Transit):
                 reason = f"{reason}; {lateral_notes[0]}"
             self.note(lateral=lateral_notes)
 
+        # Last, and applied to whatever the marks left: a via-point round a
+        # cardinal is still approached into the same corner, and the corner is
+        # what decides whether the boat can hold the line it just chose.
+        speed, pacing = corner_speed_limit(ctx, speed)
+        if pacing:
+            reason = f"{reason}; {pacing}"
+
         self.note(
             to_run_m=round(ctx.distance_to_target or 0.0, 1),
             marks=len(ctx.world.marks()),
             cardinal=cardinal_note or "none in range",
+            speed_ms=round(speed, 2),
+            room_for_speed_m=round(dynamic_clearance(ctx), 2),
+            pacing=pacing or "clear ahead",
         )
         return steer_towards(ctx, aim, speed, reason)
 
@@ -135,6 +152,9 @@ class Buoys(Transit):
 
         notes = []
         shifted = aim
+        # The room the speed itself needs, once for the leg - see
+        # `base.dynamic_clearance`. Zero on every profile but `fast`.
+        for_speed = dynamic_clearance(ctx)
         for track in ctx.world.marks():
             if track.kind not in BUOY_TYPES:
                 continue
@@ -143,7 +163,7 @@ class Buoys(Transit):
             # passes what it believes is the legal side of a mark that is
             # actually several metres the other way - which scores as passing on
             # the wrong side, the exact failure this behaviour exists to avoid.
-            clearance = ctx.config.BUOY_CLEARANCE_M + track.sigma_m
+            clearance = ctx.config.BUOY_CLEARANCE_M + track.sigma_m + for_speed
             _t, along, cross = geo.project_onto_leg(track.pos, ctx.boat, shifted)
             if along < ENFORCE_AHEAD_M:
                 continue  # already passed it
@@ -189,7 +209,7 @@ class Buoys(Transit):
         """`(via_point or None, note, speed)` for the nearest cardinal ahead."""
         boat = ctx.boat
         if boat is None:
-            return None, "", ctx.config.CAUTION_SPEED_MS
+            return None, "", ctx.caution_speed
 
         nearest = None
         for track in ctx.world.marks():
@@ -210,22 +230,49 @@ class Buoys(Transit):
                 nearest = (distance, track)
 
         if nearest is None:
-            return None, "", ctx.config.CAUTION_SPEED_MS
+            return None, "", ctx.caution_speed
         distance, track = nearest
 
+        outbound = self._with_the_buoyage(ctx)
         safe_bearing = CARDINAL_SAFE_BEARING.get(track.kind)
+        side_from = "the camera"
+        speed = ctx.caution_speed
+
         if safe_bearing is None:
-            # Seen, but the camera has not committed. Do not guess - see the
-            # module docstring. Keep the planned line, give it more room (which
-            # `deconflict` does through the extra clearance) and slow down so
-            # there is still time to act if the vote lands late.
+            # Seen, but the camera has not committed. The default is still not to
+            # guess - see the module docstring; a coin flip is a 50 % chance of
+            # the exact failure the task is scoring.
+            #
+            # Unless the operator has switched the alternation prior on, in which
+            # case there is something better than a coin flip available: the side
+            # the mark before this one forced. It is still an inference, so it
+            # buys a route rather than a commitment - `alternation.resolve` never
+            # writes to the camera's poll, and the speed stays down.
+            guess, why = alternation.resolve(ctx, track, outbound)
             self.note(cardinal_unresolved=track.cardinal.describe())
-            return (
-                None,
-                f"cardinal #{track.id} at {distance:.0f} m - "
-                f"{track.cardinal.describe()}; holding the planned line",
-                ctx.config.DOCK_SPEED_MS * 2.0,
-            )
+            if guess is None:
+                if why:
+                    self.note(alternation=why)
+                # Keep the planned line, give it more room (which `deconflict`
+                # does through the extra clearance) and slow down so there is
+                # still time to act if the vote lands late.
+                return (
+                    None,
+                    f"cardinal #{track.id} at {distance:.0f} m - "
+                    f"{track.cardinal.describe()}; holding the planned line",
+                    ctx.config.DOCK_SPEED_MS * 2.0,
+                )
+            safe_bearing = CARDINAL_SAFE_BEARING[guess]
+            side_from = "the alternating pattern"
+            self.note(alternation=why)
+            # Still slower than a committed pass. The prior is good enough to
+            # pick a side and not good enough to hurry through it.
+            speed = min(speed, ctx.config.CAUTION_SPEED_MS)
+            track = _Assumed(track, guess, why)
+        else:
+            clash = alternation.disagreement(ctx, track, outbound)
+            if clash:
+                self.note(alternation=clash)
 
         # The via-point is pushed out by the mark's own uncertainty too. A
         # cardinal says which side of *it* is safe water, so being on the wrong
@@ -238,10 +285,33 @@ class Buoys(Transit):
         if geo.distance(boat, via) < 2.0:
             return None, (
                 f"{track.kind.name.lower()} cardinal #{track.id} cleared"
-            ), ctx.config.CAUTION_SPEED_MS
+            ), speed
         return (
             via,
             f"{track.kind.name.lower()} cardinal #{track.id} at {distance:.0f} m - "
-            f"passing on its {track.kind.name.lower()} side",
-            ctx.config.CAUTION_SPEED_MS,
+            f"passing on its {track.kind.name.lower()} side, per {side_from}",
+            speed,
         )
+
+
+class _Assumed:
+    """A track wearing a cardinal type the prior suggested, for this tick only.
+
+    The alternative would be writing the guess onto the real track, and that is
+    the one thing this feature must not do: `Track.kind` is what the survey file
+    and the operator's chart are built from, and a guess written there outlives
+    the leg it was guessed on, gets saved between attempts, and comes back as
+    fact. So the guess lives for the length of one `_cardinal` call and dies with
+    it, and the mark on disk stays an uncommitted cardinal until a camera says
+    otherwise.
+    """
+
+    __slots__ = ("_track", "kind", "assumed_why")
+
+    def __init__(self, track, kind, why):
+        self._track = track
+        self.kind = kind
+        self.assumed_why = why
+
+    def __getattr__(self, name):
+        return getattr(self._track, name)

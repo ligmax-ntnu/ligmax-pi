@@ -236,7 +236,23 @@ class Track:
         Called on every track on every tick, before anything reads `sigma_m`, so
         a behaviour never sees an uncertainty computed against a different tick's
         clock than the position it is paired with.
+
+        A mark straight off the survey file is a special case and it has to be,
+        because its `last_seen` is the *previous attempt's* wall clock. Run
+        through the growth ramp that is an hour or more of ageing, which pins it
+        at `TRACK_SIGMA_MAX_M` - and a 6 m uncertainty added to a 2 m clearance
+        means every remembered mark claims 8 m of water on a course whose legs
+        are 10 to 17 m long. The second attempt would swerve around its own map
+        and very likely fail to thread it, which is the exact opposite of what
+        surveying is for. It gets `SURVEY_SIGMA_M` instead: the honest error of a
+        mark that was measured properly and has been sitting on its mooring
+        since, rather than the error of a mark nobody can account for. The
+        instant the lidar sees it, `observe` clears `restored` and this falls
+        back to the ordinary ramp from a fresh measurement.
         """
+        if self.restored:
+            self.sigma_m = float(config.SURVEY_SIGMA_M)
+            return
         age = max(0.0, now - self.last_seen)
         self.sigma_m = min(
             config.TRACK_SIGMA_MAX_M,

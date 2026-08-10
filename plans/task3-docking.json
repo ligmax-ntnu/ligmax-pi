@@ -1,0 +1,29 @@
+{
+  "name": "task3-docking",
+  "channel_bearing": 0,
+  "waypoints": [
+    {
+      "name": "7",
+      "lat": 63.440975,
+      "lon": 10.4237833,
+      "role": "transit",
+      "notes": "GPS 7 - start, about 10 m off the dock"
+    },
+    {
+      "name": "8",
+      "lat": 63.4409333,
+      "lon": 10.4240611,
+      "role": "dock",
+      "hold_s": 10,
+      "notes": "GPS 8 - bow-in berth, hold 10 s, reverse out. ROLE UNCONFIRMED"
+    },
+    {
+      "name": "9",
+      "lat": 63.4408472,
+      "lon": 10.4240444,
+      "role": "hold",
+      "hold_s": 0,
+      "notes": "GPS 9 - the timer stops here"
+    }
+  ]
+}
