@@ -1,7 +1,7 @@
 """The pilot: runs the plan through the behaviours, and refuses to when it must.
 
     pilot = Pilot(config, commander)
-    intent = pilot.tick(state, world, clusters, now)
+    intent = pilot.tick(state, world, clusters, now, sweeps)
 
 Two jobs, and the order they are done in is the whole design:
 
@@ -94,8 +94,14 @@ class Pilot:
 
     # ------------------------------------------------------------------ tick
 
-    def tick(self, state, world, clusters, now):
-        """One decision. Returns the `Intent` to send. Never raises."""
+    def tick(self, state, world, clusters, now, sweeps=()):
+        """One decision. Returns the `Intent` to send. Never raises.
+
+        `sweeps` is this tick's raw lidar scans, boat frame, passed through to the
+        context for the behaviours that fit lines to them (parking). Defaulted, so
+        a replay tool or a test that has clusters but no sweeps behaves like a run
+        with no lidar rather than raising.
+        """
         allowed, why = self._may_drive(state, now)
         if not allowed:
             self.blocked_reason = why
@@ -138,6 +144,7 @@ class Pilot:
             leg=self.plan.leg(state.origin, state.position),
             task="transit",
             clusters=clusters,
+            sweeps=sweeps,
             ceiling=self.commander.ceiling,
             run=self.commander.run,
         )
@@ -232,7 +239,10 @@ class Pilot:
         distance = ctx.distance_to_target
         if distance is None or self.behaviour is None:
             return
-        if getattr(self.behaviour, "phase", None) in ("hold", "exit"):
+        # "turn" joins them for the parking roles: an alongside park rotates 90
+        # degrees on the spot inside the space, and standing still while doing it is
+        # the behaviour working rather than the boat being stuck.
+        if getattr(self.behaviour, "phase", None) in ("hold", "exit", "turn"):
             self._progress_at = now
             return
         if self._best_distance is None or distance < self._best_distance - PROGRESS_M:

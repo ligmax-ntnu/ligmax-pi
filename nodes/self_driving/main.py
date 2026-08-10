@@ -169,7 +169,13 @@ class Node:
 
         self._commands(state)
         scans = self._perceive(state, now)
-        intent = self.pilot.tick(state, self.world, self._front_clusters, now)
+        # The sweeps go through as well as the clusters: the parking behaviours fit
+        # straight edges to the raw returns, which is a different question from the
+        # one clustering answers (`perception/lines.py`). Both lidars are offered
+        # and the behaviour decides which of them it trusts.
+        intent = self.pilot.tick(
+            state, self.world, self._front_clusters, now, sweeps=scans
+        )
         if state is not None:
             self.commander.send(intent, state, now)
 

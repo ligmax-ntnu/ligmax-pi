@@ -12,10 +12,22 @@ with a jury watching.
     hold            `hold.Hold`         arrive and station-keep     NJORD §9.1
     dock            `dock.Dock`         bow-in, hold 10 s, reverse  NJORD §9.3.1
     dock_parallel   `dock.Dock`         alongside, hold 5 s, ahead  NJORD §9.3.2
+    park            `parking.Parking`   three lines, hold 10 s, out NJORD §9.3.1
+    park_parallel   `parking.Parking`   the same, alongside         NJORD §9.3.2
 
 `task` on each class is what the classifier is told the boat is doing, and it
 exists for one genuine ambiguity: a big white object is the dock during docking
 and the Otter during collision avoidance (`perception/classify.py`).
+
+Two ways to park, on purpose
+----------------------------
+`dock*` finds a berth as a **gap between two structures** and keeps the ordinary
+obstacle avoidance switched on. `park*` finds it as **three lines making a
+rectangle with open corners**, parks on the middle of that rectangle plus a
+static per-type depth offset, and consults the world model not at all - no buoy
+colours, no clearances, no avoidance nudge. Neither has met the water; keeping
+both means the operator picks per waypoint on the day rather than after a commit.
+See `parking.py`'s docstring for why the avoidance is off in there.
 """
 
 from .. import plan as plan_roles
@@ -24,6 +36,7 @@ from .buoys import Buoys
 from .colregs import Colregs
 from .dock import Dock
 from .hold import Hold
+from .parking import Parking
 from .transit import Transit
 
 __all__ = [
@@ -33,6 +46,7 @@ __all__ = [
     "Colregs",
     "Dock",
     "Hold",
+    "Parking",
     "Transit",
     "for_role",
 ]
@@ -61,4 +75,8 @@ def for_role(role, config):
         return Dock(config, parallel=False)
     if role == plan_roles.DOCK_PARALLEL:
         return Dock(config, parallel=True)
+    if role == plan_roles.PARK:
+        return Parking(config, parallel=False)
+    if role == plan_roles.PARK_PARALLEL:
+        return Parking(config, parallel=True)
     return Transit(config)

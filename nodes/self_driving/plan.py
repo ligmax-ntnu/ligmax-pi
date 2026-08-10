@@ -24,6 +24,24 @@ each leg without anyone reloading anything.
     hold            arrive, then hold station. `hold_s` 0 means "until told".
     dock            bow-in docking: find the berth, enter, hold, REVERSE out.
     dock_parallel   come alongside, hold, then continue forward.
+    park            park in the middle of three lines, hold 10 s, REVERSE out.
+    park_parallel   the same, alongside, then continue forward.
+
+`park` versus `dock`
+--------------------
+Two ways of finding the same Njord berth, kept apart on purpose because they fail
+differently and there is no way to know which is better before the water.
+
+`dock` looks for a **gap between two structures** - two clusters the right
+distance apart (`perception/cluster.split_by_gap`) - and it obeys the ordinary
+obstacle machinery on the way in.
+
+`park` looks for **three lines making a rectangle with open corners**
+(`perception/lines.py`, `perception/parking.py`), aims at the middle of it plus a
+static per-type depth offset, and ignores the world model entirely: no buoy
+colours, no clearances, no avoidance. That is what the parking task actually is -
+the marks around it are scenery, and a buoy in the mouth is not a reason to refuse
+to park.
 
 Coordinates
 -----------
@@ -61,17 +79,27 @@ AVOID = "avoid"
 HOLD = "hold"
 DOCK = "dock"
 DOCK_PARALLEL = "dock_parallel"
+PARK = "park"
+PARK_PARALLEL = "park_parallel"
 
-ROLES = (TRANSIT, BUOYS, AVOID, HOLD, DOCK, DOCK_PARALLEL)
+ROLES = (TRANSIT, BUOYS, AVOID, HOLD, DOCK, DOCK_PARALLEL, PARK, PARK_PARALLEL)
 
 # Roles whose waypoint is a place to *arrive at and settle*, rather than a point
 # to sweep through. They get the tighter acceptance radius and they are not
 # allowed to be passed by the passing-plane test - "stop at GPS point 4" is not
 # satisfied by driving past it.
-SETTLE_ROLES = frozenset({HOLD, DOCK, DOCK_PARALLEL})
+SETTLE_ROLES = frozenset({HOLD, DOCK, DOCK_PARALLEL, PARK, PARK_PARALLEL})
 
-#: Default seconds stationary, from the rules, per role (NJORD §9.3).
-DEFAULT_HOLD_S = {DOCK: 10.0, DOCK_PARALLEL: 5.0, HOLD: 0.0}
+#: Default seconds stationary, from the rules, per role (NJORD §9.3). Both parking
+#: roles hold ten, which is what the team asked for and is the stricter of the
+#: two rulebook figures (§9.3 asks 5 s of the alongside berth).
+DEFAULT_HOLD_S = {
+    DOCK: 10.0,
+    DOCK_PARALLEL: 5.0,
+    PARK: 10.0,
+    PARK_PARALLEL: 10.0,
+    HOLD: 0.0,
+}
 
 
 class Waypoint:
@@ -83,7 +111,7 @@ class Waypoint:
 
     __slots__ = (
         "index", "name", "lat", "lon", "role", "speed", "radius", "hold_s",
-        "channel_bearing", "berth_width_m", "notes",
+        "channel_bearing", "berth_width_m", "park_offset_m", "notes",
     )
 
     def __init__(self, index, name, lat, lon, role, **kwargs):
@@ -97,6 +125,11 @@ class Waypoint:
         self.hold_s = kwargs.get("hold_s")
         self.channel_bearing = kwargs.get("channel_bearing")
         self.berth_width_m = kwargs.get("berth_width_m")
+        # How deep into a parking space to sit, metres from the middle, positive
+        # towards the closed end. Overrides the per-type figure in `config.py` for
+        # this waypoint only - which is what a space that turns out to be shorter
+        # than the handbook says needs, without touching the other parking type.
+        self.park_offset_m = kwargs.get("park_offset_m")
         self.notes = kwargs.get("notes") or ""
 
     # ------------------------------------------------------------------ query
@@ -122,7 +155,10 @@ class Waypoint:
             "lon": round(self.lon, 8),
             "role": self.role,
         }
-        for key in ("speed", "radius", "hold_s", "channel_bearing", "berth_width_m"):
+        for key in (
+            "speed", "radius", "hold_s", "channel_bearing", "berth_width_m",
+            "park_offset_m",
+        ):
             value = getattr(self, key)
             if value is not None:
                 out[key] = value
@@ -441,6 +477,14 @@ def _waypoint(position, item, origin, default_bearing):
         ),
         berth_width_m=_optional_float(
             item.get("berth_width_m"), 0.5, 10.0, position, "berth_width_m"
+        ),
+        # Signed, because "sit half a metre short of the middle" is as ordinary a
+        # request as "half a metre deeper". Bounded at +-3 m because the spaces are
+        # 2-4 m across and an offset bigger than the space is a typo, not a plan -
+        # `behaviours/parking.py` clamps it to the measured space as well and says
+        # on the panel when it had to.
+        park_offset_m=_optional_float(
+            item.get("park_offset_m"), -3.0, 3.0, position, "park_offset_m"
         ),
         notes=str(item.get("notes") or "")[:120],
     )

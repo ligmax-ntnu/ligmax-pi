@@ -95,11 +95,11 @@ class Context:
 
     __slots__ = (
         "state", "world", "plan", "config", "now", "waypoint", "leg", "task",
-        "clusters", "ceiling", "run",
+        "clusters", "sweeps", "ceiling", "run",
     )
 
     def __init__(self, state, world, plan, config, now, waypoint, leg, task,
-                 clusters=(), ceiling=None, run=None):
+                 clusters=(), ceiling=None, run=None, sweeps=()):
         self.state = state
         self.world = world
         self.plan = plan
@@ -114,6 +114,18 @@ class Context:
         # routing that measurement through the tracker would smooth away the
         # centimetres the 2 m berth is decided by.
         self.clusters = clusters
+        # This tick's raw sweeps, one dict per lidar, each with a `source` and
+        # boat-frame `points` - exactly what `nodes/io_manager/scan.py` builds and
+        # what `main.py` already holds. Only the parking behaviours use them, and
+        # they need the *points* rather than the clusters because a parking space
+        # is three straight edges: a wall reads as one enormous cluster whose
+        # centroid sits in the middle of the wall, which says nothing about where
+        # its line runs (`perception/lines.py`).
+        #
+        # Kept as the scan dicts rather than one merged point array on purpose:
+        # the line fitter relies on each array being in one sensor's angular
+        # order, and two sweeps concatenated interleave at every shared bearing.
+        self.sweeps = sweeps
         # The speed ceiling in force this tick, m/s - `commander.Commander`'s,
         # which is the 5 kn vessel limit or careful mode's 1 kn. Passed in rather
         # than read from config so that switching careful mode on takes effect on

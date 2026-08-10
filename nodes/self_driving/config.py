@@ -799,6 +799,206 @@ DOCK_ALIGN_TOLERANCE_DEG = _f("LIGMAX_AP_DOCK_ALIGN_DEG", 12.0)
 DOCK_LATERAL_TOLERANCE_M = _f("LIGMAX_AP_DOCK_LATERAL_M", 0.25)
 
 
+# --------------------------------------------------------------- line fitting
+#
+# `perception/lines.py` turns a sweep into straight edges. These are the numbers
+# that decide what counts as an edge, and they are TUNE rather than NJORD: they
+# describe the C1 and the things it is pointed at, not a rule.
+
+# How far a return may sit off a straight line and still belong to it.
+#
+# The window is wide: the C1's +-3 cm means a run of thirty returns off one flat
+# wall can have a 9 cm outlier in it, and the corners this has to *separate* are
+# right angles, which deviate from the chord by tens of centimetres. So 10 cm sits
+# comfortably above the noise and comfortably below any corner in a rectangle.
+#
+# Set it near the sensor noise instead and a straight wall shatters at whichever
+# return happens to sit furthest off the chord - which is why the length filter
+# runs after the merge (`lines.fit_segments`) rather than before it.
+LINE_TOLERANCE_M = _f("LIGMAX_AP_LINE_TOL_M", 0.10)
+
+# Slack on the above when *accepting* a fitted piece. The split loop stops at
+# `LINE_TOLERANCE_M` measured from the chord, and a fit's RMS from the
+# least-squares line is a different (smaller) figure - so the acceptance test
+# needs headroom or it throws away pieces the splitter was happy with.
+LINE_RMS_SLACK = _f("LIGMAX_AP_LINE_RMS_SLACK", 1.6)
+
+# The shortest thing that is a wall. Below this it is a buoy, a bollard or a bird:
+# a Njord berth wall is metres long, and 0.5 m is short enough to still catch the
+# part of one that a lidar inside the berth can see.
+LINE_MIN_M = _f("LIGMAX_AP_LINE_MIN_M", 0.5)
+
+# ...and the fewest returns it may be fitted from. Two points are always exactly
+# a line, which is the whole problem with two points.
+LINE_MIN_POINTS = _i("LIGMAX_AP_LINE_MIN_POINTS", 5)
+
+# How far out to bother fitting. Deliberately its own number rather than
+# `MAX_OBSTACLE_RANGE_M`: a dock wall is worth fitting further away than a buoy is
+# worth avoiding, and the far end of the C1's useful range is where a shoreline
+# starts arriving as a plausible berth wall.
+LINE_MAX_RANGE_M = _f("LIGMAX_AP_LINE_MAX_RANGE_M", 12.0)
+
+# Rejoining one wall that arrived as several pieces - a shadow across it, a cleat
+# in front of it, or just noise deciding where the splitter cut. Nearly parallel,
+# nearly collinear, and nearly touching. The angle is generous because two short
+# noisy pieces of one wall genuinely disagree about its direction by several
+# degrees, and the whole point of merging them is that the joined line is better
+# than either.
+LINE_MERGE_DEG = _f("LIGMAX_AP_LINE_MERGE_DEG", 12.0)
+LINE_MERGE_OFFSET_M = _f("LIGMAX_AP_LINE_MERGE_OFFSET_M", 0.15)
+
+# How much daylight two pieces of one wall may have between them. Sized for the
+# shadow a floating object casts on the wall behind it - a 40 cm buoy sitting in
+# the mouth of a berth hides most of a metre of the back wall from a lidar 5 m
+# away, and the two halves either side of it are the only view of that wall there
+# is. The cost of being generous is that two collinear walls of two adjacent
+# berths can be joined into one long face; that is harmless here, because a face
+# is allowed to overhang the space it closes (`perception/parking.py`).
+LINE_MERGE_GAP_M = _f("LIGMAX_AP_LINE_MERGE_GAP_M", 0.80)
+
+# Each pass makes at most one join, so this bounds how fragmented a scene can be
+# put back together. Twelve is far more than three walls need and costs nothing:
+# the pass is a double loop over a handful of segments.
+LINE_MERGE_PASSES = _i("LIGMAX_AP_LINE_MERGE_PASSES", 12)
+
+
+# ------------------------------------------------------------------- parking
+#
+# NJORD Task 3 as three lines rather than as a gap: the parking space is three
+# sides of a rectangle whose corners do not meet, and the boat parks on the middle
+# of it (`behaviours/parking.py`, `perception/parking.py`). Everything here is
+# per-parking-type, because bow-in and alongside are not the same manoeuvre.
+
+# The way in, and how far back the closed end is. NJORD §9.3's berths: 2 m x 2 m
+# bow-in, 2 m deep by 4 m along the dock alongside. Measured on the day beats
+# both - a waypoint's `berth_width_m` overrides the mouth.
+PARK_MOUTH_M = _f("LIGMAX_AP_PARK_MOUTH_M", 2.0)
+PARK_DEPTH_M = _f("LIGMAX_AP_PARK_DEPTH_M", 2.0)
+PARK_PARALLEL_MOUTH_M = _f("LIGMAX_AP_PARK_PARALLEL_MOUTH_M", 4.0)
+PARK_PARALLEL_DEPTH_M = _f("LIGMAX_AP_PARK_PARALLEL_DEPTH_M", 2.0)
+
+# **The static depth offset, one per parking type.** How far off the middle of the
+# space to sit, in metres, measured along the depth axis: **positive is deeper in**
+# - towards the lone line, the side of the space with no partner, which is the
+# only one whose distance means "how far into the space am I".
+#
+# Zero is the middle of the space and is the default for both. They are separate
+# numbers because the two manoeuvres want different things from the same box: a
+# bow-in park usually wants the bow held off the back wall (a small negative),
+# alongside usually wants the hull square in the middle. Clamped so the dot stays
+# inside the space; a waypoint's `park_offset_m` overrides either.
+PARK_DEPTH_OFFSET_M = _f("LIGMAX_AP_PARK_OFFSET_M", 0.0)
+PARK_PARALLEL_DEPTH_OFFSET_M = _f("LIGMAX_AP_PARK_PARALLEL_OFFSET_M", 0.0)
+
+# How much of the space to leave between the dot and a wall when clamping the
+# offset above. A dot on the wall is not a parking position.
+PARK_OFFSET_MARGIN_M = _f("LIGMAX_AP_PARK_OFFSET_MARGIN_M", 0.35)
+
+# How long to sit there. Ten seconds for both, which is what the team asked for;
+# NJORD §9.3 asks 10 s of the bow-in park and 5 s of the alongside one, so the
+# alongside figure is deliberately the stricter of the two. A waypoint's `hold_s`
+# overrides either.
+PARK_HOLD_S = _f("LIGMAX_AP_PARK_HOLD_S", 10.0)
+PARK_PARALLEL_HOLD_S = _f("LIGMAX_AP_PARK_PARALLEL_HOLD_S", 10.0)
+
+# How close to the dot counts as being on it, and how far the boat may drift
+# before the countdown restarts. The rule wants a continuous stretch stationary in
+# the middle, so drifting out of the second figure does not count towards it.
+PARK_TARGET_TOLERANCE_M = _f("LIGMAX_AP_PARK_TARGET_TOL_M", 0.20)
+PARK_HOLD_TOLERANCE_M = _f("LIGMAX_AP_PARK_HOLD_TOL_M", 0.40)
+
+# How far off the space's centreline the boat may be and still go in. Outside this
+# the entry is abandoned and the boat **backs out and runs the approach again** -
+# it may not steer inside the space (it would arrive crooked) and it may not crab
+# across it (see PARK_TRIM_LATERAL_MS), so lining up again outside is the only way
+# left. The approach runs along the space's normal or it does not run.
+PARK_CENTRE_TOLERANCE_M = _f("LIGMAX_AP_PARK_CENTRE_TOL_M", 0.20)
+
+# What the sideways thruster is allowed to do **while the boat is going somewhere**,
+# m/s. A trim, not a way of travelling: it holds the line the approach established
+# against a light set, and that is all.
+#
+# The reason is the hull. Pushed sideways this trimaran presents three hulls
+# broadside to the water, so lateral drag is nothing like the drag it was shaped
+# around, and a sideways translation that looks fine on a bench is slow, weak and
+# at the mercy of any tide on the water. Holding station is a different job - a few
+# centimetres against a set, with time to do it - and it gets the full
+# `LATERAL_MAX_MS` (`behaviours/parking.py:_approach_move`, `travel=False`).
+PARK_TRIM_LATERAL_MS = _speed("LIGMAX_AP_PARK_TRIM_LATERAL_MS", 0.12)
+
+# How far off the parking angle the boat may be during the hold. The countdown
+# needs the *angle* as well as the position for the whole of its ten seconds,
+# because a boat on the right spot at thirty degrees to the walls is not parked.
+# Tighter than the entry tolerance: by this point the boat is stationary and there
+# is nothing left for it to be doing except pointing the right way.
+PARK_HOLD_ANGLE_DEG = _f("LIGMAX_AP_PARK_HOLD_ANGLE_DEG", 10.0)
+
+# How many times the boat may back out and re-run the approach before saying it
+# cannot line up. Without this a boat that cannot centre itself shuttles in and out
+# of the mouth for the rest of the run, looking busy.
+PARK_MAX_REAPPROACHES = _i("LIGMAX_AP_PARK_MAX_REAPPROACHES", 2)
+
+# The depth of space this hull needs to rotate 90 degrees in, metres - which an
+# alongside park does **on the dot, inside the space**.
+#
+# **Zero, meaning not measured and not checked.** The turning circle of this boat
+# is recorded nowhere in git and this file does not invent hardware numbers. Set it
+# to a measured figure and a space shallower than it is refused with a reason
+# instead of attempted; leave it at 0 and rotating in a 2 m box is the operator's
+# judgement, which is where it currently belongs. Worth measuring early: a trimaran
+# with amas sweeps more than its length suggests.
+PARK_TURN_CLEARANCE_M = _f("LIGMAX_AP_PARK_TURN_CLEARANCE_M", 0.0)
+
+# Below this the boat is close enough on an axis to stop pushing. Thruster wear
+# and a visibly hunting boat, for centimetres nobody is scoring.
+PARK_DEADBAND_M = _f("LIGMAX_AP_PARK_DEADBAND_M", 0.06)
+
+# Metres per second per metre of error, entering and holding. Tighter than
+# `HOLD_P` because the space is 2 m wide and the boat is most of that.
+PARK_ENTRY_P = _f("LIGMAX_AP_PARK_ENTRY_P", 0.45)
+
+# Speeds. The creep in and out is the docking creep; the run to the operator's
+# parking waypoint is allowed to be brisker because it happens in open water.
+PARK_SPEED_MS = _speed("LIGMAX_AP_PARK_SPEED_MS", 0.3)
+PARK_REVERSE_SPEED_MS = _speed("LIGMAX_AP_PARK_REVERSE_SPEED_MS", 0.25)
+PARK_APPROACH_SPEED_MS = _speed("LIGMAX_AP_PARK_APPROACH_SPEED_MS", 0.8)
+
+# Where the approach starts: hold station this far out from the dot, on the
+# centreline, and square up before committing to a space the boat barely fits.
+PARK_STANDOFF_M = _f("LIGMAX_AP_PARK_STANDOFF_M", 3.0)
+
+# How square to the space the boat must be before it commits. A 2 m space entered
+# 15 deg crooked is a collision.
+PARK_ALIGN_TOLERANCE_DEG = _f("LIGMAX_AP_PARK_ALIGN_DEG", 12.0)
+
+# How far to get away from the dot before the waypoint is finished.
+PARK_EXIT_M = _f("LIGMAX_AP_PARK_EXIT_M", 3.0)
+
+# How long to look before saying so. NJORD §8.2 gives the crew 20 s to take over,
+# so saying it at 15 leaves them all 20.
+PARK_SEARCH_TIMEOUT_S = _f("LIGMAX_AP_PARK_SEARCH_TIMEOUT_S", 15.0)
+
+# Finding the space. How far the measured mouth and depth may sit from the figures
+# above, how far from parallel/perpendicular three lines may be and still be a
+# rectangle, and how much of a nominal dimension a line has to cover to count.
+#
+# The span fraction is well under 1 on purpose: a lidar *inside* a 2 m space sees
+# part of each wall and often not the far end of either, and a finder that
+# insisted on whole walls would find nothing from the one position where finding
+# something matters most.
+PARK_BOX_TOLERANCE_M = _f("LIGMAX_AP_PARK_BOX_TOL_M", 0.6)
+PARK_BOX_ANGLE_DEG = _f("LIGMAX_AP_PARK_BOX_ANGLE_DEG", 18.0)
+PARK_BOX_SPAN_FRACTION = _f("LIGMAX_AP_PARK_BOX_SPAN", 0.45)
+
+# Whether the aft lidar's returns may be fitted into a parking space. **Off**,
+# and not as a preference: the aft unit's mounting geometry is hand-measured and a
+# flipped `LIGMAX_AFT_LIDAR_ANGLE_DIR` produces a complete, plausible and
+# MIRRORED world astern (docs/testing.md 7c). A mirrored parking space is a
+# parking space on the wrong side of the boat, and this behaviour would drive into
+# it with confidence. Switch it on once the port-quarter check has passed.
+PARK_USE_AFT_LIDAR = _b("LIGMAX_AP_PARK_USE_AFT_LIDAR", False)
+
+
 # ------------------------------------------------------- lateral thruster
 
 # The boat has two main thrusters (one per ama) and a third, sideways-only unit
