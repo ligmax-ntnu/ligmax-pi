@@ -61,6 +61,11 @@ What it does:
     (`pixhalwk.py`), refreshed here every loop because the autopilot expires
     one that goes quiet, and `release_ride_height` hands that channel back to
     the receiver - a separate command because it is not a stop;
+    `goto` sends the vessel to one point on the chart in GUIDED and
+    `set_speed_limit` sets the ground speed it uses - and, since that goes out
+    as DO_CHANGE_SPEED, the speed an AUTO mission runs at as well
+    (`guided.py`); both are the hand-flown route, and neither is the autonomy
+    node's own planning or its careful-mode ceiling;
     `safety_on`/`safety_off` press the Pixhawk's own safety switch and
     `compass_cal` runs ArduPilot's large-vehicle mag cal from one known
     heading (`preflight.py`), both acked from the autopilot's COMMAND_ACK
@@ -71,11 +76,10 @@ What it does:
     that the vehicle obeyed; watch `mode` and `telemetry.control.armed` on the
     next heartbeat for that.
 
-What it does not do yet: the single-point `goto` command still has no
-GUIDED-mode implementation - only a laid mission (AUTO) runs today. Nothing here
-disarms the autopilot on its
-own initiative either - the E-stop cuts propulsion *power* at the contactor
-rather than asking the Pixhawk nicely.
+What it does not do: nothing here disarms the autopilot on its own initiative -
+the E-stop cuts propulsion *power* at the contactor rather than asking the
+Pixhawk nicely. And nothing here plans: a `goto` is one point held in GUIDED,
+with no obstacle avoidance and no route, which is `nodes/self_driving`'s job.
 
 Everything added to the loop here is non-blocking by construction. The BMS read
 takes ~0.85 s and the lights write can stall on a dead cable, so both live on
@@ -96,6 +100,7 @@ from .autopilot_bridge import AUTOPILOT_COMMANDS, AutopilotBridge
 from .bms import BmsReader
 from .edge_link import ENABLED as EDGE_LINK_ENABLED, EdgeLink
 from .emergency_stop import BatteryHoming, EstopRelay
+from .guided import MODE as GUIDED_MODE, Guided
 from .lidar import LidarReader
 from .lights import Lights
 from .mission import MissionUploader, parse_waypoints
@@ -453,6 +458,7 @@ def handle_commands(
     bridge=None,
     ride_height=None,
     preflight=None,
+    guided=None,
 ):
     """Run the operator's queued commands and ack each one.
 
@@ -576,6 +582,58 @@ def handle_commands(
                 global_points = [navigation.to_global(x, y) for x, y in points]
                 mission.upload(master, str(command_id), points, global_points)
                 continue  # acked by finish_mission() once MISSION_ACK lands
+        elif name == "goto":
+            # The hand-flown route: one point on the chart, in the same grid
+            # metres `set_mission` takes, held by the autopilot in GUIDED until
+            # it arrives. NOT the autonomy node's - that plans its own course
+            # and is not consulted here (`guided.py`).
+            #
+            # Five refusals rather than a best effort, because each of them is a
+            # way for a go-to to look sent and do nothing:
+            #   * the E-stop relay is open, so the thrusters have no power - the
+            #     same rule `home_battery` and `set_ride_height` take;
+            #   * the boat is disarmed, so a target is accepted and ignored;
+            #   * the mode is not GUIDED, and switching it from here would be a
+            #     mode change nobody asked for, on a vehicle where the mode is
+            #     also what `status.py` reads to decide who is in charge;
+            #   * there is no navigation source, or no grid origin yet, so there
+            #     is no lat/lon to send.
+            if master is None:
+                ok, result = False, "no autopilot link"
+            elif guided is None:
+                ok, result = False, "no go-to handler on this node"
+            elif relay.engaged:
+                ok, result = False, "refused: clear the emergency stop first"
+                log.warning("goto %s", result)
+            elif machine is not None and machine.armed is False:
+                ok, result = False, "refused: the vessel is disarmed - arm it first"
+            elif machine is not None and machine.mode not in (None, GUIDED_MODE):
+                ok, result = False, (
+                    f"refused: a go-to only steers in {GUIDED_MODE}, and the "
+                    f"autopilot is in {machine.mode} - set the mode first"
+                )
+            elif navigation is None:
+                ok, result = False, "no navigation source on this node"
+            else:
+                ok, result = guided.goto(
+                    master, navigation, args.get("x"), args.get("y")
+                )
+        elif name == "set_speed_limit":
+            # The ground speed a `goto` travels at and - because it goes out as
+            # DO_CHANGE_SPEED rather than being kept on this Pi - the speed an
+            # AUTO mission from `set_mission` runs at too. Refused above NJORD's
+            # 5 knots rather than clamped, so an operator who typed 4 m/s is told
+            # rather than quietly given 2.57.
+            #
+            # This is not the autonomy node's ceiling: that is careful mode and
+            # `self_driving/config.py`, it rides up separately as
+            # `autopilot.commander`, and nothing here touches it.
+            if master is None:
+                ok, result = False, "no autopilot link"
+            elif guided is None:
+                ok, result = False, "no go-to handler on this node"
+            else:
+                ok, result = guided.set_limit(master, args.get("value"))
         elif name == "set_param":
             # One stabilisation gain or trim, straight into the flight
             # controller's own storage. `tuning.py` holds the whitelist and the
@@ -993,6 +1051,12 @@ def main():
     # autopilot's own COMMAND_ACK (`preflight.py`). Inert until asked.
     preflight = Preflight()
 
+    # The operator's own go-to and the ground speed cap it travels at
+    # (`guided.py`). Starts at the 5 kn vessel limit and sends nothing until
+    # asked, so a boat nobody hand-flies behaves exactly as it did before this
+    # was wired up.
+    guided = Guided()
+
     # RTK corrections, pulled from the caster on the ground station and injected
     # into the autopilot for forwarding to the GNSS. Its own thread and its own
     # socket; the loop only drains a deque. Off if LIGMAX_RTK_ENABLED=0, and a
@@ -1112,12 +1176,17 @@ def main():
                             tuning.handle(message)
                         elif kind == "COMMAND_ACK":
                             # The safety switch and the compass swing are the
-                            # only two things this node waits for an answer to
+                            # only two things this node *waits* for an answer to
                             # (`preflight.py`). Every other command's ack -
                             # arm, mode, and anything a second GCS on this link
                             # sent - is ignored here, which is what it has
-                            # always been.
-                            preflight.handle(master, message)
+                            # always been. The one exception is the speed cap:
+                            # its ack arrives too late to be the operator's
+                            # answer, but a firmware that refuses DO_CHANGE_SPEED
+                            # would otherwise leave the boat running at WP_SPEED
+                            # with the dashboard showing a cap (`guided.py`).
+                            if not preflight.handle(master, message):
+                                guided.note_ack(message)
                         elif not navigation.handle(message):
                             # Position, course and mission progress, then a mission
                             # upload/clear exchange in flight, then the servo rail.
@@ -1233,6 +1302,7 @@ def main():
                 bridge,
                 ride_height,
                 preflight,
+                guided,
             )
             if finish_update(uploader, updater):
                 # Leave the loop the ordinary way: the `finally` below flushes the
@@ -1297,7 +1367,12 @@ def main():
                     ),
                     # Why the status is what it is - which of the three control
                     # links went away. The status itself is a top-level field.
-                    "control": machine.telemetry(),
+                    # `guided` adds the go-to speed cap in force, which belongs
+                    # here rather than in a block of its own: it is a fact about
+                    # how the boat is being commanded, and it has to be readable
+                    # by someone who has just opened the page and never saw the
+                    # ack that set it.
+                    "control": {**machine.telemetry(), **guided.telemetry()},
                     # Why propulsion is believed gone, so an operator can tell a
                     # pressed E-stop from a kicked CAN cable.
                     "propulsion": propulsion.telemetry(),
