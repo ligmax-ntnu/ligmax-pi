@@ -45,15 +45,28 @@ i.e. the boat would miss the waypoint it is being scored on passing. This is why
 `behaviours/base.py` limits speed by the geometry ahead rather than by a number
 in the plan: the straights get the knots, the corners do not.
 
-**`channel_bearing` is 27 on the buoy legs, not 0.** Direction of buoyage is
-seaward = north (NJORD §10.2), which is the plan-level default here. But leg
-3.2 → 3.3 runs at 96°, and `_with_the_buoyage` counts anything within 90° of the
-channel as running with it — so at the default that one leg alone would flip
-red and green and the boat would pass every mark on it on the wrong side, having
-been right about all the others. The boat's actual progress from GPS 3 to GPS 4
-is 40 m on a bearing of 27°, so 27 is what the buoy legs carry. It is the case
-`plan.py`'s per-waypoint override was written for, and it is the single most
-expensive field in this file to get wrong.
+**`channel_bearing` no longer does anything, and does not have to.** Direction of
+buoyage at this venue is seaward = north (NJORD §10.2) — the entrance is defined
+as true north — so it is a fact about the water, not a field on a course. It is
+hardcoded in `plan.BUOYAGE_BEARING_DEG`, and `bearing_of_buoyage` returns that and
+ignores whatever a plan carries. Type anything, or nothing, into the dashboard's
+*Direction of buoyage*: the boat runs against north and says so in the log
+(`plan carries channel_bearing 27 - ignored`). The `27` still in this file is
+inert; it is left in so the file remains correct against a boat that has not been
+updated yet.
+
+What made that field dangerous was never the number, it was the **90° window** it
+was compared against. Two of the five buoy legs run more than 90° off north —
+2 → 3 at 128° and 3.2 → 3.3 at 96° — and `_with_the_buoyage` used to invert red
+and green on anything past 90°. So the boat passed marks on the wrong side for
+those two legs while being right about the other three: confident, consistent and
+wrong for 16 m. `27` did not fix it either (|128 − 27| = 101 > 90; it only ever
+rescued 3.2 → 3.3). The window is now
+`buoys.BUOYAGE_INVERTS_BEYOND_DEG` = **135°**, on the reasoning that a leg
+*crossing* the channel is not sailing back down it and has no lateral sense of
+its own, so it inherits the channel's. Only a leg genuinely heading back down the
+channel inverts — which is still tested, and still matters for a Task 2 gate run
+in reverse.
 
 **Part 2 starts at GPS 3.** The rules let a team that cannot finish part 1
 restart from there (NJORD §9.1), which is why waypoint `3` is the first one with

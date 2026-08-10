@@ -14,9 +14,11 @@ IALA region A, direction of buoyage seaward = north (NJORD §10.2):
 
 "Against it" is not hypothetical - a course that runs back down itself does it,
 and a boat that applies the outbound rule on the return passes every mark on the
-wrong side while being confident and consistent about it. So the direction of
-buoyage is carried per leg (`plan.channel_bearing`) and compared against the
-leg's own bearing, rather than assumed.
+wrong side while being confident and consistent about it. So the leg's own
+bearing is compared against the direction of buoyage rather than assumed to
+agree with it. The *direction* is not a per-course question, though: this venue
+defines its entrance as true north, so it is fixed in
+`plan.BUOYAGE_BEARING_DEG` and nothing an operator types can move it.
 
 Enforcement is a *shift of the corridor*, not a detour. The leg is projected,
 each mark's signed cross-track is measured against it, and a mark on the wrong
@@ -78,6 +80,19 @@ CARDINAL_ENGAGE_M = 18.0
 # rule has been obeyed or broken, and steering for it now only makes things
 # worse.
 ENFORCE_AHEAD_M = -1.0
+
+# How far a leg may run from the direction of buoyage before the lateral rule
+# inverts.
+#
+# Not 90. A leg that runs *across* the channel is not sailing back down it: it
+# has no lateral sense of its own, so the honest thing is for it to inherit the
+# channel's. At 90 the boundary sits exactly where a slalom's cross-channel legs
+# land - Task 1's 3.2 -> 3.3 runs at 96 deg, six degrees the wrong side of it -
+# and the boat would swap red and green for that one leg while being right about
+# the other four, which is the worst available outcome: confident, consistent
+# and wrong for 16 m. Only a leg genuinely heading back down the channel, more
+# than this far off it, inverts.
+BUOYAGE_INVERTS_BEYOND_DEG = 135.0
 
 
 class Buoys(Transit):
@@ -191,17 +206,17 @@ class Buoys(Transit):
     def _with_the_buoyage(self, ctx):
         """Whether this leg runs with the direction of buoyage.
 
-        Within 90 deg of the channel bearing counts as with it. The boundary
-        case - a leg exactly across the channel - has no correct answer from
-        the marks alone, which is precisely why `plan.py` lets the operator set
-        `channel_bearing` per waypoint and override this.
+        The direction itself is not a question any more: it is the venue's, fixed
+        at true north in `plan.BUOYAGE_BEARING_DEG`. What varies is the leg, and
+        anything short of running back down the channel counts as with it - see
+        `BUOYAGE_INVERTS_BEYOND_DEG` for why that boundary is not 90 deg.
         """
         channel = ctx.plan.bearing_of_buoyage(ctx.waypoint)
         if ctx.leg is None:
             leg_bearing = ctx.heading if ctx.heading is not None else channel
         else:
             leg_bearing = geo.bearing_to(ctx.leg[0], ctx.leg[1])
-        return abs(geo.angle_diff(leg_bearing, channel)) <= 90.0
+        return abs(geo.angle_diff(leg_bearing, channel)) <= BUOYAGE_INVERTS_BEYOND_DEG
 
     # ------------------------------------------------------------ cardinal
 

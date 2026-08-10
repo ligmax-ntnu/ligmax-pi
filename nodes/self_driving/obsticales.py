@@ -38,8 +38,22 @@ off the detector - see `perception/classify.py`:
     white           -> BOAT or LAND, decided by size and by what the boat is
                        doing: a 2 m white object during a docking task is the
                        dock, the same object during collision avoidance is the
-                       Otter.
-    blue / dark     -> water, spray, or a shadow. Discarded, not tracked.
+                       Otter. On a buoy leg, neither - see `classify.policy_for`.
+    blue / dark     -> WATER. The sea, spray, a shadow. **Never drawn on the
+                       operator's chart** (`world.WorldModel.telemetry`), because
+                       a chart full of wave crests is a chart nobody reads.
+
+That last one is a type rather than an UNKNOWN because the two statements are
+different and the difference is worth keeping: "the camera looked at this and it
+is blue water" is a claim, and "no camera covered this bearing" is an absence.
+The first can be left off the chart; the second is an object of unknown kind and
+has to be avoided. Both used to arrive here as UNKNOWN, so neither could be acted
+on separately.
+
+WATER is still *tracked* close in, and that is deliberate. A black hull, a dark
+log or a half-submerged fender reads exactly like water to a camera, so returns
+inside `BUOY_TASK_CLUTTER_RANGE_M` are kept and steered around; it is only the
+map and the memory that they are kept out of.
 """
 
 from enum import Enum
@@ -56,8 +70,10 @@ class Enviroment:
     leg that runs back down the course inverts the sense, and a boat applying
     the outbound rule on the return passes every gate on the wrong side.
 
-    So this is carried explicitly per leg rather than assumed - `plan.py`'s
-    `channel_bearing` is what fills it in.
+    So the sense is decided per leg rather than assumed - `buoys.py` compares the
+    leg's bearing against the direction of buoyage, which is itself fixed at true
+    north in `plan.BUOYAGE_BEARING_DEG` because the venue defines its entrance
+    that way.
     """
 
     def __init__(self, upstream_direction: np.ndarray):
@@ -86,6 +102,16 @@ class ObstacleType(Enum):
     # in front of an operator than "unknown object".
     CARDINAL = 10
 
+    # The camera looked and it is blue or dark: the sea, spray, a shadow. Not the
+    # same answer as UNKNOWN, which means nothing coloured it - see the module
+    # docstring. Never drawn, never remembered, still avoided while it is close
+    # enough to hit, because a dark object and dark water are the same returns.
+    #
+    # A number is spent on it so that the vessel and the dashboard cannot disagree
+    # about what a "water" track is, but in practice the dashboard never receives
+    # one: `world.WorldModel.telemetry` drops them before the wire.
+    WATER = 11
+
 
 #: Marks that carry a lateral rule: which side of them the boat must pass.
 BUOY_TYPES = frozenset({ObstacleType.RED, ObstacleType.GREEN})
@@ -101,7 +127,14 @@ CARDINAL_TYPES = frozenset(
     }
 )
 
+#: Every buoy-like mark: the laterals and the cardinals. What the buoy tasks are
+#: scored on, what confirms and is remembered fastest (`config.MARK_CONFIRM_HITS`,
+#: `config.MARK_ESTABLISH_HITS`), and what a marks task never declines to name.
+#: LAND is deliberately not in it - the shore is not a mark.
+MARK_TYPES = BUOY_TYPES | CARDINAL_TYPES
+
 #: Anything nailed to the seabed or the shore. Smoothed hard, never predicted.
+#: WATER is not static and not anything else: it moves, and it is not an object.
 STATIC_TYPES = BUOY_TYPES | CARDINAL_TYPES | {ObstacleType.LAND}
 
 #: The Jetson's detector classes (`edge_protocol.CLASS_NAMES`) as our types.
@@ -140,6 +173,7 @@ _LABELS = {
     ObstacleType.BOAT: "vessel",
     ObstacleType.LAND: "structure",
     ObstacleType.DOCKING_CENTER: "berth",
+    ObstacleType.WATER: "water",
 }
 
 

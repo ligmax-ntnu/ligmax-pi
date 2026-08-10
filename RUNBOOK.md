@@ -43,9 +43,14 @@ Also worth a minute each:
   red and a green mark in the day's light and read `telemetry.autopilot.sees`. If
   marks come back UNKNOWN, lower it; if ordinary warm surfaces come back RED,
   raise it. Too high fails safe, too low does not.
-* `plans/task1.json`'s `channel_bearing: 27` on the buoy legs. See
-  `plans/README.md` — at the default of 0 the leg from 3.2 to 3.3 flips red and
-  green. This is the most expensive field in the file.
+* Nothing about the direction of buoyage. It is hardcoded to true north
+  (`plan.BUOYAGE_BEARING_DEG`, the venue's own definition of its entrance) and no
+  field in a plan or on the dashboard can move it — so leave *Direction of
+  buoyage* wherever it sits. This used to be the most expensive number on the
+  morning, and it is now not a number. See `plans/README.md` for what changed and
+  why the inversion window is 135° rather than 90°. **Check the boat is running
+  that code**: on an un-updated boat the field is live again, and the old default
+  of 0 flips red and green on two of the five buoy legs.
 
 ---
 
