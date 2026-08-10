@@ -48,23 +48,39 @@ mark it can see right now a tight one, automatically.
 Three tiers, and what separates them
 ------------------------------------
     tracked      any measurement at all. Dropped after `TRACK_DROP_AFTER_S`.
-    confirmed    `TRACK_CONFIRM_HITS` sightings. Steered around. This is what
-                 stops the boat manoeuvring for one wave crest.
-    established  `TRACK_ESTABLISH_HITS` sightings spread over
-                 `TRACK_ESTABLISH_SPAN_S`, at `TRACK_ESTABLISH_CONF`, and
-                 STATIC. Never dropped by time, and written to the survey file
-                 so it survives a restart and the gap between two attempts.
+    confirmed    `TRACK_CONFIRM_HITS` sightings - `MARK_CONFIRM_HITS` for a mark.
+                 Steered around. This is what stops the boat manoeuvring for one
+                 wave crest.
+    established  permanent. Never dropped by time or by confidence, and written to
+                 the survey file so it survives a restart and the gap between two
+                 attempts.
 
-The span requirement is the one doing the real work. A single stray coloured
-return - the "one random green point, once, never again" that must never be
-remembered for ever - reaches one hit and dies at the first tier. A burst off a
-wave crest can reach twelve hits inside 300 ms and still cannot reach them across
-two seconds. Nothing gets into permanent memory without having been looked at,
-repeatedly, over time.
+**A mark reaches the third tier on its second sighting** (`MARK_ESTABLISH_HITS`) -
+the same instant it becomes steerable. Once the boat has seen a buoy twice it
+knows about that buoy for the rest of the run, whether or not it ever sees it
+again. That is a change from the old rule, which wanted twelve sightings spread
+over two seconds at 0.8 confidence, and `Track._maybe_establish` sets out both
+sides of the trade in full.
+
+LAND and anything else static still has to earn permanence the slow way, and there
+the span requirement is what does the work: a burst of returns off a single wave
+crest can reach twelve hits inside 300 ms and cannot reach them across two seconds.
 
 And **only static types are ever established**, which is what keeps the Otter out
 of it: a vessel is the one object on the course guaranteed to have moved since
 the boat last saw it, and remembering where it was is worse than useless.
+
+What a permanent mark still is not
+----------------------------------
+Certain of where it is. `sigma_m` goes on growing while the mark is unseen, and
+every consumer adds it to that mark's clearance, so a buoy the boat is remembering
+from two minutes ago claims metres more water than the same buoy in view. "It is
+there for ever" and "it is exactly there" are different claims and only the first
+one is being made.
+
+And not beyond the operator's reach: `forget_track` removes a mark from the model
+and from the survey together, which is the answer to a phantom that has made
+itself permanent.
 
 Still deliberately NOT done here
 --------------------------------
@@ -82,12 +98,21 @@ from .. import geo
 from ..obsticales import (
     FROM_CARDINAL_NAME,
     FROM_DETECTOR_CLASS,
+    MARK_TYPES,
     ObstacleType,
     clearance_for,
     is_static,
     label,
 )
-from .classify import CardinalVote, classify
+from .classify import CardinalVote, classify, policy_for
+
+#: Types that mean "nothing has been named here" and are therefore allowed to
+#: associate with each other and to become anything later. UNKNOWN is "no camera
+#: covered this"; WATER is "a camera did, and it is the sea". A cluster can slide
+#: between the two as the boat's own motion moves it in and out of a lens's cone,
+#: and treating that as two different objects would put a duplicate track beside
+#: every real one along the edge of the camera coverage.
+UNNAMED = frozenset({ObstacleType.UNKNOWN, ObstacleType.WATER})
 
 log = logging.getLogger("self_driving.world")
 
@@ -212,15 +237,47 @@ class Track:
     def _maybe_establish(self, config):
         """Promote to permanent memory, once and never back.
 
-        Three tests, all of which must pass, and the *span* is the one that
-        matters - see the module docstring. Once true this never goes false
-        again: an established mark that later goes unseen is exactly the case
-        the memory exists for, and un-establishing it on the first quiet second
-        would defeat the whole thing.
+        **A mark is permanent as soon as it has been seen twice.** That is a
+        deliberate override of the three tests below and it is worth being explicit
+        about what was traded for it.
+
+        The old rule wanted twelve sightings spread over two seconds at 0.8
+        confidence before it would remember anything, and the reasoning was sound
+        in the abstract: a stray coloured return remembered for ever is worse than
+        no memory at all. What it missed is that a Njord mark is very often *not*
+        available for twelve sweeps at close range - the boat passes it, the mark
+        goes out of the lidar's plane on a swell, the camera stops covering that
+        bearing - and a mark that was seen properly for a second and then dropped
+        from the model is the failure that actually costs the run. The boat arrives
+        at the same gate a minute later with nothing in memory.
+
+        So marks are kept from the second sighting (`MARK_CONFIRM_HITS`, which is
+        also what `WorldModel.confirmed` uses, so a mark becomes steerable and
+        permanent in the same instant). Two rather than one because one sweep is a
+        measurement and two is the cheapest thing that can be called agreement:
+        sea foam is not signal red in the same spot twice running.
+
+        What still guards against a phantom, and none of it was given up:
+
+          * `sigma_m` keeps growing while the mark is unseen, so a remembered mark
+            claims more water and is approached more cautiously than a measured one
+            (`refresh`, and `avoid_radius`);
+          * the operator's "that is not a buoy" button removes it from the model
+            AND from the survey file (`WorldModel.forget_track`);
+          * only STATIC types qualify at all, so the Otter is never remembered
+            where it was.
+
+        LAND and anything else static still has to earn permanence the old way -
+        the shore is not what the memory is for, and it is the thing most likely to
+        fill the survey file (`SURVEY_MAX_TRACKS`).
         """
         if self.established:
             return
         if not is_static(self.kind) or self.kind == ObstacleType.UNKNOWN:
+            return
+        if self.kind in MARK_TYPES:
+            if self.hits >= max(1, config.MARK_ESTABLISH_HITS):
+                self.established = True
             return
         if self.hits < config.TRACK_ESTABLISH_HITS:
             return
@@ -267,8 +324,18 @@ class Track:
         for ever": `WorldModel._age` culls anything under 0.15, and without a
         floor a mark the boat had studied for a minute would still evaporate
         half a minute after it went out of view.
+
+        The floor can only ever stop confidence falling - never raise it. A mark
+        established on two sightings arrives here at about 0.4, and lifting it to
+        0.55 the first time it went out of sight would have the boat grow *more*
+        sure of a mark by not looking at it, on the panel and in the recording
+        both. It keeps whatever it earned, and keeps it indefinitely.
         """
-        floor = config.TRACK_ESTABLISH_FLOOR if self.established else 0.0
+        floor = (
+            min(config.TRACK_ESTABLISH_FLOOR, self.confidence)
+            if self.established
+            else 0.0
+        )
         self.confidence = max(
             floor, self.confidence - config.TRACK_DECAY_PER_S * dt
         )
@@ -553,6 +620,10 @@ class WorldModel:
         if boat_xy is None or heading_deg is None or not clusters:
             return
 
+        # What this task is looking for. One object per sweep rather than per
+        # cluster, since it is a pure function of the context string.
+        policy = policy_for(context, self._config)
+
         measurements = []
         # The same list, flattened for the trip recording. Built here rather than
         # re-derived by the recorder because `classify` is the expensive part of
@@ -567,36 +638,46 @@ class WorldModel:
             east, north = geo.boat_to_world(
                 cluster.centre[0], cluster.centre[1], heading_deg
             )
-            measurements.append(
-                {
-                    "pos": (boat_xy[0] + east, boat_xy[1] + north),
-                    "kind": kind,
-                    "confidence": confidence,
-                    "width_m": cluster.width_m,
-                    "why": why,
-                    "range_m": cluster.range_m,
-                    "source": cluster.source,
-                }
-            )
-            self.last_measurements.append(
-                {
-                    "source": cluster.source,
-                    "centre": [
-                        round(float(cluster.centre[0]), 3),
-                        round(float(cluster.centre[1]), 3),
-                    ],
-                    "world": [
-                        round(boat_xy[0] + east, 3),
-                        round(boat_xy[1] + north, 3),
-                    ],
-                    "width_m": round(float(cluster.width_m), 3),
-                    "range_m": round(float(cluster.range_m), 3),
-                    "n": int(cluster.n),
-                    "kind": kind.name,
-                    "confidence": round(float(confidence), 4),
-                    "why": why,
-                }
-            )
+            # Whether this task wants it remembered at all. Marks and everything
+            # mark-sized always are; wide clutter only close in. See
+            # `classify.TaskPolicy.tracks` - and note that a dropped measurement is
+            # still written to the recording below, because "why did the boat not
+            # see that" is the question a trip file exists to answer, and a silent
+            # filter is how that question stops being answerable.
+            keep, dropped_why = policy.tracks(kind, cluster.range_m, cluster.width_m)
+            if keep:
+                measurements.append(
+                    {
+                        "pos": (boat_xy[0] + east, boat_xy[1] + north),
+                        "kind": kind,
+                        "confidence": confidence,
+                        "width_m": cluster.width_m,
+                        "why": why,
+                        "range_m": cluster.range_m,
+                        "source": cluster.source,
+                    }
+                )
+            entry = {
+                "source": cluster.source,
+                "centre": [
+                    round(float(cluster.centre[0]), 3),
+                    round(float(cluster.centre[1]), 3),
+                ],
+                "world": [
+                    round(boat_xy[0] + east, 3),
+                    round(boat_xy[1] + north, 3),
+                ],
+                "width_m": round(float(cluster.width_m), 3),
+                "range_m": round(float(cluster.range_m), 3),
+                "n": int(cluster.n),
+                "kind": kind.name,
+                "confidence": round(float(confidence), 4),
+                "why": why,
+            }
+            if not keep:
+                entry["dropped"] = dropped_why
+                entry["task"] = policy.name
+            self.last_measurements.append(entry)
 
         matched = self._associate(measurements)
         for m_index, t_index in matched.items():
@@ -667,8 +748,8 @@ class WorldModel:
                 )
                 incompatible = (
                     m["kind"] != track.kind
-                    and m["kind"] != ObstacleType.UNKNOWN
-                    and track.kind != ObstacleType.UNKNOWN
+                    and m["kind"] not in UNNAMED
+                    and track.kind not in UNNAMED
                 )
                 if incompatible or cost[m_index, t_index] > gate:
                     cost[m_index, t_index] = forbidden
@@ -717,13 +798,20 @@ class WorldModel:
 
             if kind == ObstacleType.CARDINAL:
                 track.note_cardinal(det.get("card"), float(det.get("card_conf") or 0.0))
-                if track.kind == ObstacleType.UNKNOWN:
+                if track.kind in UNNAMED:
                     track.kind = ObstacleType.CARDINAL
                 continue
 
             # A deliberately weak vote: the detector gets a say only where the
-            # coloured lidar had none.
-            if track.kind == ObstacleType.UNKNOWN and confidence > 0.4:
+            # coloured lidar had none - which includes a track the colour path read
+            # as WATER, and that is not a technicality. The Jetson colours each
+            # return from the nearest buffered frame and most of them are stale
+            # (`config.COLOUR_AGE_FRESH_MS`), so a mark 8 m off can easily be
+            # painted from a frame that was looking at the water beside it. A track
+            # the lidar called water is exactly a track the camera should be
+            # allowed to correct; refusing would have made naming water a way of
+            # silencing the detector.
+            if track.kind in UNNAMED and confidence > 0.4:
                 track.observe(
                     track.pos, kind, confidence * 0.5, track.width_m, now,
                     self._config,
@@ -789,16 +877,19 @@ class WorldModel:
 
         The cull is the rule that implements everything the memory promises:
 
-            established     kept regardless of age. Its confidence has a floor
-                            (`Track.decay`) so the confidence test cannot reach
-                            it either. This is the buoy the boat is sure about,
-                            remembered indefinitely - with a position it is
-                            steadily less certain of, which is the honest part.
+            established     kept, full stop - neither age nor confidence can
+                            remove it, and for a mark that state is reached on the
+                            second sighting (`Track._maybe_establish`). This is
+                            the buoy the boat has seen, remembered for the rest of
+                            the run and written to the survey for the next one -
+                            with a position it is steadily less certain of, which
+                            is the honest part. The only things that remove it are
+                            the operator's delete button and a new grid origin.
             everything else dropped after `TRACK_DROP_AFTER_S`, exactly as
-                            before. The Otter, because it has moved. And the one
-                            stray green return that was never seen again,
-                            because a single bad read must not outlive the sweep
-                            it came from.
+                            before. The Otter, because it has moved. Unnamed
+                            clutter, because the sweep that made it is gone. And
+                            the single stray return that never came back, because
+                            one bad read must not outlive the sweep it came from.
         """
         if self._last_update is not None:
             dt = max(0.0, now - self._last_update)
@@ -816,10 +907,10 @@ class WorldModel:
         self._tracks = [
             track
             for track in self._tracks
-            if track.confidence > 0.15
-            and (
-                track.established
-                or track.age(now) < self._config.TRACK_DROP_AFTER_S
+            if track.established
+            or (
+                track.confidence > 0.15
+                and track.age(now) < self._config.TRACK_DROP_AFTER_S
             )
         ]
         self._suppressed = [s for s in self._suppressed if s[2] > now]
@@ -888,7 +979,12 @@ class WorldModel:
         for spot, spot_kind, expires in self._suppressed:
             if expires <= now:
                 continue
-            if kind != spot_kind and kind != ObstacleType.UNKNOWN:
+            # An unnamed measurement at a deleted spot is suppressed as well as a
+            # matching one, and WATER counts as unnamed here for a concrete reason:
+            # the camera is allowed to upgrade a water track (`absorb_detections`),
+            # so letting one form on a spot the operator has just cleared is a route
+            # by which the deleted phantom comes straight back.
+            if kind != spot_kind and kind not in UNNAMED:
                 continue
             if geo.distance(spot, pos) <= self._config.TRACK_GATE_M:
                 return True
@@ -931,13 +1027,25 @@ class WorldModel:
         self._write_survey()
 
     def _write_survey(self):
-        """Persist the established static tracks. Best effort, never raises."""
+        """Persist the established static tracks. Best effort, never raises.
+
+        Best-first, because `survey.write` truncates at `SURVEY_MAX_TRACKS` and
+        something has to decide which 200 survive. Since a mark now earns
+        permanence on its second sighting, the file fills with a wider spread of
+        quality than it used to, and truncating in whatever order the tracks
+        happen to sit in the list would let a mark seen twice at 8 m displace one
+        the boat spent ten seconds alongside. Ranked by sightings times
+        confidence, the cap drops the weakest instead of the newest.
+        """
         if self._survey is None or self._origin is None:
             return
+        ranked = sorted(
+            (t for t in self._tracks if t.established),
+            key=lambda t: t.hits * max(0.0, t.confidence),
+            reverse=True,
+        )
         entries = []
-        for track in self._tracks:
-            if not track.established:
-                continue
+        for track in ranked:
             entry = track.to_survey(self._origin)
             if entry is not None:
                 entries.append(entry)
@@ -958,12 +1066,21 @@ class WorldModel:
         One sweep can produce a cluster out of two stray returns off a wave
         crest. Requiring `TRACK_CONFIRM_HITS` sightings is what stops the boat
         manoeuvring for foam.
+
+        A **mark** confirms a sweep sooner (`MARK_CONFIRM_HITS`), because the thing
+        the count is defending against has already been answered in its case: a
+        cluster that came back in the same place with the same paint on it is not
+        foam, and foam is not signal red twice running. The saving is a tenth of a
+        second, and it is spent where it is worth most - a mark is only useful
+        while there is still room to choose a side of it.
         """
-        return [
-            track
-            for track in self._tracks
-            if track.hits >= self._config.TRACK_CONFIRM_HITS
-        ]
+        return [track for track in self._tracks if track.hits >= self._hits_for(track)]
+
+    def _hits_for(self, track):
+        """How many sightings this track needs before the boat acts on it."""
+        if track.kind in MARK_TYPES:
+            return max(1, self._config.MARK_CONFIRM_HITS)
+        return self._config.TRACK_CONFIRM_HITS
 
     def marks(self):
         """Confirmed static marks: buoys and cardinals."""
@@ -1009,11 +1126,22 @@ class WorldModel:
     # ------------------------------------------------------------- telemetry
 
     def telemetry(self, limit=40, now=None):
-        """The obstacle layer for the dashboard, most confident first."""
+        """The obstacle layer for the dashboard, most confident first.
+
+        **Water never reaches the chart.** Spray, wave crests and the shadow under
+        a jetty are all real returns and none of them is an object worth drawing;
+        a dozen of them a minute is what turns a chart the operator is meant to
+        read at a glance into one they scroll past. They are still tracked while
+        they are close enough to matter, still avoided, and still written to the
+        trip recording by `debug_tracks` - so "why did it swerve there" stays
+        answerable afterwards even though nothing was drawn at the time.
+        """
         now = now if now is not None else time.time()
-        tracks = sorted(
-            self.confirmed(), key=lambda t: t.confidence, reverse=True
-        )[:limit]
+        drawable = [
+            track for track in self.confirmed()
+            if track.kind != ObstacleType.WATER
+        ]
+        tracks = sorted(drawable, key=lambda t: t.confidence, reverse=True)[:limit]
         return [track.telemetry(self._config, now) for track in tracks]
 
     def debug_tracks(self, now=None):
@@ -1043,9 +1171,15 @@ class WorldModel:
         }
 
     def summary(self):
-        """One line an operator can read at a glance."""
+        """One line an operator can read at a glance.
+
+        Water is left out for the same reason it is left off the chart: "3x water"
+        is not something anybody needed to be told.
+        """
         counts = {}
         for track in self.confirmed():
+            if track.kind == ObstacleType.WATER:
+                continue
             name = label(track.kind)
             counts[name] = counts.get(name, 0) + 1
         if not counts:

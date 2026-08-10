@@ -431,6 +431,22 @@ CLUSTER_GAP_PER_M = _f("LIGMAX_AP_CLUSTER_GAP_PER_M", 0.03)
 # to buoys at the range where seeing them first matters.
 MIN_CLUSTER_POINTS = _i("LIGMAX_AP_MIN_CLUSTER_POINTS", 2)
 
+# ...unless the returns are the colour of a mark, in which case ONE is enough.
+#
+# The two cases are not the same evidence and were being held to the same bar.
+# An uncoloured return is a range and nothing else: two of them agreeing is the
+# cheapest test that separates an object from a single noisy beam. A return the
+# camera has painted signal red or neon green is a *measurement of the thing the
+# task is about*, and there is nothing else on the water that colour.
+#
+# One dot is not a rare case, either. The C1's plane is fixed and the boat
+# pitches: catch a 40 cm mark on the shoulder of its dome and a whole rotation
+# leaves one or two returns on it, which is precisely when seeing it early
+# matters most. Requiring two was throwing those away, and `TRACK_CONFIRM_HITS`
+# already refuses to steer for anything that does not come back on the next
+# sweep - so the sweep is the wrong place to be strict.
+MIN_MARK_CLUSTER_POINTS = _i("LIGMAX_AP_MIN_MARK_CLUSTER_POINTS", 1)
+
 # A cluster wider than this is a wall, a pier or the shore, not a mark.
 MAX_MARK_WIDTH_M = _f("LIGMAX_AP_MAX_MARK_WIDTH_M", 1.2)
 
@@ -445,10 +461,25 @@ MAX_MARK_WIDTH_M = _f("LIGMAX_AP_MAX_MARK_WIDTH_M", 1.2)
 # Hue is degrees 0-360. Red wraps, so it is two ranges.
 HUE_RED_LOW_MAX = _f("LIGMAX_AP_HUE_RED_LOW_MAX", 20.0)
 HUE_RED_HIGH_MIN = _f("LIGMAX_AP_HUE_RED_HIGH_MIN", 335.0)
-HUE_GREEN_MIN = _f("LIGMAX_AP_HUE_GREEN_MIN", 75.0)
-HUE_GREEN_MAX = _f("LIGMAX_AP_HUE_GREEN_MAX", 175.0)
+# Green runs from yellow-green to teal, and it is deliberately the widest band of
+# the three. Two things push a real green mark off 120 deg and they push it in
+# opposite directions: the warm cast measured below lifts the red channel, which
+# drags the hue DOWN towards yellow, and water and sky reflected off a wet dome
+# lift the blue channel, which drags it UP towards cyan. 62-200 covers both
+# without reaching either red or the sky's own blue.
+#
+# Nothing on the Njord course is teal, so the cost of the width is close to zero;
+# the cost of the old 75-175 was a mark whose hue had been dragged eight degrees
+# reading as no colour at all.
+HUE_GREEN_MIN = _f("LIGMAX_AP_HUE_GREEN_MIN", 62.0)
+HUE_GREEN_MAX = _f("LIGMAX_AP_HUE_GREEN_MAX", 200.0)
+# Yellow gives up its top eight degrees to green. RAL 1003 sits near 45 deg and
+# the warm cast moves it towards orange, never towards green, so nothing real is
+# lost above 62 - whereas a green mark dragged to 70 was being called a cardinal,
+# which is the more expensive mistake: the boat routes a via-point around a
+# cardinal and merely passes a lateral mark on one side.
 HUE_YELLOW_MIN = _f("LIGMAX_AP_HUE_YELLOW_MIN", 35.0)
-HUE_YELLOW_MAX = _f("LIGMAX_AP_HUE_YELLOW_MAX", 70.0)
+HUE_YELLOW_MAX = _f("LIGMAX_AP_HUE_YELLOW_MAX", 62.0)
 
 # Below this saturation a point has no usable hue: it is white, grey or black.
 #
@@ -486,7 +517,82 @@ HUE_YELLOW_MAX = _f("LIGMAX_AP_HUE_YELLOW_MAX", 70.0)
 # grey while costing nothing on the marks themselves. The failure mode of too
 # high is UNKNOWN, which is avoided on both sides; the failure mode of too low is
 # a confident wrong-side pass. Prefer too high.
+#
+# This is now the line between "has a hue at all" and "is a grey" - what separates
+# a blue fender from a white hull. Each of the three MARK colours has its own bar
+# below, and the asymmetry between them is the whole point. Read the next two
+# comments before touching any of the four.
 MIN_SATURATION = _f("LIGMAX_AP_MIN_SATURATION", 0.55)
+
+# RED's own bar. Deliberately LOOSE, and this is a decision rather than an
+# oversight - the crew was shown the measurement below and chose looseness.
+#
+# MEASURED on the 2026-08-08 capture (6879 returns, warm indoor light, no mark
+# anywhere in the scene), running the whole pipeline and counting the clusters that
+# came out RED at each bar:
+#
+#     red bar   0.55   0.60   0.65   0.70   0.75
+#     RED        129     85     52      8      0
+#
+# Every one of those is a false positive indoors, and the cliff at 0.70 is real:
+# that scene's warm-grey population runs out there (saturation p90 0.60) whereas
+# RAL 3001 does not - a signal red buoy reads about 0.82 in sun, the same in deep
+# shade (saturation is chroma over value, so it does not care how dark the light
+# is), and higher still under the very cast that makes the greys dangerous.
+#
+# We stay at 0.55 anyway, because the two failure modes are not equally priced. An
+# over-detected mark costs a wider berth, a marker on the chart the operator can
+# delete with one tap (`world.forget_track`), and nothing else - the buoy rules
+# only shift the corridor, they do not stop the boat. A mark that reads UNKNOWN
+# costs the pass that the task is scored on. Indoors among warm wood the detector
+# is *supposed* to light up; on the water in daylight the greys that trip it
+# largely are not there.
+#
+# **Raise this towards 0.70 if red marks are being invented on the water** - the
+# table says what each step buys, and it cannot cost green anything, because the
+# two no longer share a threshold.
+MIN_SATURATION_RED = _f("LIGMAX_AP_MIN_SATURATION_RED", 0.55)
+
+# ---- why green needs a much lower bar than red, and why that is still safe ----
+#
+# MEASURED on the same 6879-return capture, 2026-08-08: the whole sweep averages
+# RGB (80, 48, 44). That is a global warm cast, and a warm cast is not symmetric
+# in HSV - it does opposite things to the two colours the task is scored on.
+#
+# Saturation is `(high - low) / high`. Lifting the red channel:
+#
+#   on a RED mark   raises `high`. Chroma grows, saturation grows. In that
+#                   capture 6083 of 6879 returns landed in the red hue band and
+#                   at a 0.28 bar 46 of 49 clusters came out RED - warm-lit grey
+#                   masquerading as a signal-red buoy. Hence the 0.55 bar, and it
+#                   stays.
+#   on a GREEN mark raises `low` - red is the *minimum* channel on a green
+#                   object. Chroma shrinks and saturation FALLS. The cast is
+#                   actively erasing the evidence, and 0.55 was erasing the mark
+#                   with it: a neon dome reading (100, 200, 72) is 0.64 and
+#                   passes, but the same dome in shade, or a return sampled at
+#                   its edge where the camera pixel is half water, lands at
+#                   0.3-0.45 and was being called "grey". That is the reported
+#                   symptom - green never detected at all.
+#
+# So a low bar for green is not a loosening of the same test, it is the same
+# strictness applied to a channel the cast works against. For a return to land in
+# the green hue band at all, GREEN must be the maximum channel - and under a cast
+# that multiplies red by about 1.65, green beating red means the true scene had
+# green beating red by 1.65 times over. That inequality is the real detector, and
+# it is one no amount of warm light can fake; the saturation figure is then only
+# there to keep genuine greys out. 0.22 does that.
+#
+# The remaining false-green source is foliage on the shore, which is why the
+# buoys task drops wide clutter (`BUOY_TASK_CLUTTER_RANGE_M`) rather than trying
+# to solve it in the colour space, where it cannot be solved.
+MIN_SATURATION_GREEN = _f("LIGMAX_AP_MIN_SATURATION_GREEN", 0.22)
+
+# Yellow sits between the two: the cast lifts a yellow mark's red channel, which
+# is already near its maximum, so saturation moves little either way. 122 of the
+# 123 yellow returns in the capture were above 0.7, so this costs nothing there
+# and buys a cardinal seen in shade.
+MIN_SATURATION_YELLOW = _f("LIGMAX_AP_MIN_SATURATION_YELLOW", 0.45)
 
 # Grey-world white balance, per sweep, before the hue is taken: divide each
 # channel by its own mean across the sweep, which cancels a global colour cast.
@@ -517,6 +623,49 @@ COLOUR_VOTE_FRACTION = _f("LIGMAX_AP_COLOUR_VOTE_FRACTION", 0.5)
 # A cluster needs at least this many coloured returns to be classified at all.
 MIN_COLOURED_POINTS = _i("LIGMAX_AP_MIN_COLOURED_POINTS", 2)
 
+
+# ---------------------------------- a mark colour is not outvoted by background
+#
+# The vote above counts all five colour names against each other, and that was
+# losing marks for a reason that has nothing to do with disagreement.
+#
+# A cluster on a buoy is not a cluster of buoy-coloured returns. The beams that
+# strike the dome squarely get its paint; the ones that clip its shoulder, or that
+# pass a few centimetres wide and come back off the water behind it, get "dark".
+# Tilt the sensor's plane a little - which the boat's own pitch does continuously -
+# and a 40 cm mark gives one or two painted returns and half a dozen dark ones.
+# On a five-way vote that is green 1, dark 6: a fraction of 0.14 against a bar of
+# 0.5, so the mark comes out UNKNOWN and the boat gives it room on both sides
+# instead of passing it on the side it is scored on.
+#
+# But "dark" is not a competing claim about what the object is. It is water,
+# spray and shadow - the *background* the mark is standing in front of, and the
+# absence of evidence rather than evidence of absence. So the vote is taken among
+# the three MARK colours (red, green, yellow) whenever any of them is present, and
+# white and dark are left out of the denominator entirely.
+#
+# What still beats a mark is another mark colour, which is the only disagreement
+# that means anything here: one green against one red is a genuine conflict and
+# must stay UNKNOWN. Hence a *higher* bar than `COLOUR_VOTE_FRACTION` on the
+# subset - 0.6 keeps 1-vs-1 unresolved, lets 2-vs-1 through, and lets one green
+# among twenty dark returns be a green buoy.
+MARK_COLOUR_WINS = _b("LIGMAX_AP_MARK_COLOUR_WINS", True)
+MARK_COLOUR_VOTE_FRACTION = _f("LIGMAX_AP_MARK_COLOUR_VOTE_FRACTION", 0.6)
+
+# How many mark-coloured returns it takes to call a cluster a mark. One, and
+# `MIN_MARK_CLUSTER_POINTS` above explains why. The safety of this number does not
+# rest on the sweep: it rests on `TRACK_CONFIRM_HITS`, which will not steer for
+# anything that fails to come back, and on `TRACK_ESTABLISH_SPAN_S`, which will
+# not remember anything that was not looked at for two seconds.
+MARK_MIN_POINTS = _i("LIGMAX_AP_MARK_MIN_POINTS", 1)
+
+# How many mark-coloured returns count as full confidence. A one-dot mark is real
+# and it is also weak evidence, and the tracker is built to be told the
+# difference: at 3.0 a single painted return opens at 0.33 confidence and climbs
+# as the sweeps agree, rather than arriving at 1.0 and outranking a mark the boat
+# has studied for a second.
+MARK_CONFIDENCE_FULL_POINTS = _f("LIGMAX_AP_MARK_CONFIDENCE_POINTS", 3.0)
+
 # How much a return's colour is worth, given how mistimed it is.
 #
 # The Jetson colours each return from the nearest buffered camera frame, not from
@@ -544,6 +693,64 @@ COLOUR_AGE_STALE_MS = _f("LIGMAX_AP_COLOUR_AGE_STALE_MS", 250.0)
 COLOUR_AGE_MIN_WEIGHT = _f("LIGMAX_AP_COLOUR_AGE_MIN_WEIGHT", 0.25)
 
 
+# ------------------------------------------- detection, per task the boat is on
+#
+# "Follow these GPS points, but obey the buoy rules" is NJORD §9.1 part 2, it is
+# the `buoys` role, and it is a task about marks. There is no vessel to give way
+# to in it and no dock to find; the shore is scenery. A detector that reports the
+# pier as a structure and a moored dinghy as a vessel on that leg is not being
+# careful, it is answering a question nobody asked - and it costs three real
+# things: a chart the operator has to read past, `deconflict` corridors pushed
+# about by objects the task does not mention, and a survey file that fills up
+# with shoreline (`SURVEY_MAX_TRACKS`).
+#
+# So the classifier is told what the boat is doing and declines to name what the
+# task does not need. `perception/classify.py::policy_for` is where these land,
+# and there are two rules and one range:
+#
+#   marks_only    on the buoys leg, a wide object stops being BOAT or LAND and
+#                 becomes UNKNOWN. Note what that does NOT change: an UNKNOWN
+#                 track is still tracked, still drawn, still avoided on both
+#                 sides, and still stops the boat through `emergency_stop_needed`.
+#                 What it loses is the *name* - and with it the vessel clearance,
+#                 the COLREG machinery and a permanent place in the survey. The
+#                 boat still does not hit the pier; it just no longer files a
+#                 report about it.
+#   clutter range beyond this, a cluster too wide to be a mark is not tracked at
+#                 all on a marks task. This is the "bunch of boats and land" cure.
+#                 6 m is deliberately well outside anything the hull can reach
+#                 before the next dozen sweeps - at the 0.8 m/s caution speed it
+#                 is seven seconds of water, and at the fast profile's 2.5 m/s it
+#                 is still two and a half - and everything inside it is tracked
+#                 exactly as before.
+#   mark-sized    a cluster that could be a mark is ALWAYS tracked, at any range,
+#                 whatever colour it did or did not come out. That exception is
+#                 load-bearing: `world.absorb_detections` can only refine a track
+#                 that already exists, so dropping an uncoloured mark-sized
+#                 cluster at 9 m would take the camera's "that is green" vote away
+#                 with it.
+BUOY_TASK_CLUTTER_RANGE_M = _f("LIGMAX_AP_BUOY_TASK_CLUTTER_M", 6.0)
+
+# On a marks task, how wide a cluster may be and still be called a mark - looser
+# than `MAX_MARK_WIDTH_M`, because a mark at 3 m is one cluster with the water
+# behind it and reads wider than the 40 cm dome it is, and because the gate buoys
+# of Task 2 are sometimes caught together with the chop between them.
+#
+# The width alone does not buy it: a cluster past `MAX_MARK_WIDTH_M` needs
+# `BUOY_TASK_WIDE_MARK_POINTS` painted returns rather than the one a normal-sized
+# cluster needs. One green dot on a 1.7 m cluster is as likely to be a green hull
+# fitting or a reflection as a buoy; two is a mark.
+BUOY_TASK_MARK_WIDTH_M = _f("LIGMAX_AP_BUOY_TASK_MARK_WIDTH_M", 1.8)
+BUOY_TASK_WIDE_MARK_POINTS = _i("LIGMAX_AP_BUOY_TASK_WIDE_POINTS", 2)
+
+# Note what is deliberately NOT here: how much colour it takes to call something a
+# mark. That is `MARK_MIN_POINTS` and it is the same on every task, because it is a
+# question about the evidence rather than about the boat's errand - one painted
+# return is one painted return whether or not this leg is being scored on marks.
+# The task decides what is worth NAMING and what is worth REMEMBERING; it does not
+# get to decide what the returns say.
+
+
 # ------------------------------------------------------------------ tracking
 
 # How much a new measurement moves a track. Low means smooth and laggy, high
@@ -563,6 +770,43 @@ TRACK_GATE_PER_M = _f("LIGMAX_AP_TRACK_GATE_PER_M", 0.12)
 TRACK_CONFIRM_HITS = _i("LIGMAX_AP_TRACK_CONFIRM_HITS", 3)
 TRACK_DECAY_PER_S = _f("LIGMAX_AP_TRACK_DECAY_PER_S", 0.35)
 TRACK_DROP_AFTER_S = _f("LIGMAX_AP_TRACK_DROP_AFTER_S", 6.0)
+
+# A mark confirms one sweep sooner than anything else. What the confirm count is
+# defending against is a cluster made of noise - two stray returns off a wave
+# crest - and a cluster that came back twice *in the same place with the same
+# paint on it* has already answered that: sea foam is not signal red two sweeps
+# running. Meanwhile the cost of the extra sweep falls where it hurts, because a
+# mark is only useful while there is still room to choose a side of it.
+#
+# Two, not one, and that floor stays: one sweep is a measurement, two is the
+# cheapest thing that can be called agreement.
+MARK_CONFIRM_HITS = _i("LIGMAX_AP_MARK_CONFIRM_HITS", 2)
+
+# ...and a mark is remembered for the rest of the run from that same sighting.
+#
+# ONCE A BUOY IS SEEN, IT IS THERE FOR EVER. `TRACK_ESTABLISH_HITS` below wanted
+# twelve sightings over two seconds at 0.8 confidence before it would remember
+# anything, and in the abstract that is the right instinct - a phantom remembered
+# for ever is worse than no memory. But a Njord mark is very often not available
+# for twelve sweeps: the boat passes it, a swell takes it out of the lidar's fixed
+# plane, the camera stops covering that bearing. The mark then falls out of the
+# model six seconds later (`TRACK_DROP_AFTER_S`) and the boat arrives back at the
+# same gate on the next leg with nothing in memory, which is the failure that
+# actually costs a run.
+#
+# What is given up is real and is bounded, deliberately, by three things that were
+# NOT given up: the position uncertainty keeps growing while a mark is unseen so a
+# remembered mark is approached more cautiously than a measured one
+# (`TRACK_SIGMA_GROWTH_M_S`); the operator's delete button removes it from the
+# model and from the survey file together; and only marks get this - LAND still
+# has to earn permanence the slow way, since the shore is not what a memory of the
+# course is for.
+#
+# Set to 1 to remember a mark from a single return. That is a coherent choice on a
+# course you have already surveyed and a bad one on an unknown shoreline, because
+# at 1 there is nothing between one stray green pixel and a permanent buoy on the
+# chart.
+MARK_ESTABLISH_HITS = _i("LIGMAX_AP_MARK_ESTABLISH_HITS", 2)
 
 # The upper limit on the association gate, however much uncertainty a remembered
 # track has accumulated. Without it a track at the sigma ceiling would have a

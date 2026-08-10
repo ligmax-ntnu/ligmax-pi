@@ -490,6 +490,207 @@ def test_colour():
         check(kinds == ["GREEN", "RED"], f"and they are told apart by colour {kinds}")
 
 
+def test_loose_marks():
+    """One painted dot is a buoy, and a marks task only reports marks.
+
+    The three complaints this answers, from the water:
+
+      * marks plainly visible in the lidar were not being detected, because a
+        sweep that grazes a 40 cm dome leaves one or two painted returns among a
+        crowd of dark ones and both the cluster threshold and the colour vote
+        threw that away;
+      * green was never detected AT ALL, because red and green were sharing a
+        saturation threshold that a warm cast moves in opposite directions;
+      * a leg that follows GPS points under buoy rules was reporting a harbour
+        full of vessels and shoreline, none of which is part of that task.
+    """
+    section("loose mark detection, and detection that knows its task")
+
+    from nodes.self_driving.perception.classify import policy_for
+
+    dark, white = (18, 22, 30), (230, 230, 230)
+    green, red = (20, 200, 60), (210, 30, 30)
+
+    # ---- one dot is enough, at every stage of the chain --------------------
+    single = cluster_sweep([[0.0, 6.0]], list(green), config=config)
+    check(len(single) == 1, f"a single painted return makes a cluster ({len(single)})")
+    check(
+        not cluster_sweep([[0.0, 6.0]], list(dark), config=config),
+        "...and a single dark one does not - MIN_CLUSTER_POINTS still bites",
+    )
+    check(
+        not cluster_sweep([[0.0, 6.0]], None, config=config),
+        "...nor a single uncoloured one, which could be any stray beam",
+    )
+    if single:
+        kind, confidence, why = classify(single[0], config, context="buoys")
+        check(kind == ObstacleType.GREEN, f"and one green dot IS a green buoy ({why})")
+        check(
+            0.0 < confidence < 0.5,
+            f"reported as weak evidence, not certainty ({confidence:.2f})",
+        )
+
+    # A mark is not outvoted by the water it is standing in front of.
+    grazed = _rgb_cluster([green] + [dark] * 6)
+    kind, _c, why = classify(grazed, config, context="buoys")
+    check(kind == ObstacleType.GREEN, f"1 green against 6 dark is a green buoy ({why})")
+    check("background" in why, f"...and says so in words for the log ({why})")
+
+    # ...but IS outvoted by a mark colour that disagrees, which is the only
+    # disagreement that means anything: guessing here is the failure being scored.
+    kind, _c, why = classify(_rgb_cluster([green, red]), config, context="buoys")
+    check(
+        kind == ObstacleType.UNKNOWN,
+        f"one green against one red stays UNKNOWN rather than guessing ({why})",
+    )
+    kind, _c, _w = classify(_rgb_cluster([green, green, red]), config, context="buoys")
+    check(kind == ObstacleType.GREEN, "two green against one red resolves to green")
+
+    # ---- green, calibrated for the cast the camera actually sends ----------
+    # A warm cast lifts the red channel, which on a GREEN object is the minimum
+    # channel - so chroma shrinks and saturation falls. These are the returns that
+    # were being called grey.
+    for name, rgb in (
+        ("neon green under the measured warm cast", (100, 200, 72)),
+        ("a dome in shade, half mixed with water", (86, 120, 92)),
+        ("a yellow-green dragged down by the cast", (150, 190, 60)),
+        ("green against water, dragged towards teal", (40, 170, 150)),
+    ):
+        kind, _c, why = classify(_rgb_cluster([rgb] * 3), config, context="buoys")
+        check(kind == ObstacleType.GREEN, f"{name} {rgb} reads GREEN ({why})")
+
+    # And the thing the low green bar must NOT swallow: an actual grey.
+    kind, _c, why = classify(_rgb_cluster([(95, 101, 96)] * 6), config, context="buoys")
+    check(
+        kind != ObstacleType.GREEN,
+        f"a grey with a green tint is not a buoy ({why})",
+    )
+    # Nor the warm-lit grey that the red bar exists for.
+    kind, _c, why = classify(_rgb_cluster([(120, 72, 66)] * 6), config, context="buoys")
+    check(
+        kind != ObstacleType.RED,
+        f"the measured warm cast on a grey surface is not a red buoy ({why})",
+    )
+
+    # ---- the same returns, named differently per task ----------------------
+    otter = _rgb_cluster([white] * 20, width=2.0, centre=(0.0, 8.0))
+    named = {ctx: classify(otter, config, context=ctx)[0] for ctx in
+             ("transit", "avoid", "dock", "buoys")}
+    check(named["avoid"] == ObstacleType.BOAT, "giving way, a 2 m object is a vessel")
+    check(named["dock"] == ObstacleType.LAND, "docking, the same object is structure")
+    check(named["transit"] == ObstacleType.BOAT, "on a blind leg it is still a vessel")
+    check(
+        named["buoys"] == ObstacleType.UNKNOWN,
+        f"under buoy rules it is named neither ({named['buoys'].name}) - that task "
+        f"is about the marks",
+    )
+
+    # A painted cluster too wide for the strict threshold is still a mark on a
+    # marks task, given more than one painted return.
+    wide = _rgb_cluster([green] * 2 + [white] * 30, width=1.7, centre=(0.0, 5.0))
+    check(
+        classify(wide, config, context="buoys")[0] == ObstacleType.GREEN,
+        "a 1.7 m cluster with two green returns is a mark under buoy rules",
+    )
+    thin_evidence = _rgb_cluster([green] + [white] * 30, width=1.7, centre=(0.0, 5.0))
+    check(
+        classify(thin_evidence, config, context="buoys")[0] == ObstacleType.UNKNOWN,
+        "...but one green return on a 1.7 m cluster is not enough to call it one",
+    )
+
+    # ---- water is a positive answer, and it is not an object --------------
+    puddle = _rgb_cluster([dark] * 8, centre=(0.0, 9.0))
+    kind, _c, why = classify(puddle, config, context="buoys")
+    check(
+        kind == ObstacleType.WATER,
+        f"a dark cluster the camera DID colour is water, not unknown ({why})",
+    )
+    blind = _fake_cluster((0.0, 9.0), "green")
+    blind.rgb = None
+    check(
+        classify(blind, config, context="buoys")[0] == ObstacleType.UNKNOWN,
+        "while a cluster no camera covered stays UNKNOWN - an object of unknown kind",
+    )
+
+    # ---- what each task keeps ---------------------------------------------
+    marks_task, blind_task = policy_for("buoys", config), policy_for("transit", config)
+    far = config.BUOY_TASK_CLUTTER_RANGE_M + 3.0
+    check(
+        not marks_task.tracks(ObstacleType.UNKNOWN, far, 4.0)[0],
+        "under buoy rules, 4 m of shoreline beyond the clutter range is not tracked",
+    )
+    check(
+        marks_task.tracks(ObstacleType.UNKNOWN, config.BUOY_TASK_CLUTTER_RANGE_M - 1, 4.0)[0],
+        "...the same shoreline close enough to hit still is",
+    )
+    check(
+        marks_task.tracks(ObstacleType.UNKNOWN, far, 0.4)[0],
+        "...and anything mark-SIZED is tracked at any range, so the camera can "
+        "still upgrade it",
+    )
+    check(
+        not marks_task.tracks(ObstacleType.WATER, far, 0.3)[0],
+        "...but water out at range is not, however small",
+    )
+    check(
+        marks_task.tracks(ObstacleType.GREEN, 40.0, 0.4)[0],
+        "...and a mark is kept at any range at all",
+    )
+    check(
+        blind_task.tracks(ObstacleType.LAND, 40.0, 9.0)[0]
+        and blind_task.tracks(ObstacleType.WATER, 40.0, 0.3)[0],
+        "off a marks task nothing is dropped - unchanged behaviour",
+    )
+
+    # ---- through the world model: the chart, and how fast a mark counts ----
+    world = WorldModel(config)
+    now = 3000.0
+    world.observe([_rgb_cluster([green] * 6, centre=(2.0, 8.0))], (0.0, 0.0), 0.0,
+                  now, "buoys")
+    check(not world.confirmed(), "one sighting of a mark is not yet steerable")
+    world.observe([_rgb_cluster([green] * 6, centre=(2.0, 8.0))], (0.0, 0.0), 0.0,
+                  now + 0.1, "buoys")
+    check(
+        len(world.marks()) == 1,
+        f"two sightings confirm it - a mark is only useful while there is room to "
+        f"choose a side ({len(world.marks())})",
+    )
+
+    # Water close in: tracked, avoided, and never drawn.
+    wet = WorldModel(config)
+    for i in range(4):
+        wet.observe([_rgb_cluster([dark] * 8, centre=(0.0, 3.0))], (0.0, 0.0), 0.0,
+                    now + i * 0.1, "buoys")
+    water_tracks = [t for t in wet.all() if t.kind == ObstacleType.WATER]
+    check(bool(water_tracks), "spray 3 m off the bow is tracked, so it is avoided")
+    check(
+        wet.telemetry() == [],
+        f"...and never drawn on the chart ({len(wet.telemetry())} marker(s))",
+    )
+    check("water" not in wet.summary(), f"nor counted at a glance ({wet.summary()})")
+    check(
+        any(m.get("kind") == "WATER" for m in wet.last_measurements),
+        "but the trip recording keeps it, so a swerve stays explainable",
+    )
+
+
+def _rgb_cluster(rgbs, width=0.4, centre=(0.0, 6.0)):
+    """A `Cluster` with exactly the returns given, for the colour rules."""
+    from nodes.self_driving.perception.cluster import Cluster
+
+    arr = np.array(rgbs, dtype=np.int64).reshape(-1, 3)
+    return Cluster(
+        centre=(float(centre[0]), float(centre[1])),
+        nearest=(float(centre[0]), float(centre[1])),
+        range_m=math.hypot(*centre),
+        bearing_deg=math.degrees(math.atan2(centre[0], centre[1])),
+        width_m=width,
+        n=arr.shape[0],
+        rgb=arr,
+        source="front_lidar",
+    )
+
+
 def test_colour_age_weighting():
     """A well-timed return outvotes a mistimed one (§5.2.3).
 
@@ -1152,18 +1353,53 @@ def test_memory():
     buoy = marks[0]
     check(buoy.established, "26 sightings over 2.5 s establishes it")
 
-    # The span is the test that actually kills a stray, so check it bites: the
-    # same number of hits crammed into 300 ms must NOT establish anything.
+    # A mark is permanent from its SECOND sighting - the whole promise of
+    # `MARK_ESTABLISH_HITS`. Once the boat has seen a buoy twice it knows about
+    # that buoy for the rest of the run, whether or not it ever sees it again.
+    quick = WorldModel(config)
+    quick.observe(
+        [_fake_cluster((3.0, 10.0), "green")], (0.0, 0.0), 0.0, 5000.0, "buoys"
+    )
+    check(
+        not any(tr.established for tr in quick.all()),
+        "one sighting is a measurement, not a memory",
+    )
+    quick.observe(
+        [_fake_cluster((3.0, 10.0), "green")], (0.0, 0.0), 0.0, 5000.1, "buoys"
+    )
+    seen_twice = quick.all()
+    check(
+        len(seen_twice) == 1 and seen_twice[0].established,
+        "a mark seen twice is established at once - no 12 hits, no 2 s span",
+    )
+    # ...and it survives an interval that would drop anything else several times
+    # over, with nothing further measured.
+    quick.observe([], (0.0, 0.0), 0.0, 5000.1 + config.TRACK_DROP_AFTER_S * 20, "buoys")
+    check(
+        len(quick.all()) == 1,
+        "and it is still there two minutes later, unseen the whole time",
+    )
+    check(
+        quick.all()[0].confidence <= seen_twice[0].confidence + 1e-9,
+        "the confidence floor holds it up without inflating it - a mark does not "
+        "become more certain by not being looked at",
+    )
+
+    # The span rule has NOT been removed, it has been scoped: structure still has
+    # to earn permanence the slow way, so the same 26-hits-in-300-ms burst that
+    # used to be the headline case for it must still fail to establish a wall.
     burst = WorldModel(config)
     for i in range(26):
         burst.observe(
-            [_fake_cluster((3.0, 10.0), "green")],
-            (0.0, 0.0), 0.0, 5000.0 + i * 0.012, "buoys",
+            [_fake_cluster((3.0, 6.0), "white", width=3.0)],
+            (0.0, 0.0), 0.0, 5000.0 + i * 0.012, "dock",
         )
+    walls = [tr for tr in burst.all() if tr.kind == ObstacleType.LAND]
+    check(bool(walls), f"the wall is tracked as structure ({len(walls)})")
     check(
         not any(tr.established for tr in burst.all()),
-        "26 hits crammed into 300 ms does NOT establish - a wave crest cannot "
-        "buy permanent memory",
+        "26 hits of structure crammed into 300 ms does NOT establish - a wave "
+        "crest still cannot buy permanent memory",
     )
     check(
         abs(buoy.sigma_m - config.TRACK_SIGMA_M) < 1e-6,
@@ -2071,6 +2307,7 @@ def main():
     for test in (
         test_geo,
         test_colour,
+        test_loose_marks,
         test_colour_age_weighting,
         test_masks,
         test_plan,

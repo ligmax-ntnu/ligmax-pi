@@ -101,6 +101,15 @@ DEFAULT_HOLD_S = {
     HOLD: 0.0,
 }
 
+#: Direction of buoyage at this venue, degrees true (NJORD §10.2).
+#:
+#: The entrance is defined as true north, so this is a property of the *water*
+#: and not of the course laid on it. A plan cannot be right about it, only
+#: wrong - so it is not something an operator types in at 08:15. `Plan.parse`
+#: accepts a `channel_bearing` for backwards compatibility and says loudly that
+#: it is being ignored; `bearing_of_buoyage` returns this and only this.
+BUOYAGE_BEARING_DEG = 0.0
+
 
 class Waypoint:
     """One point on the course, and what to do on the way to it.
@@ -213,10 +222,33 @@ class Plan:
         if len(raw) > 200:
             raise PlanError(f"{len(raw)} waypoints is more than a Njord course has")
 
-        default_bearing = _float(payload.get("channel_bearing"), 0.0)
+        default_bearing = _float(payload.get("channel_bearing"), BUOYAGE_BEARING_DEG)
         waypoints = []
         for position, item in enumerate(raw):
             waypoints.append(_waypoint(position, item, origin, default_bearing))
+
+        # The direction of buoyage is hardcoded (`BUOYAGE_BEARING_DEG`). A plan
+        # that still carries one is not refused - refusing the course over a
+        # field that no longer does anything would be the more expensive
+        # failure - but it is not accepted quietly either, because an operator
+        # who typed a number is entitled to know the boat is not reading it.
+        carried = {default_bearing} | {
+            float(point.channel_bearing)
+            for point in waypoints
+            if point.channel_bearing is not None
+        }
+        stray = sorted(
+            bearing
+            for bearing in carried
+            if abs(geo.angle_diff(bearing, BUOYAGE_BEARING_DEG)) > 0.5
+        )
+        if stray:
+            log.warning(
+                "plan carries channel_bearing %s - ignored; buoyage is fixed at "
+                "%.0f deg true, the venue's entrance (NJORD 10.2)",
+                ", ".join(f"{bearing:.0f}" for bearing in stray),
+                BUOYAGE_BEARING_DEG,
+            )
 
         plan = cls(
             waypoints,
@@ -361,10 +393,15 @@ class Plan:
         }
 
     def bearing_of_buoyage(self, waypoint):
-        """The direction of buoyage on the leg into `waypoint`, degrees."""
-        if waypoint is not None and waypoint.channel_bearing is not None:
-            return float(waypoint.channel_bearing)
-        return float(self.channel_bearing)
+        """The direction of buoyage on the leg into `waypoint`, degrees true.
+
+        Always true north - `BUOYAGE_BEARING_DEG`, the venue's own definition of
+        its entrance. Whatever the plan carries is ignored, so the boat cannot be
+        talked onto the wrong side of a red by a number in a file. `waypoint` is
+        still taken: the caller has one in hand, and a venue whose buoyage turns
+        partway up the channel is a plausible future for this to key off.
+        """
+        return BUOYAGE_BEARING_DEG
 
     # ------------------------------------------------------------ persistence
 

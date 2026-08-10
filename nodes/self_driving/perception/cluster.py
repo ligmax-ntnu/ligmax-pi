@@ -31,6 +31,22 @@ one sweep and is thrown away. Identity, history and velocity are
 function of one sweep and be tested against a captured file with no boat
 attached.
 
+How small a cluster may be depends on what colour it is
+-------------------------------------------------------
+`MIN_CLUSTER_POINTS` returns make an object, **or one return that the camera
+painted the colour of a mark** (`MIN_MARK_CLUSTER_POINTS`). The two are different
+evidence and were being held to the same bar: an uncoloured return is a range and
+nothing else, so two of them agreeing is the cheapest test that tells an object
+from a noisy beam, whereas a return painted signal red or neon green is a
+measurement of the thing the task is about and nothing else on the water is that
+colour.
+
+It is not a corner case either. The C1's plane is fixed and the boat pitches, so
+a rotation that catches a 40 cm dome on its shoulder leaves one or two returns on
+it - exactly when seeing it early matters most. Being strict here was throwing
+those away twice over, since `world.TRACK_CONFIRM_HITS` already refuses to steer
+for anything that does not come back on the next sweep.
+
 The width figure is the honest one to threshold on: `width_m` is the chord
 across the cluster, so a 40 cm Njord buoy reads 0.2-0.4 m depending on how much
 of it the beams caught, a 2 m Otter reads 1-2 m, and a pier reads as far as the
@@ -43,7 +59,7 @@ import math
 
 import numpy as np
 
-from .classify import white_balance_gains
+from .classify import mark_colour_mask, white_balance_gains
 
 
 class Cluster:
@@ -164,9 +180,16 @@ def cluster_sweep(points, rgb=None, source="lidar", *, config, coloured_mask=Non
     if len(groups) > 1 and _wraps(pts, ranges, groups[0], groups[-1], config):
         groups = [np.concatenate([groups[-1], groups[0]])] + list(groups[1:-1])
 
+    # Which returns the camera painted the colour of a mark. Computed once for the
+    # whole sweep, after every filter and reorder above, so the mask lines up with
+    # the point indices the groups are made of.
+    painted = mark_colour_mask(colours, config, gains) if colours is not None else None
+
     out = []
     for index in groups:
-        if index.size < config.MIN_CLUSTER_POINTS:
+        if index.size < config.MIN_CLUSTER_POINTS and not _painted(
+            painted, index, config
+        ):
             continue
         member = pts[index]
         centre = (float(member[:, 0].mean()), float(member[:, 1].mean()))
@@ -195,6 +218,25 @@ def cluster_sweep(points, rgb=None, source="lidar", *, config, coloured_mask=Non
             )
         )
     return out
+
+
+def _painted(painted, index, config):
+    """Whether a group too small to be an object is nevertheless mark-coloured.
+
+    This is the one-dot rule. An uncoloured return is a range and nothing else, so
+    two of them agreeing is the cheapest test that separates an object from a
+    single noisy beam - but a return the camera painted signal red or neon green is
+    a measurement of the thing the task is about, and nothing else on the water is
+    that colour. `config.MIN_MARK_CLUSTER_POINTS` carries the argument, including
+    why the pitch of the boat makes one-return marks routine rather than exotic.
+
+    Floored at one, so a mis-set zero cannot mean "no colour needed at all", and
+    naturally off when the two thresholds are equal.
+    """
+    if painted is None:
+        return False
+    needed = max(1, int(config.MIN_MARK_CLUSTER_POINTS))
+    return int(painted[index].sum()) >= needed
 
 
 def _wraps(pts, ranges, first, last, config):
