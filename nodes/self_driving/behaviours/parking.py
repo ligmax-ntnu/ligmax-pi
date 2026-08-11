@@ -6,13 +6,38 @@
 Both do the same three things and differ only in dimensions, in which way the
 bow points while sitting there, and in which way they leave.
 
+One lidar, forward only, and what that costs
+--------------------------------------------
+**The boat has one working lidar and it looks forward.** The aft unit is broken
+(2026-08-11) and parking never used it anyway - a flipped
+`LIGMAX_AFT_LIDAR_ANGLE_DIR` gives a plausible, complete and *mirrored* world
+astern, and a mirrored parking space is a space on the wrong side of the boat.
+Either way there is nothing behind the boat now, and one phase of one manoeuvre
+pays for it:
+
+**an alongside park cannot see the space it is sitting in.** It comes down the
+normal bow-first, reaches the dot, then rotates 90 degrees - and the lone line,
+the closed end that every depth measurement is taken from, ends up abeam and out
+of view. The two side walls are then ahead and astern of the bow instead of
+either side of it, at a range where the hull's own returns live. So from the turn
+onwards the boat has to **remember the space** rather than measure it: it holds
+the dimensions and the pose it last measured properly, from the dot, square, with
+all three lines in view, and it dead-reckons the middle of that against its own
+GNSS. `_measure` latches for exactly that reason, `parking.source` on the panel
+says `remembered` while it is doing it, and the hold is being flown on memory -
+which is worth knowing before the countdown restarts and somebody wonders why.
+
+Bow-in parking is unaffected: it sits facing the closed end, so it keeps all
+three lines and keeps measuring.
+
 What this behaviour looks at, and what it deliberately does not
 --------------------------------------------------------------
 **Lines. Only lines.** The parking space is three sides of a rectangle whose
 corners do not meet (`perception/parking.py`), the target is the middle of it, and
 none of that involves knowing what anything *is*. So this behaviour reads the
-lidar sweeps and fits edges to them, and it never consults the world model: no
-buoy colours, no track identities, no obstacle clearances, no avoidance nudge.
+front lidar's sweeps and fits edges to them, and it never consults the world
+model: no buoy colours, no track identities, no obstacle clearances, no avoidance
+nudge.
 
 That is a decision and not an oversight. During a parking run the boat is
 deliberately driving to within tens of centimetres of structures it can see
@@ -66,6 +91,14 @@ The phases
     SEARCH   drive to the operator's waypoint and fit lines until three of them
              make a space. The waypoint says where to look; the lidar says where
              the space is.
+    PROBE    nothing in view from the waypoint after `PARK_SEARCH_TIMEOUT_S`, so
+             creep on a fixed bearing (120 degrees at Havet arena - east and a
+             little south, in towards land) for up to `PARK_PROBE_M`, still
+             fitting lines. A forward-looking lidar sitting outside the docks
+             cannot see a berth a few metres further in, so sitting still is not
+             a plan. Its own phase because `pilot._watch_progress` has to exempt
+             it: this is the one phase that deliberately drives *away* from the
+             waypoint.
     ALIGN    get onto the space's centreline one standoff out, and square up.
              **A 2 m space entered crooked is a collision**, and the only cheap
              moment to be straight is before committing.
@@ -93,15 +126,27 @@ it was clamped. `parking.depth_m` next to it is the readback that makes the
 number tunable from what the operator sees: park once, read how deep the boat
 actually sat, adjust by the difference.
 
-Why the box is latched once the boat is inside
-----------------------------------------------
+Why the box is latched once the boat is committed
+-------------------------------------------------
 Up to and including ENTER the space is re-measured every tick, because a floating
-dock moves and the boat's own position error grows. From HOLD onwards a new
-measurement is accepted only if it moves the dot by less than the hold tolerance:
-that still tracks a drifting dock, and it cannot restart a countdown that is
-eight seconds through because one sweep clipped a wall differently.
+dock moves and the boat's own position error grows. **From the turn onwards it is
+a memory**, and a fresh fit has to earn its way in: it is accepted only if it
+agrees with the remembered box on all three of where the dot is
+(`PARK_LATCH_TOLERANCE_M`), how wide the mouth is, and which way the way in
+faces. That still tracks a floating dock, and it cannot
+
+  * restart a countdown that is eight seconds through because one sweep clipped a
+    wall differently, or
+  * hand an alongside park a *different* space fitted from the two returns it can
+    still see while lying across the berth with the closed end out of view.
+
+The second is the one that arrived with the aft lidar's death, and it is why the
+test is on the whole geometry rather than on the dot alone: from that pose the
+front unit sees one side wall and part of the other, and three lines fitted from
+that can be a plausible box with its mouth 90 degrees from the real one.
 """
 
+import logging
 import math
 
 from .. import geo
@@ -111,7 +156,10 @@ from ..perception import lines as line_fit
 from ..perception import parking as parking_geometry
 from .base import Behaviour, creep, next_leg
 
+log = logging.getLogger("self_driving.parking")
+
 SEARCH = "search"
+PROBE = "probe"
 ALIGN = "align"
 ENTER = "enter"
 TURN = "turn"
@@ -145,6 +193,13 @@ class Parking(Behaviour):
         self._turn_to = None
         self._turn_next = HOLD
         self._turned_back = False
+        # Whether the box is a memory rather than a measurement, and how long it
+        # has been one. Set when the boat commits to the turn - see `_measure`.
+        self._latched_at = None
+        self._ignored = 0
+        # Where the probe started from, and how far along it the boat has gone.
+        # None until the search gives up on the waypoint itself.
+        self._probe_from = None
 
     def start(self, ctx):
         super().start(ctx)
@@ -159,6 +214,9 @@ class Parking(Behaviour):
         self._turn_to = None
         self._turn_next = HOLD
         self._turned_back = False
+        self._latched_at = None
+        self._ignored = 0
+        self._probe_from = None
 
     # ------------------------------------------------------------------ tick
 
@@ -170,6 +228,7 @@ class Parking(Behaviour):
 
         handler = {
             SEARCH: self._search,
+            PROBE: self._probe,
             ALIGN: self._align,
             ENTER: self._enter,
             TURN: self._turn,
@@ -193,9 +252,22 @@ class Parking(Behaviour):
         return intent
 
     def _to(self, phase, ctx):
-        if self.phase != phase:
-            self.phase = phase
-            self._phase_at = ctx.now
+        if self.phase == phase:
+            return
+        self.phase = phase
+        self._phase_at = ctx.now
+        # The moment the box stops being a measurement and becomes a memory. It is
+        # stamped on the way *into* the turn rather than when the lines are lost,
+        # because that is the last tick on which the boat was on the dot, square,
+        # with all three lines in view - which is the measurement worth keeping.
+        if phase in (TURN, HOLD, EXIT):
+            if self._latched_at is None:
+                self._latched_at = ctx.now
+        else:
+            # Back outside: re-measure freely again. A re-approach is a fresh look
+            # at the space, not a boat second-guessing a memory.
+            self._latched_at = None
+            self._ignored = 0
 
     # ---------------------------------------------------------------- phases
 
@@ -211,38 +283,118 @@ class Parking(Behaviour):
 
         distance = geo.distance(ctx.boat, target)
         elapsed = _since(self._phase_at, ctx.now)
+        if self._probe_from is not None:
+            # A probe that has already started owns the boat, even if the box it
+            # found has since been lost: the waypoint is astern by now, and going
+            # back out to it to look again from the one place already known not to
+            # see the space is a shuttle, not a search.
+            self._to(PROBE, ctx)
+            return self._probe(ctx)
         if distance <= ctx.config.ARRIVAL_RADIUS_M:
-            reason = (
-                f"at the parking waypoint, looking for three lines "
-                f"({self._segments} in view, {elapsed:.0f} s)"
-            )
             if elapsed > ctx.config.PARK_SEARCH_TIMEOUT_S:
-                # The same sentence in both places, on purpose. `stuck` raises the
-                # panel's badge (it is read for truth, not for text - see
-                # `pilot.telemetry`), and the *reason* is what the operator actually
-                # reads in the headline, so the one that says what to do has to be
-                # there. A 2 m space cannot be seen into from much off its axis, so
-                # "reposition" is the answer far more often than "wait".
-                reason = (
-                    f"no {self._mouth(ctx):.1f} m x {self._depth():.1f} m parking "
-                    f"space in {elapsed:.0f} s ({self._segments} line(s) in view of "
-                    f"the three it needs) - take over and reposition"
-                )
-                self.note(stuck=reason)
+                # Its own phase, and not only for tidiness: `pilot._watch_progress`
+                # exempts it, so a probe that is deliberately driving *away* from
+                # the waypoint does not raise the STUCK badge on the panel. A badge
+                # during a working probe would spend the operator's attention on the
+                # one thing that is going right.
+                self._to(PROBE, ctx)
+                return self._probe(ctx)
             return station_keep(
-                ctx.state, target, ctx.heading, ctx.config, reason
+                ctx.state, target, ctx.heading, ctx.config,
+                f"at the parking waypoint, looking for three lines "
+                f"({self._segments} in view, {elapsed:.0f} s)",
+                ceiling=ctx.ceiling,
             )
 
         # A plain position target, deliberately not `steer_towards`: that one
         # deconflicts against the world model, and the world model's opinion is
         # exactly what a parking run is told to ignore. The waypoint is laid a
         # few metres off the space by the operator, so this leg is short.
-        speed = min(ctx.caution_speed, ctx.config.PARK_APPROACH_SPEED_MS)
+        speed = self._speed(ctx, ctx.config.PARK_APPROACH_SPEED_MS)
         return goto(
             target, speed,
             f"approaching the parking waypoint, {distance:.0f} m, "
             f"looking for three lines",
         )
+
+    def _probe(self, ctx):
+        """Creep in towards the docks on a fixed bearing, still looking. `(intent)`.
+
+        **The waypoint is outside the docks and the boat only sees forwards**, so
+        "nothing in view from the waypoint" is the expected case rather than a
+        failure: a 2 m space a few metres further in is behind a dock face as far
+        as one forward lidar is concerned. Sitting on the waypoint declaring itself
+        stuck would waste the crew's twenty seconds (NJORD §8.2) on a situation one
+        metre of travel fixes.
+
+        So the boat drives the bearing it has been told the docks are on -
+        `park_probe_deg` on the waypoint, else `PARK_PROBE_BEARING_DEG`, which is
+        **120 degrees for Havet arena: east and a little south, straight in towards
+        land** - bow first, at the docking creep, for at most `PARK_PROBE_M`. Every
+        tick of it is still fitting lines, so the probe ends the moment a space
+        appears (`_measure` sets the box and `update` hands over to ALIGN).
+
+        Bow first and no faster than the creep, both deliberately: this is a blind
+        move towards a structure, and the only sensor that will see the structure is
+        the one pointing where the boat is going.
+        """
+        if self.box is not None:
+            # Found one. Hand over from wherever the probe has got to - not from the
+            # waypoint, which is behind the boat now and was the wrong place to look
+            # from in the first place.
+            self._to(ALIGN, ctx)
+            return self._align(ctx)
+
+        if self._probe_from is None:
+            self._probe_from = ctx.boat
+            log.warning(
+                "no parking space at the waypoint after %.0f s - probing %.0f deg "
+                "for up to %.1f m at %.2f m/s",
+                ctx.config.PARK_SEARCH_TIMEOUT_S,
+                self._probe_bearing(ctx),
+                ctx.config.PARK_PROBE_M,
+                self._speed(ctx, ctx.config.PARK_PROBE_SPEED_MS),
+            )
+
+        bearing = self._probe_bearing(ctx)
+        gone = geo.distance(self._probe_from, ctx.boat)
+        limit = ctx.config.PARK_PROBE_M
+        self.note(
+            probe_bearing_deg=round(bearing, 1),
+            probe_m=round(gone, 2),
+            probe_limit_m=round(limit, 1),
+        )
+
+        if gone >= limit:
+            # Out of probe. Said in the words the operator needs, and `stuck` as
+            # well, because this is the point where the twenty seconds start
+            # mattering: the waypoint was wrong, or the space is not where anybody
+            # thought, and neither is something this behaviour can fix.
+            message = (
+                f"no {self._mouth(ctx):.1f} m x {self._depth():.1f} m parking space "
+                f"at the waypoint or {gone:.1f} m along {bearing:.0f} deg "
+                f"({self._segments} line(s) in view of the three it needs) - take "
+                f"over and reposition"
+            )
+            self.note(stuck=message)
+            return stop(message)
+
+        return creep(
+            ctx,
+            forward=self._speed(ctx, ctx.config.PARK_PROBE_SPEED_MS),
+            desired_heading=bearing,
+            reason=(
+                f"nothing in view from the waypoint - probing {bearing:.0f} deg "
+                f"towards the docks, {gone:.1f}/{limit:.1f} m "
+                f"({self._segments} line(s) in view)"
+            ),
+        )
+
+    def _probe_bearing(self, ctx):
+        """Which way the docks are. The waypoint's figure beats the config's."""
+        if ctx.waypoint is not None and ctx.waypoint.park_probe_deg is not None:
+            return geo.wrap360(float(ctx.waypoint.park_probe_deg))
+        return geo.wrap360(ctx.config.PARK_PROBE_BEARING_DEG)
 
     def _align(self, ctx):
         """Get onto the space's centreline, one standoff out, and square up.
@@ -288,7 +440,7 @@ class Parking(Behaviour):
 
         offset = geo.distance(ctx.boat, approach)
         if offset > ctx.config.HOLD_TOLERANCE_M:
-            speed = min(ctx.caution_speed, ctx.config.PARK_APPROACH_SPEED_MS)
+            speed = self._speed(ctx, ctx.config.PARK_APPROACH_SPEED_MS)
             return goto(
                 approach, speed,
                 f"running to the approach point, {offset:.1f} m off the "
@@ -308,6 +460,7 @@ class Parking(Behaviour):
             ctx.state, approach, desired, ctx.config,
             f"squaring up on the centreline ({across:+.2f} m across, "
             f"{misalignment:.0f} deg out)",
+            ceiling=ctx.ceiling,
         )
 
     def _enter(self, ctx):
@@ -425,6 +578,7 @@ class Parking(Behaviour):
     def _dispatch(self, ctx, phase):
         return {
             SEARCH: self._search,
+            PROBE: self._probe,
             ALIGN: self._align,
             ENTER: self._enter,
             TURN: self._turn,
@@ -526,6 +680,20 @@ class Parking(Behaviour):
                     "on one axis"
                 )
             )
+        if self._blind(ctx):
+            # Said every tick of the hold, on the panel, because it changes what the
+            # operator should be watching: the boat is not looking at the berth any
+            # more, it is holding a remembered middle on GNSS, and the thing that
+            # will go wrong is drift rather than a bad fit.
+            self.note(
+                hold_blind=(
+                    f"lying across the space - holding the remembered middle of a "
+                    f"{self.box['mouth_m']:.2f} m mouth on GNSS, the closed end is "
+                    f"out of the front lidar's view"
+                    if self.box
+                    else "no space in view"
+                )
+            )
 
         if held >= required:
             self._to(EXIT, ctx)
@@ -580,10 +748,24 @@ class Parking(Behaviour):
             ctx, out,
             f"reversing out along the normal, {distance:.1f}/{target:.1f} m",
             travel=True,
-            speed=ctx.config.PARK_REVERSE_SPEED_MS,
+            speed=self._speed(ctx, ctx.config.PARK_REVERSE_SPEED_MS),
         )
 
     # ------------------------------------------------------------- the driving
+
+    def _speed(self, ctx, wanted):
+        """`wanted`, held under the operator's speed setting. Every speed in here.
+
+        One method rather than a `min` at each site, because there are seven of
+        them - the run to the waypoint, the probe, the approach, the entry, the
+        turn, the hold and the way out - and the one that gets forgotten is the one
+        that makes a 0.1 m/s test a 0.3 m/s test.
+
+        A cap, never a floor: `ctx.ceiling` is what the boat *may* do and these
+        figures are what a berth manoeuvre *should* do, so the slower of the two
+        always wins.
+        """
+        return min(float(wanted), ctx.ceiling)
 
     def _space_error(self, ctx, target):
         """`(across, along)` from the boat to `target`, in the SPACE's own axes.
@@ -628,6 +810,12 @@ class Parking(Behaviour):
         clipped separately. Clipping one axis rotates the commanded motion, and a
         motion that was square to the walls before the clamp and diagonal after it
         is the exact failure this method exists to avoid.
+
+        Both limits are then held under the **operator's speed setting**
+        (`ctx.ceiling`), which is what makes "set it to 0.1 m/s for the first
+        parking test" mean what it says. It is a cap and never a floor: at the
+        ordinary 1.2 m/s setting nothing here changes, because every figure in
+        this method is already far below it.
         """
         desired = self._desired_heading(ctx)
         across, along = self._space_error(ctx, target)
@@ -643,15 +831,26 @@ class Parking(Behaviour):
         )
         starboard, forward = geo.world_to_boat(east, north, ctx.heading)
 
-        limit = ctx.config.PARK_SPEED_MS if speed is None else speed
-        sideways = (
-            ctx.config.PARK_TRIM_LATERAL_MS if travel else LATERAL_MAX_MS
+        limit = self._speed(
+            ctx, ctx.config.PARK_SPEED_MS if speed is None else speed
+        )
+        sideways = self._speed(
+            ctx, ctx.config.PARK_TRIM_LATERAL_MS if travel else LATERAL_MAX_MS
         )
         scale = 1.0
         if abs(forward) > limit:
             scale = min(scale, limit / abs(forward))
         if abs(starboard) > sideways:
             scale = min(scale, sideways / abs(starboard))
+
+        # ...and the **resultant** against the operator's setting, which is a
+        # different test from either axis: 0.02 m/s ahead plus 0.10 m/s sideways is
+        # legal on both axes and 0.102 m/s through the water. `commander._limit_pair`
+        # would scale it on the way out anyway, so without this the behaviour plans
+        # at a speed it does not get - and then reports that speed on the panel.
+        resultant = math.hypot(forward * scale, starboard * scale)
+        if resultant > ctx.ceiling > 0.0:
+            scale *= ctx.ceiling / resultant
 
         return creep(
             ctx,
@@ -664,6 +863,9 @@ class Parking(Behaviour):
     def _desired_heading(self, ctx):
         """The heading to hold **in this phase**. One place, so it cannot diverge.
 
+            PROBE                the bearing the docks are on. The bow points where
+                                 the boat is going, because the only sensor that
+                                 will see the dock points forwards.
             SEARCH/ALIGN/ENTER   the approach heading: square to the space, bow
                                  pointing in. Both types, because both come down
                                  the normal.
@@ -672,6 +874,8 @@ class Parking(Behaviour):
             EXIT                 whatever the boat is lying at now, which is the
                                  parking angle unless `_exit` turned it back.
         """
+        if self.phase == PROBE:
+            return self._probe_bearing(ctx)
         if self.box is None:
             return ctx.heading
         if self.phase == TURN and self._turn_to is not None:
@@ -722,7 +926,23 @@ class Parking(Behaviour):
     # ------------------------------------------------------------ the geometry
 
     def _measure(self, ctx):
-        """Fit lines, find the space, and keep it in world metres."""
+        """Fit lines, find the space, and keep it in world metres.
+
+        Two regimes, and which one is in force is the difference between a boat
+        that is looking at the berth and a boat that is remembering it:
+
+        **Before the turn** (SEARCH, ALIGN, ENTER) every fit replaces the box. The
+        boat is outside or on the way in, facing the closed end, so all three lines
+        are in front of the one lidar there is, and a floating dock that has moved
+        since the last tick should move the dot with it.
+
+        **From the turn onwards** (TURN, HOLD, EXIT) the box is latched and a fit
+        has to agree with it to be accepted - see `_agrees`. This is what carries an
+        alongside park through the part of the manoeuvre where the closed end is
+        abeam and out of view: the boat holds the width, the depth and the pose it
+        measured from the dot while it could still see all three lines, and holds
+        the middle of *that* on GNSS.
+        """
         segments = line_fit.fit_sweeps(
             ctx.sweeps, config=ctx.config, sources=self._sources(ctx)
         )
@@ -744,26 +964,85 @@ class Parking(Behaviour):
             return
 
         found = self._to_world(ctx, box)
-        if self.phase in (HOLD, EXIT) and self.box is not None:
-            # Inside the space: track a drifting dock, never teleport the dot.
-            moved = geo.distance(self.box["target"], found["target"])
-            if moved > ctx.config.PARK_HOLD_TOLERANCE_M:
-                self.note(box_ignored_m=round(moved, 2))
+        if self._latched() and self.box is not None:
+            agrees, why = self._agrees(ctx, found)
+            if not agrees:
+                self._ignored += 1
+                self.note(box_ignored=why, boxes_ignored=self._ignored)
                 return
         self.box = found
 
-    def _sources(self, ctx):
-        """Which lidars to believe.
+    def _latched(self):
+        """Whether the box is a memory. True from the turn onwards."""
+        return self.phase in (TURN, HOLD, EXIT)
 
-        The front unit always. The aft one only if it has been switched on,
-        because its mounting geometry is hand-measured and a flipped
-        `LIGMAX_AFT_LIDAR_ANGLE_DIR` gives a complete and **mirrored** world
-        astern (docs/testing.md 7c) - and a mirrored parking space is a parking
-        space on the wrong side of the boat, which this behaviour would drive
-        into with confidence.
+    def _blind(self, ctx):
+        """Whether the closed end is out of the front lidar's view right now.
+
+        True for an **alongside** park from the moment it starts turning until it
+        has turned back to leave: that is the stretch where the boat lies across
+        the space with the lone line abeam, and with no aft lidar there is nothing
+        looking at it. Not a guess about what the sweep contains - it is a
+        statement about where the hull is pointing, which is the thing that is
+        actually known.
+
+        False for a bow-in park throughout. It sits square to the closed end, so
+        the one lidar there is has all three lines in front of it the whole time.
         """
-        if ctx.config.PARK_USE_AFT_LIDAR:
-            return ("front_lidar", "aft_lidar")
+        if not self.parallel or self.box is None:
+            return False
+        if not self._latched():
+            return False
+        if self.phase == EXIT and self._turned_back:
+            return False
+        if ctx.heading is None:
+            return True
+        # Square to the way in means looking at the closed end; ninety degrees off
+        # it means looking down the space's width at a side wall.
+        off = abs(geo.angle_diff(self.box["into_deg"], ctx.heading))
+        return off > 45.0
+
+    def _agrees(self, ctx, found):
+        """Whether a fresh fit is the *same* space as the latched one. `(ok, why)`.
+
+        Three tests rather than one, and the two extra ones arrived with the aft
+        lidar's death. Distance alone was enough while the boat always faced the
+        closed end: any real re-measurement of the same box lands within a few
+        centimetres of the same dot, so a jump meant a different box.
+
+        Lying across a berth with one forward lidar, that is no longer true. From
+        that pose the front unit sees one side wall and part of the other, plus
+        whatever is beyond the mouth, and three lines fitted from that can produce a
+        box whose *centre* is close to the right one and whose mouth faces ninety
+        degrees away. Driving out along that box's normal would be driving into a
+        wall. So the mouth width and the way in have to match as well - all three,
+        or the fit is a different space wearing the same name.
+        """
+        moved = geo.distance(self.box["target"], found["target"])
+        if moved > ctx.config.PARK_LATCH_TOLERANCE_M:
+            return False, f"the dot jumped {moved:.2f} m"
+        widened = abs(found["mouth_m"] - self.box["mouth_m"])
+        if widened > ctx.config.PARK_BOX_TOLERANCE_M:
+            return False, f"the mouth changed by {widened:.2f} m"
+        turned = abs(geo.angle_diff(found["into_deg"], self.box["into_deg"]))
+        if turned > ctx.config.PARK_BOX_ANGLE_DEG:
+            return False, f"the way in swung {turned:.0f} deg"
+        return True, ""
+
+    def _sources(self, ctx):
+        """Which lidars to believe: **the front one, and there is no other.**
+
+        The aft unit is broken (2026-08-11) and it was never fitted into a parking
+        space even when it worked, because its mounting geometry is hand-measured
+        and a flipped `LIGMAX_AFT_LIDAR_ANGLE_DIR` gives a complete and **mirrored**
+        world astern (docs/testing.md 7c) - and a mirrored parking space is a
+        parking space on the wrong side of the boat, which this behaviour would
+        drive into with confidence.
+
+        A tuple with one entry rather than nothing at all: `fit_sweeps` filters the
+        sweeps it is given by source, and being explicit is what stops an aft sweep
+        that reappears on the bus one day from silently joining in.
+        """
         return ("front_lidar",)
 
     def _to_world(self, ctx, box):
@@ -854,13 +1133,46 @@ class Parking(Behaviour):
         a 4G link twice a second.
         """
         if self.box is None:
-            return {"seen": False, "segments": self._segments}
+            return {
+                "seen": False,
+                "segments": self._segments,
+                "speed_cap_ms": round(ctx.ceiling, 2),
+                # Only while probing, so a panel that is not showing a probe is
+                # showing nothing about one.
+                **(
+                    {
+                        "probing_deg": round(self._probe_bearing(ctx), 1),
+                        "probed_m": round(
+                            geo.distance(self._probe_from, ctx.boat), 2
+                        ),
+                    }
+                    if self._probe_from is not None and ctx.boat is not None
+                    else {}
+                ),
+            }
         box = self.box
         required = self._required_hold(ctx)
         held = _since(self._hold_from, ctx.now)
         return {
             "seen": True,
             "kind": self.name,
+            # Whether these figures are being measured right now or remembered
+            # from the last tick that could see all three lines. The single most
+            # important field on this block during an alongside park: everything
+            # below it is either a measurement or a dead-reckoned memory, and the
+            # operator cannot tell which from the numbers themselves.
+            "source": "remembered" if self._latched() else "measured",
+            "blind": self._blind(ctx),
+            "remembered_s": (
+                round(_since(self._latched_at, ctx.now), 1)
+                if self._latched_at is not None
+                else None
+            ),
+            "boxes_ignored": self._ignored,
+            # The speed everything in this manoeuvre is held under - the operator's
+            # setting. On the block because "why is it creeping" and "why is it not
+            # creeping" are both answered by this number.
+            "speed_cap_ms": round(ctx.ceiling, 2),
             "target": _round_point(box["target"]),
             "centre": _round_point(box["centre"]),
             "corners": [_round_point(point) for point in box["corners"]],

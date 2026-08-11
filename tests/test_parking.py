@@ -456,7 +456,8 @@ def test_offset():
 # ------------------------------------------------------------- the behaviour
 
 def _ctx_for(behaviour, sweep_points, position=(0.0, 0.0), heading=0.0, now=0.0,
-             waypoint_xy=(0.0, 6.0), hold_s=None, offset_m=None, next_xy=None):
+             waypoint_xy=(0.0, 6.0), hold_s=None, offset_m=None, next_xy=None,
+             ceiling=None, probe_deg=None):
     """A `Context` with no world model at all.
 
     `world=None` is deliberate and is itself the test: the parking behaviours are
@@ -480,6 +481,8 @@ def _ctx_for(behaviour, sweep_points, position=(0.0, 0.0), heading=0.0, now=0.0,
         entry["hold_s"] = hold_s
     if offset_m is not None:
         entry["park_offset_m"] = offset_m
+    if probe_deg is not None:
+        entry["park_probe_deg"] = probe_deg
     entries = [entry]
     if next_xy is not None:
         # A waypoint after this one, which is what the alongside park breaks the
@@ -498,6 +501,9 @@ def _ctx_for(behaviour, sweep_points, position=(0.0, 0.0), heading=0.0, now=0.0,
         task="dock",
         clusters=(),
         sweeps=[{"source": "front_lidar", "points": sweep_points}],
+        # The operator's one speed setting. Defaulted to the boot value, so every
+        # test that does not care about it behaves like an ordinary run.
+        ceiling=config.SPEED_MS if ceiling is None else ceiling,
     )
 
 
@@ -1039,6 +1045,390 @@ def test_offset_clamp():
     )
 
 
+def test_probe():
+    """Nothing in view at the waypoint: creep in towards the docks and look.
+
+    The case this exists for is not a fault. The waypoint before a park is laid
+    *just outside* the docks and the boat has one forward-looking lidar, so a berth
+    a few metres further in produces no returns at all from there. Standing on the
+    waypoint declaring itself stuck would spend NJORD §8.2's twenty seconds on
+    something a metre of travel fixes.
+    """
+    section("the probe: nothing in view from the waypoint")
+
+    behaviour = Parking(config, parallel=False)
+    waypoint = (0.0, 6.0)
+    ctx = _ctx_for(behaviour, [], position=waypoint, waypoint_xy=waypoint)
+    behaviour.start(ctx)
+    behaviour.update(ctx)
+    check(behaviour.phase == "search", "at the waypoint with nothing in view: search")
+    check(
+        behaviour._probe_from is None,
+        "...and it does not set off immediately - it looks from there first",
+    )
+
+    # Past the search timeout, still nothing. Now it should move.
+    late = config.PARK_SEARCH_TIMEOUT_S + 1.0
+    intent = behaviour.update(
+        _ctx_for(behaviour, [], position=waypoint, waypoint_xy=waypoint, now=late)
+    )
+    check(
+        behaviour._probe_from is not None and behaviour.phase == "probe",
+        f"after {config.PARK_SEARCH_TIMEOUT_S:.0f} s it probes instead of giving up "
+        f"(phase {behaviour.phase})",
+    )
+    check(
+        intent.kind == "velocity" and intent.vx > 0.0,
+        f"...moving ahead ({intent.kind}, vx {getattr(intent, 'vx', 0):+.2f})",
+    )
+    check(
+        abs(behaviour.status["probe_bearing_deg"] - config.PARK_PROBE_BEARING_DEG)
+        < 0.01,
+        f"...on {config.PARK_PROBE_BEARING_DEG:.0f} deg - east and a little south, "
+        f"in towards land at Havet ({behaviour.status['probe_bearing_deg']})",
+    )
+    check(
+        intent.vx <= config.PARK_PROBE_SPEED_MS + 1e-9,
+        f"...at the docking creep and no faster ({intent.vx:.2f} of "
+        f"{config.PARK_PROBE_SPEED_MS})",
+    )
+    check(
+        "120" in intent.reason or "probing" in intent.reason,
+        f"...and says what it is doing: {intent.reason}",
+    )
+
+    from nodes.self_driving import pilot as pilot_module
+    import inspect
+    check(
+        '"probe"' in inspect.getsource(pilot_module.Pilot._watch_progress),
+        "the pilot exempts the probe from its no-progress badge - a probe drives "
+        "away from the waypoint on purpose",
+    )
+
+    # A waypoint's own bearing beats the config's, because it is a fact about a
+    # berth rather than about the boat.
+    other = Parking(config, parallel=False)
+    ctx = _ctx_for(
+        other, [], position=waypoint, waypoint_xy=waypoint, probe_deg=240.0
+    )
+    other.start(ctx)
+    other.update(ctx)
+    other.update(
+        _ctx_for(
+            other, [], position=waypoint, waypoint_xy=waypoint, probe_deg=240.0,
+            now=late,
+        )
+    )
+    check(
+        abs(other.status["probe_bearing_deg"] - 240.0) < 0.01,
+        f"a waypoint's park_probe_deg overrides the default "
+        f"({other.status['probe_bearing_deg']})",
+    )
+
+    # Out of probe: it stops and asks for a human rather than crossing the basin.
+    far = geo.offset_point(waypoint, config.PARK_PROBE_BEARING_DEG,
+                           config.PARK_PROBE_M + 0.5)
+    intent = behaviour.update(
+        _ctx_for(behaviour, [], position=far, waypoint_xy=waypoint, now=late + 60.0)
+    )
+    check(
+        intent.kind == "stop",
+        f"{config.PARK_PROBE_M:.0f} m along with nothing found, it stops "
+        f"({intent.kind})",
+    )
+    check(
+        "take over" in (behaviour.status.get("stuck") or ""),
+        f"...and asks for a human: {behaviour.status.get('stuck')}",
+    )
+
+    # And the probe ends the moment a space appears, without needing the timeout
+    # again: the boat is somewhere new, and somewhere new is the whole point.
+    seen = Parking(config, parallel=False)
+    here = (0.0, 0.0)
+    ctx = _ctx_for(seen, [], position=here, waypoint_xy=here)
+    seen.start(ctx)
+    seen.update(ctx)
+    seen.update(_ctx_for(seen, [], position=here, waypoint_xy=here, now=late))
+    check(seen._probe_from is not None, "probing, with nothing in view")
+    seen.update(_ctx_for(seen, sweep_from(here), position=here, waypoint_xy=here,
+                         now=late + 1.0))
+    check(
+        seen.phase == "align" and seen.box is not None,
+        f"a space appearing mid-probe ends it and squares up (phase {seen.phase})",
+    )
+
+
+def test_blind_alongside_hold():
+    """The alongside hold, with the closed end out of view. One lidar, forwards.
+
+    This is the manoeuvre the broken aft lidar actually costs. The boat comes down
+    the normal bow-first, reaches the dot, turns 90 degrees - and from then until it
+    turns back, the lone line it measured every depth from is abeam of a hull that
+    can only see ahead. So it holds the *remembered* middle of a remembered space,
+    and the tests here are that it does exactly that: keeps parking, says it is
+    working from memory, and refuses to be handed a different space.
+    """
+    section("the alongside hold is flown from memory (no aft lidar)")
+
+    behaviour = Parking(config, parallel=True)
+    following = (40.0, MOUTH_NORTH_M + 1.0)
+    ctx = _ctx_for(behaviour, sweep_from((0.0, 0.0), mouth=4.0), next_xy=following)
+    behaviour.start(ctx)
+    behaviour.update(ctx)
+    if behaviour.box is None:
+        check(False, "this test needs a space")
+        return
+    dot = behaviour.box["target"]
+    into = behaviour.box["into_deg"]
+    park = behaviour._park_heading(ctx)
+    remembered = dict(behaviour.box)
+
+    check(
+        behaviour.status["parking"]["source"] == "measured",
+        "outside the space, the figures are measured",
+    )
+
+    # On the dot and turned: from here on it is memory.
+    behaviour.phase = "hold"
+    behaviour._latched_at = 10.0
+    behaviour._hold_from = 10.0
+    now = 11.0
+    intent = behaviour.update(
+        _ctx_for(behaviour, [], position=dot, heading=park, now=now,
+                 next_xy=following)
+    )
+    block = behaviour.status["parking"]
+    check(
+        behaviour.box is not None and block["seen"] is True,
+        "with the space out of view it still knows where the space is",
+    )
+    check(
+        block["source"] == "remembered" and block["blind"] is True,
+        f"...and says the figures are remembered rather than measured "
+        f"({block['source']}, blind={block['blind']})",
+    )
+    check(
+        abs(block["mouth_m"] - remembered["mouth_m"]) < 0.02,
+        f"...holding the mouth width it measured ({block['mouth_m']:.2f} m)",
+    )
+    check(
+        "remembered middle" in (behaviour.status.get("hold_blind") or ""),
+        f"...and the panel says so in words: {behaviour.status.get('hold_blind')}",
+    )
+    check(
+        intent.kind in ("velocity", "stop"),
+        f"...while still holding the dot ({intent.kind})",
+    )
+
+    # The countdown runs on the memory, which is the requirement: ten continuous
+    # seconds in the middle, whether or not the middle is visible.
+    for step in range(1, 30):
+        now = 11.0 + step * 0.5
+        behaviour.update(
+            _ctx_for(behaviour, [], position=dot, heading=park, now=now,
+                     next_xy=following)
+        )
+        if behaviour.phase != "hold":
+            break
+    check(
+        behaviour.phase in ("exit", "turn") and behaviour._turned_back,
+        f"ten blind seconds on the remembered dot finishes the hold and it turns "
+        f"back to leave (phase {behaviour.phase})",
+    )
+
+    # A *different* space, offered while the boat is lying across this one, must
+    # not be believed. This is the failure the aft lidar's death introduced: from
+    # that pose a three-line fit can be a plausible box facing anywhere.
+    latched = Parking(config, parallel=True)
+    ctx = _ctx_for(latched, sweep_from((0.0, 0.0), mouth=4.0), next_xy=following)
+    latched.start(ctx)
+    latched.update(ctx)
+    latched.phase = "hold"
+    latched._latched_at = 5.0
+    latched._hold_from = 5.0
+    before = dict(latched.box)
+    elsewhere = ray_cast(scene(4.0, 2.0, standoff=1.0, bearing=90.0))
+    latched.update(
+        _ctx_for(latched, elsewhere, position=dot, heading=park, now=6.0,
+                 next_xy=following)
+    )
+    check(
+        latched.status.get("box_ignored") is not None,
+        f"a fit that disagrees with the memory is refused: "
+        f"{latched.status.get('box_ignored')}",
+    )
+    check(
+        geo.distance(latched.box["target"], before["target"]) < 1e-9
+        and abs(latched.box["into_deg"] - before["into_deg"]) < 1e-9,
+        "...and the remembered space is untouched by it",
+    )
+
+    # The three tests, directly, so it is clear which one catches what.
+    same = dict(before)
+    ok, _why = latched._agrees(ctx, same)
+    check(ok, "the same box agrees with itself")
+    ok, why = latched._agrees(
+        ctx,
+        dict(before, target=geo.offset_point(before["target"], 0.0,
+                                             config.PARK_LATCH_TOLERANCE_M + 0.2)),
+    )
+    check(not ok and "jumped" in why, f"a dot that jumped is refused: {why}")
+    ok, why = latched._agrees(
+        ctx, dict(before, mouth_m=before["mouth_m"] + config.PARK_BOX_TOLERANCE_M + 0.2)
+    )
+    check(not ok and "mouth" in why, f"a mouth that changed width is refused: {why}")
+    ok, why = latched._agrees(ctx, dict(before, into_deg=(before["into_deg"] + 90.0)))
+    check(
+        not ok and "way in" in why,
+        f"a way in 90 deg from the remembered one is refused: {why}",
+    )
+
+    # Bow-in parking keeps measuring throughout, because it faces the closed end.
+    bow = Parking(config, parallel=False)
+    ctx = _ctx_for(bow, sweep_from((0.0, 0.0)))
+    bow.start(ctx)
+    bow.update(ctx)
+    bow.phase = "hold"
+    bow._latched_at = 1.0
+    bow._hold_from = 1.0
+    bow.update(_ctx_for(bow, sweep_from(bow.box["target"]),
+                        position=bow.box["target"], now=2.0))
+    check(
+        bow.status["parking"]["blind"] is False,
+        "a bow-in park is never blind - it sits looking at the closed end",
+    )
+    check(
+        abs(geo.angle_diff(into, bow.box["into_deg"])) < 5.0,
+        "...and keeps measuring the same space it came in on",
+    )
+
+
+def test_speed_setting_is_obeyed():
+    """0.1 m/s means 0.1 m/s, including inside the berth.
+
+    Every speed in a parking run used to come from `config` alone, so an operator
+    who set the dashboard's speed to 0.1 m/s for a first attempt got a 0.30 m/s
+    entry and a 0.35 m/s hold: the number on the panel was a decoration in the one
+    manoeuvre where it matters most.
+    """
+    section("the operator's speed setting is obeyed by the whole manoeuvre")
+
+    slow = 0.1
+    behaviour = Parking(config, parallel=False)
+    ctx = _ctx_for(behaviour, sweep_from((0.0, 0.0)), ceiling=slow)
+    behaviour.start(ctx)
+    behaviour.update(ctx)
+    if behaviour.box is None:
+        check(False, "this test needs a space")
+        return
+    dot = behaviour.box["target"]
+    check(
+        behaviour.status["parking"]["speed_cap_ms"] == slow,
+        f"the panel carries the cap in force "
+        f"({behaviour.status['parking']['speed_cap_ms']} m/s)",
+    )
+
+    # Entering.
+    behaviour.phase = "enter"
+    start = (dot[0], dot[1] - config.PARK_STANDOFF_M)
+    intent = behaviour.update(
+        _ctx_for(behaviour, sweep_from(start), position=start, now=2.0, ceiling=slow)
+    )
+    check(
+        0.0 < intent.vx <= slow + 1e-9,
+        f"the entry creeps at {intent.vx:.3f} m/s, not PARK_SPEED_MS "
+        f"({config.PARK_SPEED_MS})",
+    )
+
+    # Holding, where the lateral thruster has full authority - which must also be
+    # held under the setting, or a "0.1 m/s" hold crabs at 0.35.
+    behaviour.phase = "hold"
+    behaviour._hold_from = 5.0
+    pushed = (dot[0] + 0.35, dot[1])
+    intent = behaviour.update(
+        _ctx_for(behaviour, sweep_from(pushed), position=pushed, now=5.5,
+                 ceiling=slow)
+    )
+    check(
+        abs(intent.vy) <= slow + 1e-9,
+        f"the hold's sideways command is {abs(intent.vy):.3f} m/s, under the "
+        f"setting rather than at LATERAL_MAX_MS",
+    )
+    check(
+        math.hypot(intent.vx, intent.vy) <= slow + 1e-9,
+        f"...and so is the resultant ({math.hypot(intent.vx, intent.vy):.3f} m/s)",
+    )
+
+    # Leaving.
+    behaviour.phase = "exit"
+    intent = behaviour.update(
+        _ctx_for(behaviour, sweep_from(dot), position=dot, now=20.0, ceiling=slow)
+    )
+    check(
+        abs(intent.vx) <= slow + 1e-9,
+        f"reversing out is {abs(intent.vx):.3f} m/s, not PARK_REVERSE_SPEED_MS "
+        f"({config.PARK_REVERSE_SPEED_MS})",
+    )
+
+    # The run to the waypoint, which is a position target rather than a velocity.
+    away = Parking(config, parallel=False)
+    ctx = _ctx_for(away, [], position=(0.0, -20.0), ceiling=slow)
+    away.start(ctx)
+    intent = away.update(ctx)
+    check(
+        intent.kind == "goto" and intent.speed <= slow + 1e-9,
+        f"even the run out to the parking waypoint obeys it "
+        f"({getattr(intent, 'speed', None)} m/s)",
+    )
+
+    # ...and a high setting cannot make a berth approach brisk. The setting is a
+    # ceiling, never a floor.
+    brisk = Parking(config, parallel=False)
+    ctx = _ctx_for(brisk, sweep_from((0.0, 0.0)), ceiling=config.SPEED_LIMIT_MS)
+    brisk.start(ctx)
+    brisk.update(ctx)
+    brisk.phase = "enter"
+    start = (brisk.box["target"][0], brisk.box["target"][1] - config.PARK_STANDOFF_M)
+    intent = brisk.update(
+        _ctx_for(brisk, sweep_from(start), position=start, now=2.0,
+                 ceiling=config.SPEED_LIMIT_MS)
+    )
+    check(
+        intent.vx <= config.PARK_SPEED_MS + 1e-9,
+        f"at the 5 kn setting the entry is still the docking creep "
+        f"({intent.vx:.3f} of {config.PARK_SPEED_MS})",
+    )
+
+
+def test_front_lidar_only():
+    section("one lidar, and it looks forward")
+
+    behaviour = Parking(config, parallel=False)
+    ctx = _ctx_for(behaviour, sweep_from((0.0, 0.0)))
+    check(
+        behaviour._sources(ctx) == ("front_lidar",),
+        f"parking fits lines to the front unit and nothing else "
+        f"({behaviour._sources(ctx)})",
+    )
+    check(
+        not hasattr(config, "PARK_USE_AFT_LIDAR"),
+        "there is no aft-lidar switch left to turn on by accident",
+    )
+
+    # An aft sweep on the bus is ignored rather than fitted. The scene here is a
+    # space *astern*, which is what a mirrored aft unit would offer.
+    behaviour.start(ctx)
+    ctx = _ctx_for(behaviour, [])
+    ctx.sweeps = [
+        {"source": "aft_lidar", "points": ray_cast(scene(2.0, 2.0, standoff=2.0))}
+    ]
+    behaviour.update(ctx)
+    check(
+        behaviour.box is None,
+        "a parking space offered by the aft unit is not believed",
+    )
+
+
 def main():
     test_lines()
     test_finding()
@@ -1053,6 +1443,10 @@ def main():
     test_no_lateral_thruster()
     test_parallel_behaviour()
     test_offset_clamp()
+    test_probe()
+    test_blind_alongside_hold()
+    test_speed_setting_is_obeyed()
+    test_front_lidar_only()
 
     print()
     if FAILURES:

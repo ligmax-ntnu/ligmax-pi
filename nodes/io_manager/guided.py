@@ -8,13 +8,17 @@ AUTO obeys it too. Both were advertised by the dashboard from the start and
 neither existed on the vessel until 2026-08-10: they acked
 `'goto' is not implemented on the vessel` (docs/findings.md).
 
-**This is the hand-flown route, not the autonomy node's.** `nodes/self_driving`
-plans its own course, picks a speed per behaviour and enforces its own ceiling
-(`commander.ceiling`, careful mode, `config.SPEED_LIMIT_KNOTS`); nothing here
-changes any of that, and nothing here is consulted when it is driving. What this
-is for is the operator clicking a point on the chart with the planner out of the
-picture - moving the boat off a start line, closing on a mark by hand, or
-checking that GUIDED steers at all before trusting a plan to it.
+**The go-to is the hand-flown route; the cap is now shared.** `goto` is for the
+operator clicking a point on the chart with the planner out of the picture -
+moving the boat off a start line, closing on a mark by hand, or checking that
+GUIDED steers at all before trusting a plan to it. `set_speed_limit` reaches
+further than that: since 2026-08-11 it is in `autopilot_bridge.SHARED_COMMANDS`,
+so the same press also sets the autonomy node's one speed setting
+(`self_driving/commander.set_speed`) - which is what every autonomous behaviour
+plans under, docking included. What this file still owns is only this node's half
+of it: the figure a `goto` uses and the `DO_CHANGE_SPEED` that an AUTO mission
+runs at. Careful mode and the three run profiles are gone; one number does the
+job they were sharing badly.
 
 Three things worth knowing before changing this:
 
@@ -49,8 +53,16 @@ log = logging.getLogger(__name__)
 
 # The slowest cap worth having. Below this the boat cannot hold heading against
 # any wind at all, so a value under it is a typo rather than a request - and the
-# dashboard's own input carries the same floor.
-MIN_LIMIT_MS = 0.2
+# dashboard's own input and `self_driving/config.SPEED_MIN_MS` carry the same
+# floor, so all three agree.
+#
+# 0.2 until 2026-08-11, when it was lowered to 0.1: this figure is now also the
+# floor on the *autonomy* node's speed (`SHARED_COMMANDS` in
+# `autopilot_bridge.py`), and a first parking test on the water is run at
+# 0.1 m/s. At that speed the boat will not hold heading against any wind worth
+# the name - which is fine alongside a dock with somebody watching, and is why
+# the number is a floor rather than a recommendation.
+MIN_LIMIT_MS = 0.1
 
 # The only flight mode that acts on a position target. `main.py` refuses a go-to
 # in anything else rather than switching mode on the operator's behalf.
@@ -141,11 +153,13 @@ class Guided:
             return False, "the speed cap could not be sent - see the vessel log"
         self.limit = number
         log.warning(
-            "speed cap now %.2f m/s (%.2f kn) for go-to and AUTO", number, knots(number)
+            "speed now %.2f m/s (%.2f kn) for go-to, AUTO and the autonomy node",
+            number,
+            knots(number),
         )
         return True, (
-            f"speed cap {number:.2f} m/s ({knots(number):.2f} kn) for go-to and "
-            "AUTO - the autonomy node keeps its own ceiling"
+            f"speed {number:.2f} m/s ({knots(number):.2f} kn) - go-to, AUTO and "
+            "the autonomy node, docking included"
         )
 
     def _send_limit(self, master, speed_ms):

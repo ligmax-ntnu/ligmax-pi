@@ -156,12 +156,13 @@ class Dock(Behaviour):
                 ctx.state, target, ctx.heading, ctx.config,
                 f"at the dock waypoint, looking for a "
                 f"{self._berth_width():.0f} m berth ({elapsed:.0f} s)",
+                ceiling=ctx.ceiling,
             )
 
         from .base import steer_towards
 
         return steer_towards(
-            ctx, target, ctx.config.DOCK_SPEED_MS * 2.0,
+            ctx, target, _under(ctx, ctx.config.DOCK_SPEED_MS * 2.0),
             f"approaching the dock, {distance:.0f} m, looking for the berth",
         )
 
@@ -191,6 +192,7 @@ class Dock(Behaviour):
             ctx.state, approach, desired, ctx.config,
             f"squaring up for the berth ({offset:.1f} m off, "
             f"{misalignment:.0f} deg out)",
+            ceiling=ctx.ceiling,
         )
 
     def _enter(self, ctx):
@@ -225,13 +227,12 @@ class Dock(Behaviour):
         sideways, _f = geo.world_to_boat(
             centre[0] - ctx.boat[0], centre[1] - ctx.boat[1], ctx.heading
         )
+        lateral = _under(ctx, ctx.config.LATERAL_MAX_MS)
         return creep(
             ctx,
-            forward=ctx.config.DOCK_SPEED_MS,
+            forward=_under(ctx, ctx.config.DOCK_SPEED_MS),
             desired_heading=desired,
-            starboard=_clamp(
-                sideways * 0.5, -ctx.config.LATERAL_MAX_MS, ctx.config.LATERAL_MAX_MS
-            ),
+            starboard=_clamp(sideways * 0.5, -lateral, lateral),
             reason=f"entering the berth, {remaining:.2f} m to go",
         )
 
@@ -263,15 +264,16 @@ class Dock(Behaviour):
                 ctx.state, target, desired, ctx.config,
                 f"no lateral thruster configured - angling alongside, "
                 f"{gap:.2f} m off",
+                ceiling=ctx.ceiling,
             )
 
+        ahead = _under(ctx, ctx.config.DOCK_SPEED_MS)
+        lateral = _under(ctx, ctx.config.LATERAL_MAX_MS)
         return creep(
             ctx,
-            forward=_clamp(forward * 0.4, -ctx.config.DOCK_SPEED_MS, ctx.config.DOCK_SPEED_MS),
+            forward=_clamp(forward * 0.4, -ahead, ahead),
             desired_heading=desired,
-            starboard=_clamp(
-                sideways * 0.5, -ctx.config.LATERAL_MAX_MS, ctx.config.LATERAL_MAX_MS
-            ),
+            starboard=_clamp(sideways * 0.5, -lateral, lateral),
             reason=f"crabbing alongside, {gap:.2f} m off the dock",
         )
 
@@ -296,6 +298,7 @@ class Dock(Behaviour):
             ctx.state, target, desired, ctx.config,
             f"docked - holding {held:.0f}/{required:.0f} s"
             f"{'' if ctx.state.stationary else ' (still moving)'}",
+            ceiling=ctx.ceiling,
         )
 
     def _exit(self, ctx):
@@ -438,3 +441,17 @@ class Dock(Behaviour):
 
 def _clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def _under(ctx, wanted):
+    """`wanted`, held under the operator's speed setting. Every speed in here.
+
+    The docking figures are already slow - 0.3 m/s in, 0.35 m/s sideways - so at
+    the ordinary setting this changes nothing. It matters at the other end: an
+    operator who sets 0.1 m/s for a first berth attempt means the berth attempt,
+    and a manoeuvre that ignored the setting and crept in at three times it would
+    be the one place on the boat where the number on the panel was a decoration.
+
+    A cap and never a floor, so a high setting cannot make a berth approach brisk.
+    """
+    return min(float(wanted), ctx.ceiling)

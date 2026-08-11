@@ -43,6 +43,13 @@ colours, no clearances, no avoidance. That is what the parking task actually is 
 the marks around it are scenery, and a buoy in the mouth is not a reason to refuse
 to park.
 
+Two fields exist for the parking roles alone: `park_offset_m`, how deep into the
+space to sit, and `park_probe_deg`, **which way the docks are** from a waypoint
+laid just outside them. The second one is there because the boat has one
+forward-looking lidar (the aft unit is broken), so a berth a few metres further in
+is not visible from the waypoint at all, and the honest answer is to creep that
+way and look rather than to declare failure standing still.
+
 Coordinates
 -----------
 A waypoint may be given as `lat`/`lon` or as `x`/`y` grid metres - the dashboard
@@ -120,7 +127,8 @@ class Waypoint:
 
     __slots__ = (
         "index", "name", "lat", "lon", "role", "speed", "radius", "hold_s",
-        "channel_bearing", "berth_width_m", "park_offset_m", "notes",
+        "channel_bearing", "berth_width_m", "park_offset_m", "park_probe_deg",
+        "notes",
     )
 
     def __init__(self, index, name, lat, lon, role, **kwargs):
@@ -139,6 +147,14 @@ class Waypoint:
         # this waypoint only - which is what a space that turns out to be shorter
         # than the handbook says needs, without touching the other parking type.
         self.park_offset_m = kwargs.get("park_offset_m")
+        # Which way the docks are from this waypoint, as a true bearing. Used only
+        # when the parking space is not in view from the waypoint itself, which
+        # with one forward-looking lidar is the ordinary case rather than a fault:
+        # the boat creeps along this bearing until it finds three lines
+        # (`behaviours/parking.py:_probe`). Per waypoint because it is a fact about
+        # a berth, not about the boat - Havet arena's is about 120 degrees, in
+        # towards land, and `config.PARK_PROBE_BEARING_DEG` is that default.
+        self.park_probe_deg = kwargs.get("park_probe_deg")
         self.notes = kwargs.get("notes") or ""
 
     # ------------------------------------------------------------------ query
@@ -166,7 +182,7 @@ class Waypoint:
         }
         for key in (
             "speed", "radius", "hold_s", "channel_bearing", "berth_width_m",
-            "park_offset_m",
+            "park_offset_m", "park_probe_deg",
         ):
             value = getattr(self, key)
             if value is not None:
@@ -522,6 +538,12 @@ def _waypoint(position, item, origin, default_bearing):
         # on the panel when it had to.
         park_offset_m=_optional_float(
             item.get("park_offset_m"), -3.0, 3.0, position, "park_offset_m"
+        ),
+        # A compass bearing, so 0..360. Bounded rather than wrapped, because a
+        # bearing of 480 in a plan is a typo and wrapping it to 120 would hide
+        # that - and this is the number the boat drives blind towards a dock on.
+        park_probe_deg=_optional_float(
+            item.get("park_probe_deg"), 0.0, 360.0, position, "park_probe_deg"
         ),
         notes=str(item.get("notes") or "")[:120],
     )

@@ -59,6 +59,7 @@ from nodes.io_manager.edge_link import EdgeLink
 from nodes.io_manager.scan import front_scan
 
 from . import config
+from . import paths
 from .commander import Commander
 from .link import NodeLink
 from .perception import cluster_sweep, masks
@@ -83,6 +84,13 @@ SCAN_RELAY_PERIOD = 0.1
 # working?" without the dashboard, which is exactly the situation you are in
 # when the dashboard is the thing that is not working.
 HEARTBEAT_LOG_PERIOD = 10.0
+
+# Re-send the chart's path layers this often even when nothing about them has
+# changed. Only a backstop: they are sent the moment they change. What it
+# recovers from is another publisher replacing the list - `io_manager`'s mission
+# echo does exactly that - which would otherwise leave the wrong lines on the
+# chart until the plan next moved.
+PATHS_KEEPALIVE = 5.0
 
 _STOPPING = False
 
@@ -109,6 +117,10 @@ class Node:
         self._aft_clusters = []
         self._last_telemetry = 0.0
         self._last_relay = 0.0
+        # What the chart's path layers looked like when they were last sent, so
+        # an unchanged plan is not re-sent at 2 Hz. Cleared to force a resend.
+        self._paths_sig = None
+        self._paths_at = 0.0
         self._last_heartbeat_log = 0.0
         self.ticks = 0
         # Loop health, recorded every sample and published on the panel. A
@@ -192,7 +204,7 @@ class Node:
             perf=self._perf(started),
             survey=self.survey.telemetry(),
         )
-        self._publish(state, scans, now)
+        self._publish(state, scans, now, intent)
         self.ticks += 1
         self._last_tick_s = time.monotonic() - started
 
@@ -358,7 +370,12 @@ class Node:
             if name == "set_plan":
                 ok, result = self.pilot.set_plan(args.get("plan") or args, origin)
                 if ok:
-                    self._publish_route(state)
+                    # Draw the new course on the next telemetry tick rather than
+                    # here. `_paths_payload` sends the ideal route and the
+                    # committed path as one list, and a second sender would race
+                    # it - the layer replaces rather than merges. Half a second
+                    # is below noticing, and it costs one special case.
+                    self._paths_sig = None
             elif name == "autopilot_start":
                 ok, result = self.pilot.start()
                 if ok:
@@ -377,26 +394,23 @@ class Node:
                 self.recorder.stop("operator stopped autonomy")
                 # End of an attempt: this is the map attempt two starts from.
                 self.survey_save("attempt finished")
-            elif name in ("careful_on", "careful_off"):
-                # A speed ceiling the operator can drop to 1 kn and back while
-                # the boat is running. Takes effect on the next tick and does not
-                # interrupt the run - the point is to slow a pass down, not to
-                # stop it. `args.on` is accepted too so a single toggle command
-                # works from a dashboard that would rather send one name.
-                on = name == "careful_on"
-                if "on" in args:
-                    on = bool(args.get("on"))
-                ok, result = self.commander.set_careful(on)
-            elif name == "run_profile":
-                # Which of the two attempts this is. `survey` for the slow first
-                # pass that builds the map, `fast` for the second one that is
-                # driven off it (`profiles.py`). Like careful mode it takes
-                # effect on the next tick and does not interrupt a run, so the
-                # speed can be dropped mid-pass if the course turns out tighter
-                # than it looked from the dock.
-                ok, result = self.commander.set_profile(
-                    args.get("profile") or args.get("name")
-                )
+            elif name == "set_speed_limit":
+                # **The one speed setting, and the one command that sets it.**
+                # io_manager owns this command as well - it is the hand-flown
+                # go-to's cap and the AUTO mission speed there
+                # (`io_manager/guided.py`) - so it is deliberately handled in
+                # both nodes off the same press, and deliberately **not acked
+                # here**: io_manager acks it, and two answers to one command is
+                # worse than none (`autopilot_bridge.SHARED_COMMANDS`).
+                #
+                # Takes effect on the next tick and does not interrupt a run.
+                # Every behaviour is held to it, docking included, which is the
+                # whole point: 0.1 m/s means a berth approach at 0.1 m/s.
+                ok, result = self.commander.set_speed(args.get("value"))
+                if not ok:
+                    log.warning("set_speed_limit refused: %s", result)
+                self.recorder.event("command_result", name=name, ok=ok, result=result)
+                continue
             elif name == "alternation":
                 # The cardinal alternation prior, off by default. See
                 # `behaviours/alternation.py` - it is an inference, and switching
@@ -449,7 +463,7 @@ class Node:
 
     # --------------------------------------------------------------- telemetry
 
-    def _publish(self, state, scans, now):
+    def _publish(self, state, scans, now, intent=None):
         # The front cloud, relayed so the operator's chart keeps its plot. This
         # node holds 3401, so without this the coloured cloud would vanish from
         # the dashboard the moment autonomy started - which is exactly when
@@ -480,8 +494,8 @@ class Node:
             return
         self._last_telemetry = now
 
-        self.link.telemetry(
-            autopilot={
+        blocks = {
+            "autopilot": {
                 **self.pilot.telemetry(state, self.world),
                 "commander": self.commander.telemetry(),
                 "recording": self.recorder.telemetry(),
@@ -499,30 +513,53 @@ class Node:
                 "bus": self.link.stats(),
                 "ticks": self.ticks,
             },
-            tracks=self.world.telemetry(now=now),
-        )
+            "tracks": self.world.telemetry(now=now),
+        }
+        if (layers := self._paths_payload(state, intent, now)) is not None:
+            blocks["paths"] = layers
+        self.link.telemetry(**blocks)
 
-    def _publish_route(self, state):
-        """The plan as the chart's ideal-route layer, roles and all. NJORD §11.4.
+    def _paths_payload(self, state, intent, now):
+        """The chart's two lines, or None when there is nothing new to say.
 
-        The roles ride along with the points because a Njord course is a list of
-        places *plus what to do between them*, and a chart that draws only the
-        line cannot show that leg 5 is a dock and leg 3 obeys the buoy rules.
-        That is also the cheapest place to catch a role typed into the wrong row:
-        it is visible on the map the moment the upload is acked, rather than at
-        the moment the boat sails past a gate on the wrong side.
+        Both layers go in one `paths` list because the list **replaces** rather
+        than merges (`ligmax-server/ligmax_gui/state.py`, `_merge`): a frame that
+        carried only the cyan committed path would wipe the amber ideal route off
+        the chart, and one that carried only the amber would wipe the cyan. See
+        `paths.py`.
+
+        Two reasons this is not simply sent every time:
+
+        **Silence is not the same as an empty list.** With no plan loaded, this
+        node has no opinion about the layer and must not publish one - the
+        `paths` `io_manager` echoes back after an admin-laid MAVLink mission
+        upload (`nodes/io_manager/main.py`, `finish_mission`) is the only thing
+        on the chart in that state, and a stream of empty lists from here would
+        hold it permanently blank.
+
+        **An unchanged plan is not worth 2 Hz of 4G.** The reference route is a
+        dozen waypoints with their roles and names attached and it only changes
+        when the plan does. The keepalive still re-sends it every few seconds, so
+        a mission echo that lands on top of these layers is corrected rather than
+        left standing.
         """
-        if self.pilot.plan is None or state is None or not state.origin:
-            return
-        layer = self.pilot.plan.reference_layer(state.origin)
-        if layer["points"]:
-            self.link.telemetry(
-                path={
-                    **layer,
-                    "kind": "reference",
-                    "label": f"plan: {self.pilot.plan.name}",
-                }
-            )
+        if self.pilot.plan is None:
+            return None
+        layers = paths.layers(state, intent, self.pilot.plan)
+        if not layers:
+            # A plan is loaded but nothing about it can be drawn yet - no origin,
+            # so no grid to place it on. Silence, not an empty list: this node
+            # only ever asserts lines, it never blanks the chart, and before the
+            # first fix the honest state is "I have not said anything".
+            return None
+        # Rounded to the centimetre by `paths.py` before it gets here, so an aim
+        # point jittering below that does not count as a change.
+        signature = repr(layers)
+        if signature == self._paths_sig and now - self._paths_at < PATHS_KEEPALIVE:
+            return None
+        self._paths_sig = signature
+        self._paths_at = now
+        return layers
 
 
 def _listify(points):

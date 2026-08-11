@@ -146,7 +146,7 @@ class Pilot:
             clusters=clusters,
             sweeps=sweeps,
             ceiling=self.commander.ceiling,
-            run=self.commander.run,
+            alternation=self.commander.alternation,
         )
 
         # A new waypoint means a new behaviour, and a fresh progress clock.
@@ -242,7 +242,14 @@ class Pilot:
         # "turn" joins them for the parking roles: an alongside park rotates 90
         # degrees on the spot inside the space, and standing still while doing it is
         # the behaviour working rather than the boat being stuck.
-        if getattr(self.behaviour, "phase", None) in ("hold", "exit", "turn"):
+        # "probe" is the opposite shape and the same conclusion: a park whose berth
+        # is not in view from the waypoint drives deliberately AWAY from it looking
+        # for the space (`behaviours/parking.py:_probe`), so distance-to-target grows
+        # by design. It raises its own `stuck` with a sentence when the probe runs
+        # out, which is the honest place for the badge.
+        if getattr(self.behaviour, "phase", None) in (
+            "hold", "exit", "turn", "probe"
+        ):
             self._progress_at = now
             return
         if self._best_distance is None or distance < self._best_distance - PROGRESS_M:

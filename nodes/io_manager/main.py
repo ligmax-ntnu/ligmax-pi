@@ -64,8 +64,10 @@ What it does:
     `goto` sends the vessel to one point on the chart in GUIDED and
     `set_speed_limit` sets the ground speed it uses - and, since that goes out
     as DO_CHANGE_SPEED, the speed an AUTO mission runs at as well
-    (`guided.py`); both are the hand-flown route, and neither is the autonomy
-    node's own planning or its careful-mode ceiling;
+    (`guided.py`), and since 2026-08-11 the autonomy node's one speed setting
+    too, because it is in `autopilot_bridge.SHARED_COMMANDS`: one number for the
+    hand-flown go-to, an AUTO mission and every autonomous behaviour including
+    docking;
     `safety_on`/`safety_off` press the Pixhawk's own safety switch and
     `compass_cal` runs ArduPilot's large-vehicle mag cal from one known
     heading (`preflight.py`), both acked from the autopilot's COMMAND_ACK
@@ -96,7 +98,11 @@ from pymavlink import mavutil
 
 from config import LOGGING_PORT, pixhawk_port
 
-from .autopilot_bridge import AUTOPILOT_COMMANDS, AutopilotBridge
+from .autopilot_bridge import (
+    AUTOPILOT_COMMANDS,
+    SHARED_COMMANDS,
+    AutopilotBridge,
+)
 from .bms import BmsReader
 from .edge_link import ENABLED as EDGE_LINK_ENABLED, EdgeLink
 from .emergency_stop import BatteryHoming, EstopRelay
@@ -501,6 +507,21 @@ def handle_commands(
         if machine is not None:
             machine.note_operator()
 
+        # Commands both nodes act on, off the same press - today just
+        # `set_speed_limit`, which is the go-to/AUTO cap here and the autonomy
+        # node's whole speed setting there. Copied onto the bus and then handled
+        # by the chain below as well, deliberately outside it: **this node acks
+        # it** and the autonomy node deliberately does not, so two answers to one
+        # command cannot happen (`autopilot_bridge.SHARED_COMMANDS`).
+        #
+        # Copied before it is validated, on purpose. The autonomy node applies the
+        # same bounds (`self_driving/commander.set_speed`), so a value this node
+        # refuses is one that node refuses too and the worst case is a warning
+        # line in the vessel journal - whereas forwarding only what passed here
+        # would let the two ends disagree about which is holding the boat back.
+        if name in SHARED_COMMANDS and bridge is not None and bridge.available:
+            for_autopilot.append(command)
+
         if name in AUTOPILOT_COMMANDS:
             # The autonomy node's, not ours. Collected here and put on the node
             # bus by the caller; it acks them itself.
@@ -625,9 +646,12 @@ def handle_commands(
             # 5 knots rather than clamped, so an operator who typed 4 m/s is told
             # rather than quietly given 2.57.
             #
-            # This is not the autonomy node's ceiling: that is careful mode and
-            # `self_driving/config.py`, it rides up separately as
-            # `autopilot.commander`, and nothing here touches it.
+            # **Since 2026-08-11 it is also the autonomy node's speed**, because
+            # it is in `SHARED_COMMANDS` and was copied onto the node bus at the
+            # top of this loop. One number now covers the hand-flown go-to, an
+            # AUTO mission and every autonomous behaviour including a berth
+            # approach; careful mode and `run_profile` are gone. This branch still
+            # only speaks for this node's half - the autonomy node logs its own.
             if master is None:
                 ok, result = False, "no autopilot link"
             elif guided is None:

@@ -284,7 +284,7 @@ class FakeLink:
 
 
 def run(plan, obstacles, start=(0.0, 0.0), heading=0.0, seconds=180.0, dt=0.1,
-        moving=(), watch=None, profile=None, alternation=False, world=None):
+        moving=(), watch=None, speed=None, alternation=False, world=None):
     """Fly a plan. Returns `(pilot, boat, track, ticks)`.
 
     `watch(pilot, world, boat, now)` is called every tick, for the assertions
@@ -292,18 +292,18 @@ def run(plan, obstacles, start=(0.0, 0.0), heading=0.0, seconds=180.0, dt=0.1,
     a track that was committed and then aged out, a docking phase that was
     entered and left, are invisible from the final state.
 
-    `profile` selects a run profile the way the operator's command does, and
-    `world` lets a run start from a world model an earlier run left behind -
-    which is the whole two-attempt story (`profiles.py`) and cannot be tested
-    without flying one run into the next.
+    `speed` sets the operator's one speed setting the way `set_speed_limit`
+    does, and `world` lets a run start from a world model an earlier run left
+    behind - which is the whole two-attempt story (`survey.py`) and cannot be
+    tested without flying one run into the next.
     """
     boat = FakeBoat(start, heading)
     link = FakeLink(boat)
     commander = commander_module.Commander(link, config)
-    if profile is not None:
-        ok, why = commander.set_profile(profile)
+    if speed is not None:
+        ok, why = commander.set_speed(speed)
         assert ok, why
-    commander.run.alternation = bool(alternation)
+    commander.alternation = bool(alternation)
     pilot = Pilot(config, commander)
     pilot.plan = plan
     pilot.start()
@@ -1191,8 +1191,8 @@ def test_commander():
     commander.send(over, state)
     sent = [m for m in link.messages if m.get("cmd") == "position_target"]
     check(
-        sent and sent[0]["speed"] <= config.MAX_SPEED_MS,
-        "an absurd speed is clamped to the cap",
+        sent and sent[0]["speed"] <= config.SPEED_MS,
+        "an absurd speed is clamped to the speed setting in force",
     )
 
     link.messages.clear()
@@ -1530,7 +1530,7 @@ def test_memory():
 
 
 def test_speed_limit():
-    """The 5 knot vessel limit, and careful mode's 1 knot, at every seam.
+    """The 5 knot vessel limit, and the operator's own speed, at every seam.
 
     Written as an attack rather than as a demonstration: each check is a way
     somebody could plausibly get the boat over the limit, and asserts that they
@@ -1563,11 +1563,13 @@ def test_speed_limit():
         def control(self, **fields):
             self.sent.append(fields)
 
-    def commanded(intent, careful=False):
+    def commanded(intent, speed=None):
         """The speed actually put on the wire for one intent, m/s."""
         link = _Link()
         commander = cm.Commander(link, config)
-        commander.careful = careful
+        if speed is not None:
+            ok, why = commander.set_speed(speed)
+            assert ok, why
         state = BoatState(
             {"origin": ORIGIN, "boat": {"position": [0.0, 0.0], "heading_deg": 0.0}}
         )
@@ -1586,13 +1588,14 @@ def test_speed_limit():
         return max(speeds) if speeds else 0.0
 
     # A behaviour asking for an absurd speed.
-    fast = commanded(cm.goto((100.0, 0.0), 99.0, "attack"))
+    wide = config.SPEED_LIMIT_MS
+    fast = commanded(cm.goto((100.0, 0.0), 99.0, "attack"), speed=wide)
     check(fast <= limit + 1e-6, f"a goto at 99 m/s goes out at {fast:.3f} m/s")
 
     # ...and in body-velocity form, forwards and astern.
-    fwd = commanded(cm.move(forward=99.0, reason="attack"))
+    fwd = commanded(cm.move(forward=99.0, reason="attack"), speed=wide)
     check(fwd <= limit + 1e-6, f"a 99 m/s forward velocity goes out at {fwd:.3f} m/s")
-    astern = commanded(cm.move(forward=-99.0, reason="attack"))
+    astern = commanded(cm.move(forward=-99.0, reason="attack"), speed=wide)
     check(
         astern <= limit + 1e-6,
         f"the limit is symmetric - 99 m/s astern goes out at {astern:.3f} m/s",
@@ -1602,7 +1605,8 @@ def test_speed_limit():
     # ceiling plus the lateral thruster is over the limit while each axis is
     # legal on its own.
     both = commanded(
-        cm.move(forward=limit, starboard=config.LATERAL_MAX_MS, reason="attack")
+        cm.move(forward=limit, starboard=config.LATERAL_MAX_MS, reason="attack"),
+        speed=wide,
     )
     naive = math.hypot(limit, config.LATERAL_MAX_MS)
     check(
@@ -1617,7 +1621,7 @@ def test_speed_limit():
     )
 
     # A NaN speed is a stop, not an undefined command to ArduPilot.
-    nan = commanded(cm.move(forward=float("nan"), reason="attack"))
+    nan = commanded(cm.move(forward=float("nan"), reason="attack"), speed=wide)
     check(nan == 0.0, f"a NaN velocity goes out as {nan:.3f} m/s, not as NaN")
 
     # A plan cannot ask for more than the limit, and is refused in words.
@@ -1651,60 +1655,111 @@ def test_speed_limit():
     )
     check(ok_plan.waypoints[0].speed == 2.5, "a 2.5 m/s waypoint is still accepted")
 
-    # ---------------------------------------------------------- careful mode
-    section("careful mode (1 knot)")
+    # ------------------------------------------------------ the one setting
+    section("the operator's one speed setting")
 
-    careful = config.CAREFUL_SPEED_MS
     check(
-        abs(config.CAREFUL_SPEED_KNOTS - 1.0) < 1e-9,
-        f"careful mode is {config.CAREFUL_SPEED_KNOTS} knot ({careful:.4f} m/s)",
-    )
-    check(careful < limit, "careful mode is slower than the vessel limit")
-
-    slow = commanded(cm.goto((100.0, 0.0), 99.0, "attack"), careful=True)
-    check(
-        slow <= careful + 1e-6,
-        f"in careful mode a goto at 99 m/s goes out at {slow:.3f} m/s "
-        f"({slow / config.KNOT_MS:.2f} kn)",
-    )
-    slow_vel = commanded(
-        cm.move(forward=99.0, starboard=99.0, reason="attack"), careful=True
+        not hasattr(config, "CAREFUL_SPEED_MS")
+        and not hasattr(config, "DEFAULT_PROFILE"),
+        "careful mode and the run profiles are gone - there is one speed",
     )
     check(
-        slow_vel <= careful + 1e-6,
-        f"...and a body velocity at {slow_vel:.3f} m/s",
+        abs(config.SPEED_MIN_MS - 0.1) < 1e-9,
+        f"the floor is {config.SPEED_MIN_MS} m/s, low enough for a dockside "
+        f"parking test",
     )
 
-    # Even a waypoint that legally asks for 2.5 m/s is held to 1 kn.
     link = _Link()
     commander = cm.Commander(link, config)
-    ok, message = commander.set_careful(True)
-    check(ok and commander.careful, f"careful mode switches on: {message}")
-    ctx_speed = None
+    check(
+        abs(commander.ceiling - config.SPEED_MS) < 1e-9,
+        f"a fresh node boots at {config.SPEED_MS:.2f} m/s, the tuned figure",
+    )
+
+    slow = 0.1
+    ok, message = commander.set_speed(slow)
+    check(
+        ok and abs(commander.ceiling - slow) < 1e-9,
+        f"the operator can set 0.1 m/s for a first parking test: {message}",
+    )
+
+    # ...and it is real on the wire, not just in the object.
+    held = commanded(cm.goto((100.0, 0.0), 99.0, "attack"), speed=slow)
+    check(
+        held <= slow + 1e-6,
+        f"at 0.1 m/s a goto asking for 99 m/s goes out at {held:.3f} m/s",
+    )
+    held_vel = commanded(
+        cm.move(forward=99.0, starboard=99.0, reason="attack"), speed=slow
+    )
+    check(
+        held_vel <= slow + 1e-6,
+        f"...and a body velocity at {held_vel:.3f} m/s, resultant and all",
+    )
+
+    # Refused rather than clamped, at both ends - an operator who typed 4 and
+    # silently got 2.57 would believe the boat was doing 4.
+    for bad in (0.0, 0.05, 4.0, float("nan"), float("inf"), "quick", None):
+        was = commander.ceiling
+        ok, message = commander.set_speed(bad)
+        check(
+            not ok and abs(commander.ceiling - was) < 1e-9,
+            f"set_speed({bad!r}) is refused and changes nothing: {message}",
+        )
+    ok, _message = commander.set_speed(config.SPEED_LIMIT_MS)
+    check(ok, "the vessel limit itself is a legal setting")
+
+    # A behaviour PLANS at the setting rather than asking for more and being
+    # clamped on the way out, which is the difference between a panel that
+    # reports 0.1 m/s and one that reports 1.2 while the boat does 0.1.
     from nodes.self_driving.behaviours.base import Context
 
+    commander.set_speed(slow)
+    ctx = Context(
+        state=None, world=None, plan=None, config=config, now=0.0,
+        waypoint=None, leg=None, task="transit",
+        ceiling=commander.ceiling,
+    )
+    check(
+        ctx.cruise_speed <= slow + 1e-9 and ctx.caution_speed <= slow + 1e-9,
+        f"a behaviour plans at {ctx.cruise_speed:.3f} m/s on an open leg and "
+        f"{ctx.caution_speed:.3f} among marks",
+    )
+
+    # The waypoint's own speed is still honoured, and still capped by the setting.
     ctx = Context(
         state=None, world=None, plan=None, config=config, now=0.0,
         waypoint=ok_plan.waypoints[0], leg=None, task="transit",
         ceiling=commander.ceiling,
     )
-    ctx_speed = ctx.speed_limit(config.CRUISE_SPEED_MS)
     check(
-        ctx_speed <= careful + 1e-9,
-        f"a behaviour PLANS at {ctx_speed:.3f} m/s, rather than asking for more "
-        f"and being clamped on the way out",
+        ctx.speed_limit(config.SPEED_LIMIT_MS) <= slow + 1e-9,
+        f"a waypoint asking for 2.5 m/s is held to the setting "
+        f"({ctx.speed_limit(config.SPEED_LIMIT_MS):.3f} m/s)",
     )
 
-    ok, message = commander.set_careful(False)
+    # Docking is under the setting too, which is the whole reason it is one
+    # number: `station_keep` is what every hold and every squaring-up runs on.
+    state = BoatState(
+        {"origin": ORIGIN, "boat": {"position": [0.0, 0.0], "heading_deg": 0.0}}
+    )
+    pull = cm.station_keep(state, (0.0, 8.0), 0.0, config, "hold", ceiling=slow)
     check(
-        ok and not commander.careful and commander.ceiling > careful,
-        f"careful mode switches off again: {message}",
+        math.hypot(pull.vx, pull.vy) <= slow + 1e-9,
+        f"a station-keeping pull-back at 0.1 m/s is {pull.vx:.3f} m/s, not the "
+        f"{config.DOCK_SPEED_MS} m/s docking creep",
+    )
+    loose = cm.station_keep(state, (0.0, 8.0), 0.0, config, "hold")
+    check(
+        loose.vx > slow,
+        f"...and with no setting passed it is the docking creep as before "
+        f"({loose.vx:.3f} m/s)",
     )
 
-    # Careful mode can only ever slow the boat, never speed it up.
+    # The setting can never raise the vessel limit.
     check(
-        cm.CAREFUL_CEILING_MS <= cm.CEILING_MS,
-        "careful mode's ceiling can never exceed the ordinary one",
+        cm.CEILING_MS <= config.SPEED_LIMIT_MS + 1e-9,
+        "the module ceiling is the vessel limit and nothing looser",
     )
 
 
@@ -1774,80 +1829,82 @@ def worst_miss(track, points):
     return worst
 
 
-def test_profiles():
-    section("run profiles - the slow attempt and the fast one")
+def test_speed_setting():
+    """One number the operator sets, and what it does and does not touch."""
+    section("the one speed setting")
 
-    from nodes.self_driving import profiles
+    from nodes.self_driving.behaviours.base import Context, dynamic_clearance
 
     limit = config.SPEED_LIMIT_MS
-    for name, profile in sorted(profiles.PROFILES.items()):
-        check(
-            profile.ceiling_ms <= limit + 1e-9,
-            f"the {name} profile's ceiling is inside the 5 kn vessel limit "
-            f"({profile.ceiling_kn:.2f} kn)",
-        )
-        check(
-            profile.cruise_ms <= profile.ceiling_ms + 1e-9
-            and profile.caution_ms <= profile.ceiling_ms + 1e-9,
-            f"...and the {name} profile never plans above its own ceiling",
-        )
-
-    fast = profiles.PROFILES[profiles.FAST]
     check(
-        abs(fast.ceiling_ms - limit) < 1e-9,
-        f"the fast profile goes all the way to the limit and no further "
-        f"({fast.ceiling_kn:.2f} kn)",
-    )
-    survey = profiles.PROFILES[profiles.SURVEY]
-    check(
-        abs(survey.ceiling_ms - config.CAREFUL_SPEED_MS) < 1e-9,
-        f"the survey profile is careful mode's 1 kn ({survey.ceiling_ms:.2f} m/s)",
+        config.SPEED_MS <= limit + 1e-9 and config.SPEED_MIN_MS > 0.0,
+        f"the boot setting ({config.SPEED_MS:.2f} m/s) is inside the limit and "
+        f"the floor ({config.SPEED_MIN_MS} m/s) is above zero",
     )
 
-    # The property Task 2 depends on, stated as a test rather than as a comment.
-    # A gate is a red/green pair 5 m apart (NJORD 9.2), so the boat has 2.5 m to
-    # play with either side of the centreline; a speed term on the normal profile
-    # would eat it and the boat would refuse a gate it is meant to drive through.
-    for name in (profiles.NORMAL, profiles.SURVEY):
-        check(
-            profiles.PROFILES[name].clearance_per_ms == 0.0,
-            f"the {name} profile adds no speed term to clearance, so a 5 m gate "
-            f"stays passable",
+    def ctx_at(setting):
+        return Context(
+            state=None, world=None, plan=None, config=config, now=0.0,
+            waypoint=None, leg=None, task="buoys", ceiling=setting,
         )
+
+    # The setting IS the cruise. Everything the code holds slower stays slower.
+    fast = ctx_at(limit)
+    check(
+        abs(fast.cruise_speed - limit) < 1e-9,
+        f"an open leg runs at the setting ({fast.cruise_speed:.2f} m/s)",
+    )
+    check(
+        abs(fast.caution_speed - fast.cruise_speed) < 1e-9,
+        f"...and so does a buoy leg: one setting, not a second figure for marks "
+        f"({fast.caution_speed:.2f} m/s)",
+    )
+    crawl = ctx_at(0.1)
+    check(
+        crawl.cruise_speed <= 0.1 + 1e-9 and crawl.caution_speed <= 0.1 + 1e-9,
+        "and a 0.1 m/s setting slows both, because it is a ceiling as well",
+    )
+
+    # The clearance speed term. Zero by default, and that is the Task 2 property
+    # stated as a test rather than as a comment: a gate is a red/green pair 5 m
+    # apart (NJORD 9.2), so the boat has 2.5 m either side of the centreline, and
+    # a speed term would eat it and make the boat refuse a gate it is meant to
+    # drive through.
+    check(
+        config.CLEARANCE_PER_MS == 0.0,
+        "no speed term on clearance by default, so a 5 m gate stays passable",
+    )
+    check(
+        dynamic_clearance(ctx_at(limit)) == 0.0,
+        "...so even at 5 kn a mark claims no extra water",
+    )
     gate_half = 5.0 / 2.0
-    normal_room = config.BUOY_CLEARANCE_M + config.TRACK_SIGMA_M
+    room = config.BUOY_CLEARANCE_M + config.TRACK_SIGMA_M
     check(
-        normal_room < gate_half,
-        f"a freshly seen gate buoy claims {normal_room:.2f} m of the {gate_half:.1f} m "
+        room < gate_half,
+        f"a freshly seen gate buoy claims {room:.2f} m of the {gate_half:.1f} m "
         f"half-gate",
     )
-    check(fast.clearance_per_ms > 0.0, "the fast profile does add one")
 
-    # What that term is worth where it is switched on.
-    at_speed = min(
-        config.CLEARANCE_SPEED_MAX_M, fast.clearance_per_ms * fast.ceiling_ms
-    )
-    check(
-        at_speed > 1.5,
-        f"at full speed the fast profile buys {at_speed:.1f} m of extra water "
-        f"round every mark",
-    )
+    # Switched on - which is what a Task 1 pass with no gates in it wants - it is
+    # worth real metres, and it is capped.
+    was = config.CLEARANCE_PER_MS
+    config.CLEARANCE_PER_MS = 1.0
+    try:
+        at_speed = dynamic_clearance(ctx_at(limit))
+        check(
+            at_speed > 1.0,
+            f"with LIGMAX_AP_CLEARANCE_PER_MS set, full speed buys "
+            f"{at_speed:.1f} m of extra water round every mark",
+        )
+        check(
+            at_speed <= config.CLEARANCE_SPEED_MAX_M + 1e-9,
+            f"...capped at CLEARANCE_SPEED_MAX_M ({config.CLEARANCE_SPEED_MAX_M} m)",
+        )
+    finally:
+        config.CLEARANCE_PER_MS = was
 
-    # Selection, and refusing to select nonsense.
-    mode = profiles.RunMode(config)
-    check(mode.profile.name == profiles.NORMAL, "a fresh node is in the normal profile")
-    check(not mode.alternation, "...with the alternation prior off")
-    ok, message = mode.set_profile("fast")
-    check(ok and mode.profile.name == profiles.FAST, f"fast selects: {message}")
-    ok, message = mode.set_profile("ludicrous")
-    check(
-        not ok and "fast" in message and mode.profile.name == profiles.FAST,
-        f"an unknown profile is refused and changes nothing: {message}",
-    )
-    ok, _message = mode.set_profile("survey")
-    check(ok and mode.careful, "the survey profile IS careful mode, not a rival to it")
-
-    # ...and that the ceiling is real on the wire, not just in the object.
+    # And the ceiling is real on the wire at every setting, not just in the object.
     class _Link:
         def __init__(self):
             self.sent = []
@@ -1855,10 +1912,11 @@ def test_profiles():
         def control(self, **fields):
             self.sent.append(fields)
 
-    def wire_speed(profile_name):
+    def wire_speed(setting):
         link = _Link()
         commander = commander_module.Commander(link, config)
-        commander.set_profile(profile_name)
+        ok, why = commander.set_speed(setting)
+        assert ok, why
         state = BoatState(
             {"origin": ORIGIN, "boat": {"position": [0.0, 0.0], "heading_deg": 0.0}}
         )
@@ -1870,17 +1928,27 @@ def test_profiles():
         )
 
     check(
-        abs(wire_speed("fast") - limit) < 1e-6,
-        f"in the fast profile a 99 m/s request goes out at {wire_speed('fast'):.3f} m/s "
-        f"- the vessel limit, not more",
+        abs(wire_speed(limit) - limit) < 1e-6,
+        f"at the 5 kn setting a 99 m/s request goes out at {wire_speed(limit):.3f} "
+        f"m/s - the vessel limit, not more",
     )
+    for setting in (0.1, 0.5, 1.2, 2.0):
+        out = wire_speed(setting)
+        check(
+            out <= setting + 1e-6,
+            f"at a {setting} m/s setting it goes out at {out:.3f} m/s",
+        )
+
+    # The alternation prior lives on the commander now that the profiles are gone.
+    commander = commander_module.Commander(_Link(), config)
+    check(not commander.alternation, "a fresh node has the alternation prior off")
+    ok, message = commander.set_alternation(True)
+    check(ok and commander.alternation, f"it can be switched on: {message}")
+    block = commander.telemetry()
     check(
-        wire_speed("normal") <= config.MAX_SPEED_MS + 1e-6,
-        "in the normal profile it is still held to the tuned 1.6 m/s",
-    )
-    check(
-        wire_speed("survey") <= config.CAREFUL_SPEED_MS + 1e-6,
-        "and in the survey profile to 1 kn",
+        block.get("speed_ms") is not None and block.get("alternation") is True,
+        f"and both ride up in the telemetry ({block.get('speed_ms')} m/s, "
+        f"alternation {block.get('alternation')})",
     )
 
 
@@ -1888,11 +1956,15 @@ def test_corner_speed():
     section("how fast a corner allows")
 
     from nodes.self_driving.behaviours.base import Context, corner_speed_limit
-    from nodes.self_driving import profiles
 
     payload, points = real_course()
 
-    def limit_at(index, distance_out, profile=profiles.FAST):
+    # The two settings worth probing: wide open, and the 1 kn walk-alongside pace
+    # that used to be a mode of its own.
+    WIDE = config.SPEED_LIMIT_MS
+    WALK = 1.0 * config.KNOT_MS
+
+    def limit_at(index, distance_out, speed=None):
         """The speed allowed `distance_out` metres before waypoint `index`."""
         plan = Plan.parse(payload, ORIGIN)
         plan.index = index
@@ -1905,12 +1977,10 @@ def test_corner_speed():
                 "boat": {"position": list(boat), "heading_deg": bearing},
             }
         )
-        run_mode = profiles.RunMode(config)
-        run_mode.set_profile(profile)
         ctx = Context(
             state=state, world=None, plan=plan, config=config, now=0.0,
             waypoint=plan.current, leg=(start, end), task="buoys",
-            ceiling=run_mode.profile.ceiling_ms, run=run_mode,
+            ceiling=WIDE if speed is None else speed,
         )
         return corner_speed_limit(ctx, ctx.cruise_speed)
 
@@ -1919,8 +1989,8 @@ def test_corner_speed():
     # limiter has to have finished its work.
     tight, note = limit_at(9, 0.3)
     check(
-        tight < config.FAST_CRUISE_SPEED_MS * 0.8,
-        f"the 123 deg corner at 3.2 holds the fast profile down to "
+        tight < WIDE * 0.8,
+        f"the 123 deg corner at 3.2 holds a 5 kn setting down to "
         f"{tight:.2f} m/s ({tight / config.KNOT_MS:.1f} kn): {note}",
     )
     check("deg turn" in note, f"...and says why, in words: {note}")
@@ -1935,17 +2005,28 @@ def test_corner_speed():
 
     # A gentle corner does not limit at all. Waypoint 3 (`1.2` -> `1.3`) turns 13
     # degrees, which is a kink.
+    # A gentle corner barely limits at all, which is the proportionality the whole
+    # limiter is for. Waypoint 3 (`1.2` -> `1.3`) turns 13 degrees, which is a kink.
+    # At a 5 kn setting even a kink shaves something off - 2.57 m/s is a 6.6 m
+    # radius at the hull's assumed grip - and that is honest rather than a bug; what
+    # matters is how much less it takes than the 123 degree corner does.
     gentle, note = limit_at(3, 2.0)
     check(
-        abs(gentle - config.FAST_CRUISE_SPEED_MS) < 1e-9 and note == "",
-        f"a 13 deg kink is not a corner and is not slowed ({gentle:.2f} m/s)",
+        gentle > tight * 1.4,
+        f"a 13 deg kink is barely limited ({gentle:.2f} m/s) next to the 123 deg "
+        f"corner ({tight:.2f} m/s)",
+    )
+    below = limit_at(3, 2.0, speed=1.6)
+    check(
+        abs(below[0] - 1.6) < 1e-9 and below[1] == "",
+        f"...and at 1.6 m/s it is not limited at all ({below[0]:.2f} m/s)",
     )
 
-    # The survey profile is already below every corner's limit, so the limiter
-    # never fires - the slow attempt is not made slower still.
-    slow, note = limit_at(10, 2.0, profile=profiles.SURVEY)
+    # A 1 kn setting is already below every corner's limit, so the limiter never
+    # fires - a slow pass is not made slower still.
+    slow, note = limit_at(10, 2.0, speed=WALK)
     check(
-        abs(slow - config.CAREFUL_SPEED_MS) < 1e-9,
+        abs(slow - WALK) < 1e-9,
         f"at 1 kn the corner limiter has nothing to do ({slow:.2f} m/s)",
     )
 
@@ -1987,13 +2068,17 @@ def test_fast_course():
     section("the real Task 1 course, flown fast")
 
     from nodes.self_driving.behaviours import transit as transit_module
-    from nodes.self_driving import profiles
 
     payload, points = real_course()
     radius = config.WAYPOINT_RADIUS_M
+    WALK = 1.0 * config.KNOT_MS   # the walk-alongside pace, as a setting
+    # The fastest setting that still flies this course clean, and it is NOT the
+    # vessel limit - see the check at the end of this test, which is the whole
+    # reason the number is written down here. 2.2 m/s is 4.3 kn.
+    FAST = 2.2
 
     _pilot, _boat, slow_track, _ticks = run(
-        Plan.parse(payload, ORIGIN), [], seconds=600.0, profile=profiles.SURVEY
+        Plan.parse(payload, ORIGIN), [], seconds=600.0, speed=WALK
     )
     index, missed = worst_miss(slow_track, points)
     check(
@@ -2005,17 +2090,17 @@ def test_fast_course():
     check(slow_s is not None, f"...and it reaches GPS 4, in {slow_s} s")
 
     _pilot, _boat, fast_track, _ticks = run(
-        Plan.parse(payload, ORIGIN), [], seconds=600.0, profile=profiles.FAST
+        Plan.parse(payload, ORIGIN), [], seconds=600.0, speed=FAST
     )
     index, missed = worst_miss(fast_track, points)
     check(
         missed <= radius,
-        f"and in the fast profile too (worst was #{index} at {missed:.1f} m)",
+        f"and at a {FAST} m/s setting too (worst was #{index} at {missed:.1f} m)",
     )
     fast_s = seconds_to_finish(fast_track, points, config.ARRIVAL_RADIUS_M)
     check(
         fast_s is not None and slow_s is not None and fast_s < slow_s,
-        f"the fast attempt is actually faster: {fast_s:.0f} s against "
+        f"the fast setting is actually faster: {fast_s:.0f} s against "
         f"{slow_s:.0f} s to GPS 4, a "
         f"{1.0 - (fast_s / slow_s if slow_s else 1.0):.0%} saving",
     )
@@ -2039,7 +2124,7 @@ def test_fast_course():
     from nodes.self_driving.behaviours import base as base_module
     from nodes.self_driving.behaviours import buoys as buoys_module
 
-    def fly_with_hull(lateral_accel, paced):
+    def fly_with_hull(lateral_accel, paced, speed=None):
         was = FakeBoat.MAX_LATERAL_ACCEL
         FakeBoat.MAX_LATERAL_ACCEL = lateral_accel
         saved = (
@@ -2061,7 +2146,7 @@ def test_fast_course():
         try:
             _p, _b, flown, _t = run(
                 Plan.parse(payload, ORIGIN), [], seconds=600.0,
-                profile=profiles.FAST, watch=count,
+                speed=FAST if speed is None else speed, watch=count,
             )
         finally:
             (
@@ -2093,41 +2178,85 @@ def test_fast_course():
         loose_s is None or loose_s > (paced_s or 0.0),
         f"...and does not, unpaced (reached GPS 4 at {loose_s} s)",
     )
+    # What the pacing does NOT buy, which is worth stating because the previous
+    # version of this test asserted it and it was never the pacing's doing.
+    #
+    # With a hull 25 % weaker than assumed, 2.2 m/s misses marks whether the boat
+    # paces itself or not - 4.9 m and 3.8 m worst miss against a 3 m radius. What
+    # used to keep that line tight was the old fast profile's *second* number, a
+    # 1.6 m/s caution speed among marks, and there is no second number any more:
+    # there is one setting, and the way to buy margin against the hull being worse
+    # than the config believes is to turn it down.
     _index, limp_missed = worst_miss(limp_paced, points)
     _index, loose_missed = worst_miss(limp_loose, points)
     check(
-        limp_missed < loose_missed,
-        f"and it holds a tighter line doing it: {limp_missed:.1f} m worst miss "
-        f"against {loose_missed:.1f} m",
+        limp_missed > radius and loose_missed > radius,
+        f"...but pacing alone does not save the marks on a weak hull at {FAST} m/s "
+        f"({limp_missed:.1f} m paced, {loose_missed:.1f} m unpaced, "
+        f"{radius:.0f} m radius)",
+    )
+    limp_slow, _eased = fly_with_hull(weak, True, speed=1.6)
+    _index, slow_missed = worst_miss(limp_slow, points)
+    check(
+        slow_missed <= radius,
+        f"turning the setting down to 1.6 m/s does: the same weak hull passes every "
+        f"mark inside {radius:.0f} m (worst {slow_missed:.1f} m)",
+    )
+
+    # **The vessel limit is not a target, and this is where that stops being an
+    # opinion.** With one operator-set speed there is nothing stopping somebody
+    # typing 2.57 m/s, so what happens if they do is worth knowing before the day:
+    # on this course the boat carries too much speed through the 100-degree corners
+    # and sweeps outside the acceptance radius of a mark it is scored on passing.
+    # It still finishes, and it looks decisive doing it, which is what makes this
+    # the expensive kind of wrong.
+    _pilot, _boat, flat_out, _ticks = run(
+        Plan.parse(payload, ORIGIN), [], seconds=600.0, speed=config.SPEED_LIMIT_MS
+    )
+    index, over = worst_miss(flat_out, points)
+    check(
+        over > radius,
+        f"at the {config.SPEED_LIMIT_MS:.2f} m/s vessel limit it misses #{index} by "
+        f"{over:.1f} m, outside the {radius:.0f} m radius - so {FAST} m/s is the "
+        f"setting for a fast pass on this course, not 5 knots",
     )
 
 
-def test_fast_clearance():
+def test_speed_clearance():
+    """Clearance as a time budget, when the speed term is switched on.
+
+    Off by default (see `test_speed_setting` for why - a 5 m gate), so this sets
+    it for the length of the test. What it is proving is that the mechanism still
+    works now that the figure is a config value rather than a property of a
+    profile: the same mark, the same plan, two settings, and the faster one gets
+    the wider berth.
+    """
     section("clearance at speed")
 
-    from nodes.self_driving import profiles
+    was = config.CLEARANCE_PER_MS
+    config.CLEARANCE_PER_MS = 1.0
+    try:
+        def pass_distance(speed):
+            mark = Obstacle((2.2, 20.0), ObstacleType.RED, 0.2)
+            plan = make_plan([(0.0, 40.0)], role="buoys")
+            _pilot, _boat, track, _ticks = run(
+                plan, [mark], seconds=300.0, speed=speed
+            )
+            return min_distance(track, mark.xy)
 
-    # One buoy sitting beside a straight 40 m leg. The only thing that changes
-    # between the two runs is the profile.
-    def pass_distance(profile):
-        mark = Obstacle((2.2, 20.0), ObstacleType.RED, 0.2)
-        plan = make_plan([(0.0, 40.0)], role="buoys")
-        _pilot, _boat, track, _ticks = run(
-            plan, [mark], seconds=300.0, profile=profile
+        walk = pass_distance(1.0 * config.KNOT_MS)
+        quick = pass_distance(config.SPEED_LIMIT_MS)
+        check(
+            walk > config.BUOY_CLEARANCE_M * 0.75,
+            f"at 1 kn the mark is cleared by {walk:.1f} m",
         )
-        return min_distance(track, mark.xy)
-
-    careful = pass_distance(profiles.SURVEY)
-    quick = pass_distance(profiles.FAST)
-    check(
-        careful > config.BUOY_CLEARANCE_M * 0.75,
-        f"at survey speed the mark is cleared by {careful:.1f} m",
-    )
-    check(
-        quick > careful + 0.5,
-        f"at speed the same mark is given {quick:.1f} m instead of {careful:.1f} m "
-        f"- clearance is a time budget, and speed spends it",
-    )
+        check(
+            quick > walk + 0.5,
+            f"at speed the same mark is given {quick:.1f} m instead of {walk:.1f} m "
+            f"- clearance is a time budget, and speed spends it",
+        )
+    finally:
+        config.CLEARANCE_PER_MS = was
 
 
 def test_alternation():
@@ -2136,7 +2265,6 @@ def test_alternation():
 
     from nodes.self_driving.behaviours import alternation
     from nodes.self_driving.behaviours.base import Context
-    from nodes.self_driving import profiles
 
     class _Mark:
         def __init__(self, mark_id, kind, pos):
@@ -2156,11 +2284,9 @@ def test_alternation():
             {"origin": ORIGIN, "boat": {"position": [0.0, 0.0], "heading_deg": 0.0}}
         )
         plan = make_plan([(leg[1][0], leg[1][1])], role="buoys")
-        mode = profiles.RunMode(config)
-        mode.alternation = on
         return Context(
             state=state, world=_World(marks), plan=plan, config=config, now=0.0,
-            waypoint=plan.current, leg=leg, task="buoys", run=mode,
+            waypoint=plan.current, leg=leg, task="buoys", alternation=on,
         )
 
     # A leg running due north. A red mark 10 m up it: sailing with the buoyage,
@@ -2323,10 +2449,10 @@ def main():
         test_recorder,
         test_memory,
         test_speed_limit,
-        test_profiles,
+        test_speed_setting,
         test_corner_speed,
         test_fast_course,
-        test_fast_clearance,
+        test_speed_clearance,
         test_alternation,
         test_real_jetson_sample,
     ):

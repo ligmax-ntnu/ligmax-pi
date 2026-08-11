@@ -41,7 +41,7 @@ LIGMAX_AP_TURN_LATERAL_ACCEL      default 0.8 m/s²
 How hard the boat can turn. Measure it, do not trust the default:
 
 1. Open water, GUIDED off, full lock, hold a steady turn at roughly the fast
-   profile's speed (~2 m/s).
+   pass's speed (~2 m/s).
 2. Time one full revolution. `A = speed × 2π / period`.
    A 2 m/s boat circling in 20 s is `2 × 6.28 / 20` = **0.63 m/s²**.
 3. Put the answer in `/etc/ligmax/node.env` and restart the node.
@@ -72,22 +72,21 @@ Also worth a minute each:
 
 ---
 
-## 1. Attempt one — survey
+## 1. Attempt one — the slow pass
 
-On the dashboard: load the course, press **Survey (1 kn)**, press Start. The
-equivalent commands, which is what the chips send:
+On the dashboard: load the course, put **0.5** in the Speed field on `/control`
+and press Apply, then press Start. The equivalent commands:
 
 ```
-set_plan        {"plan": <contents of plans/task1.json>}
-run_profile     {"profile": "survey"}
-autopilot_start {"label": "task1-attempt1"}
+set_plan         {"plan": <contents of plans/task1.json>}
+set_speed_limit  {"value": 0.5}
+autopilot_start  {"label": "task1-attempt1"}
 ```
 
-The three profile chips and the alternation toggle are new
-(`ligmax-server/web/js/autopilot.js`), so **the ground station needs updating
-before the first run** or the only speed control on the panel is the old Careful
-mode toggle — which still works and is the same state as `survey`, but there is
-then no way to select `fast`.
+**There is one speed control and that field is it** (2026-08-11). It sets the
+hand-flown go-to, an AUTO mission and the autonomy node together, and every
+docking creep is held under it. Careful mode and the three profile chips are
+gone — one of them (`run_profile`) had never reached the vessel at all.
 
 1 knot, everything watched. Expect roughly **3½–4 minutes** to GPS 4 (220 s in
 simulation, and the real thing will be slower).
@@ -96,7 +95,7 @@ simulation, and the real thing will be slower).
 
 | watch | where | what is wrong if it is not there |
 |---|---|---|
-| `profile: survey`, `ceiling_kn: 1.0` | commander block | the wrong attempt is being run |
+| `speed_kn` ≈ 1.0 (0.5 m/s) | commander block | the pass is being run at the wrong speed |
 | marks appearing with `source: front_lidar` | obstacle layer | the lidar or the colour thresholds |
 | cardinals going from `cardinal (side unknown)` to `east cardinal (4 votes)` | mark label | the camera never commits — see §3 |
 | `survey` block's `marks` count climbing | telemetry | nothing is being established, so attempt two gains nothing |
@@ -164,23 +163,27 @@ Without it, an unresolved cardinal makes the boat hold the planned line at
 0.6 m/s and say so loudly, which is the NJORD §8.2 twenty-second window arriving
 early enough to use.
 
-## 4. Attempt two — fast
+## 4. Attempt two — the fast pass
 
-Press **Fast (up to 5 kn)**, rewind to the start, press Start:
+Put **2.2** in the Speed field, rewind to the start, press Start:
 
 ```
-run_profile     {"profile": "fast"}
-autopilot_goto  {"index": 0}
-autopilot_start {"label": "task1-attempt2"}
+set_speed_limit  {"value": 2.2}
+autopilot_goto   {"index": 0}
+autopilot_start  {"label": "task1-attempt2"}
 ```
 
-Up to the 5 knot limit, paced by the geometry. Expect roughly **70–110 seconds**
-to GPS 4 against the survey run's 220.
+**2.2 m/s, not the 2.57 m/s limit, and the difference matters.** In simulation
+2.2 passes every mark on this course inside the 3 m acceptance radius; 2.4 misses
+one by 3.2 m and the vessel limit itself by 4.0 m. It finishes either way and it
+looks decisive doing it, which is what makes the fast setting the expensive place
+to be greedy. `tests/test_autopilot.py:test_fast_course` asserts both halves of
+that. Expect roughly **70–110 seconds** to GPS 4 against the slow pass's 220.
 
-**It will not hold 5 knots, and that is correct.** A flat 5 kn over 126 m would be
-49 s, but three of the corners on this course are over 100 degrees on legs of
-10–17 m, and a turn radius is set by speed: the straights get the knots and the
-corners do not. Two limits do that, both of them narrated on the panel:
+**It will not hold 2.2 m/s all the way round, and that is correct.** Three of the
+corners on this course are over 100 degrees on legs of 10–17 m, and a turn radius
+is set by speed: the straights get the knots and the corners do not. Two limits do
+that, both of them narrated on the panel:
 
 * `123 deg turn at 3.2 in 4 m - easing to 1.5 m/s` — the corner ahead, read off
   the plan. Full pace down the leg, brake late.
@@ -188,15 +191,17 @@ corners do not. Two limits do that, both of them narrated on the panel:
   already crosswise, which is what coming out of a hard corner looks like. This
   is the one that saves the waypoint *after* a tight turn.
 
-Marks also get more room at speed: about 2.6 m on top of the static 2 m at full
-pace, because clearance is a time budget wearing metres and speed spends it. This
-applies **only** in the fast profile — Task 2's gates are 5 m wide and a speed
-term there would make the boat refuse a gate it is meant to drive through.
+Marks can also be given more room at speed — clearance is a time budget wearing
+metres and speed spends it — but that term is **off by default**
+(`LIGMAX_AP_CLEARANCE_PER_MS = 0`) and has to be set for the day. Task 2's gates
+are 5 m wide and any speed term at all would make the boat refuse a gate it is
+meant to drive through, so switch it on for a Task 1 pass and leave it off for
+anything with a gate in it.
 
-**Abort criteria — drop to survey mid-run rather than lose the attempt:**
+**Abort criteria — turn the speed down mid-run rather than lose the attempt:**
 
 ```
-run_profile {"profile": "survey"}
+set_speed_limit {"value": 0.5}
 ```
 
 Takes effect on the next tick and does not interrupt the run. Do it if:
@@ -230,8 +235,7 @@ autopilot_stop {"why": "GPS 4 held"}
 | command | args | what it does |
 |---|---|---|
 | `set_plan` | `{"plan": {...}}` | upload a course. Refused with a readable reason rather than partly accepted |
-| `run_profile` | `{"profile": "survey"\|"normal"\|"fast"}` | which attempt this is. Mid-run is fine |
-| `careful_on` / `careful_off` | — | the older name for `survey` / `normal`. Same mechanism, not a rival to it |
+| `set_speed_limit` | `{"value": m/s}` | **the one speed**: this leg, the go-to, an AUTO mission, and the ceiling every behaviour including docking plans under. 0.1–2.5722 m/s, refused rather than clamped. Mid-run is fine |
 | `alternation` | `{"on": true\|false}` | the cardinal prior. Off by default |
 | `autopilot_start` | `{"label": "..."}` | engage, and start recording under that label |
 | `autopilot_stop` | `{"why": "..."}` | stand down, close the recording, **write the survey** |
@@ -242,17 +246,24 @@ autopilot_stop {"why": "GPS 4 held"}
 | `forget_object` | `{"id": n}` | delete one phantom. The spot is refused new tracks for 30 s |
 | `forget_world` | — | clear the live tracks **and** the stored survey |
 
-## The three profiles
+## The one speed
 
-| | ceiling | cruise | around marks | extra room per m/s |
-|---|---|---|---|---|
-| `survey` | 1.0 kn | 0.51 m/s | 0.51 m/s | — |
-| `normal` | 3.1 kn | 1.20 m/s | 0.80 m/s | — |
-| `fast` | **5.0 kn** | 2.20 m/s | 1.60 m/s | 1.0 m, capped at 3.0 m |
+| setting | what it is for |
+|---|---|
+| 0.1 m/s | a first parking attempt, alongside a dock, hand on the E-stop. The floor |
+| 0.5 m/s | the slow pass. Walk alongside it |
+| 1.2 m/s | the boot value. What the boat comes up in after a reboot |
+| 2.2 m/s | the fast pass. The most this course flies clean in simulation |
+| 2.5722 m/s | NJORD's 5 knots. The **limit**, not a setting to use — it misses marks |
+
+One number, set from `/control`'s Speed field or `set_speed_limit`. It is what the
+boat runs a leg at **and** the ceiling nothing may exceed: everything the code
+already holds slower stays slower, so a berth approach still creeps at 0.30 m/s at
+any setting above it and creeps at 0.1 m/s if that is what you set.
 
 The 5 knot limit is enforced in five independent places and none of them is
 overridable from the environment — see the block in `nodes/self_driving/config.py`.
-A profile spends the boat's own margin up to that limit; nothing spends past it.
+The setting spends the boat's own margin up to that limit; nothing spends past it.
 
 ## After the day
 

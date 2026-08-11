@@ -64,20 +64,18 @@ import math
 import time
 
 from . import geo
-from . import profiles
 from .config import (
+    ALTERNATION_DEFAULT,
     LATERAL_MAX_MS,
     LATERAL_MODE,
     LATERAL_RC_CENTRE,
     LATERAL_RC_CHAN,
     LATERAL_RC_SPAN,
-    CAREFUL_DEFAULT,
-    CAREFUL_SPEED_KNOTS,
-    CAREFUL_SPEED_MS,
     KNOT_MS,
-    MAX_SPEED_MS,
     SPEED_LIMIT_KNOTS,
     SPEED_LIMIT_MS,
+    SPEED_MIN_MS,
+    SPEED_MS,
     TARGET_REFRESH_S,
     YAW_DEADBAND_DEG,
     YAW_MAX_RATE,
@@ -168,7 +166,7 @@ def yaw_rate_towards(desired_heading, current_heading):
     return max(-YAW_MAX_RATE, min(YAW_MAX_RATE, YAW_P * error))
 
 
-def station_keep(state, target_xy, desired_heading, config, reason):
+def station_keep(state, target_xy, desired_heading, config, reason, ceiling=None):
     """A body-velocity intent that holds a point and a heading.
 
     This is how the two scored "stay stationary" requirements are met - stop at
@@ -181,6 +179,13 @@ def station_keep(state, target_xy, desired_heading, config, reason):
     should be sits still instead of hunting. Outside it, the correction is
     proportional and expressed in the *body* frame, which is what lets the
     lateral thruster do the sideways part without the hull having to turn.
+
+    `ceiling` is the operator's speed setting (`ctx.ceiling`), and passing it is
+    how a hold obeys "0.1 m/s" instead of pulling back at the 0.30 m/s docking
+    creep regardless. Both axes are held to it, because a hold that crabs at
+    0.35 m/s while the operator asked for 0.1 is not slower in any sense they
+    would recognise. Defaulted to None - the docking figures - so a caller that
+    has no context behaves exactly as this did before.
     """
     if state.position is None or state.heading is None:
         return stop(f"{reason} (no position - holding by stopping)")
@@ -198,9 +203,14 @@ def station_keep(state, target_xy, desired_heading, config, reason):
 
     starboard, forward = geo.world_to_boat(east, north, state.heading)
     gain = config.HOLD_P
+    cap = config.DOCK_SPEED_MS
+    sideways = LATERAL_MAX_MS
+    if ceiling is not None:
+        cap = min(cap, float(ceiling))
+        sideways = min(sideways, float(ceiling))
     return move(
-        forward=_clamp(forward * gain, -config.DOCK_SPEED_MS, config.DOCK_SPEED_MS),
-        starboard=_clamp(starboard * gain, -LATERAL_MAX_MS, LATERAL_MAX_MS),
+        forward=_clamp(forward * gain, -cap, cap),
+        starboard=_clamp(starboard * gain, -sideways, sideways),
         yaw_rate=yaw,
         reason=f"{reason} - pulling back {error:.1f} m",
     )
@@ -212,16 +222,12 @@ def _clamp(value, low, high):
 
 # ------------------------------------------------------------- the speed limit
 
-#: The ordinary ceiling every command out of this file is held to: the boat's own
-#: 5 kn limit, and whatever lower figure the tuning asks for. `min` of the two
-#: rather than trusting `MAX_SPEED_MS` alone, because that one is read from the
-#: environment and this one is not (`config.SPEED_LIMIT_MS`).
-CEILING_MS = min(SPEED_LIMIT_MS, MAX_SPEED_MS)
-
-#: The ceiling in careful mode. Never above the ordinary one - careful mode can
-#: only ever slow the boat down, so switching it on can never be the thing that
-#: makes the boat go faster, whatever the tuning says.
-CAREFUL_CEILING_MS = min(CEILING_MS, CAREFUL_SPEED_MS)
+#: The hard ceiling every command out of this file is held to when no lower one
+#: has been given: NJORD's 5 knots, from the repo-root `config.py`, which is not
+#: overridable from the environment. The operator's own setting
+#: (`Commander.speed`) is always at or below it and is what actually binds in a
+#: run; this is the floor under the whole arrangement.
+CEILING_MS = SPEED_LIMIT_MS
 
 
 def _limit(value, ceiling=CEILING_MS):
@@ -286,73 +292,91 @@ class Commander:
         self.engaged = False
         self.sent = 0
         self.last_intent = None
-        # How hard the boat is being driven, and the switches that go with it.
-        # It lives here rather than on the pilot because this is the file that
-        # enforces the speed part, and a flag that lives anywhere other than its
-        # enforcement point eventually disagrees with it. `pilot.py` reads it
-        # through the commander so the behaviours plan at the profile's speed
-        # instead of being clamped after the fact.
-        self.run = profiles.RunMode(config)
-        if CAREFUL_DEFAULT:
-            self.run.set_profile(profiles.SURVEY)
+        # **The one speed setting**, m/s: what the boat runs a leg at and the
+        # ceiling nothing may exceed. It lives here rather than on the pilot
+        # because this is the file that enforces it, and a number that lives
+        # anywhere other than its enforcement point eventually disagrees with it.
+        # `pilot.py` passes it into every `Context`, so a behaviour *plans* at
+        # the speed it will actually get instead of asking for more and being
+        # silently clamped on the way out.
+        self.speed = min(SPEED_LIMIT_MS, float(SPEED_MS))
+        # The cardinal alternation prior. See `behaviours/alternation.py`; off
+        # unless deliberately switched on, because it is an inference rather than
+        # a measurement.
+        self.alternation = bool(ALTERNATION_DEFAULT)
 
-    # -------------------------------------------------------- careful mode
+    # ------------------------------------------------------------- the speed
 
     @property
     def ceiling(self):
-        """The speed ceiling in force right now, m/s.
+        """The speed in force right now, m/s. Never above the vessel limit."""
+        return min(SPEED_LIMIT_MS, self.speed)
 
-        The profile's, held to the vessel limit. `SPEED_LIMIT_MS` rather than
-        `CEILING_MS` is the right bound here and the difference is the whole
-        point of the fast profile: `CEILING_MS` folds in `MAX_SPEED_MS`, which is
-        the *normal* profile's self-imposed 1.6 m/s and not a limit on the
-        vessel. A profile is allowed to spend the boat's own margin up to 5
-        knots; nothing is allowed past 5 knots. `profiles.Profile` clamps to the
-        same figure on the way in, so this is the second of the two.
+    def set_speed(self, value):
+        """Set the one speed, m/s. `(ok, message)` for the operator's ack.
+
+        **Refused rather than clamped** out of range, the same rule
+        `io_manager/guided.py` follows for the hand-flown cap: an operator who
+        typed 4 m/s and quietly got 2.57 would believe the boat was doing 4.
+
+        Takes effect on the next tick and does not interrupt a run - the point is
+        to slow a pass down, not to stop it - and it applies to docking as much as
+        to a transit, which is the whole reason it exists in this form.
         """
-        return min(SPEED_LIMIT_MS, self.run.profile.ceiling_ms)
-
-    @property
-    def careful(self):
-        """The one-knot ceiling, under the name the dashboard already sends."""
-        return self.run.careful
-
-    @careful.setter
-    def careful(self, on):
-        self.run.set_profile(profiles.SURVEY if on else profiles.NORMAL)
-
-    def set_profile(self, name):
-        """Select a run profile by name. `(ok, message)` for the ack."""
-        return self.run.set_profile(name)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return False, f"speed is a number of m/s, not {value!r}"
+        if number != number or number in (float("inf"), float("-inf")):
+            return False, "speed must be a finite number of m/s"
+        if not SPEED_MIN_MS <= number <= SPEED_LIMIT_MS:
+            return False, (
+                f"speed must be {SPEED_MIN_MS:g}..{SPEED_LIMIT_MS:.2f} m/s - "
+                f"{SPEED_LIMIT_KNOTS:g} knots is the vessel limit and nothing "
+                "from the dashboard can raise it"
+            )
+        was = self.speed
+        self.speed = number
+        if abs(was - number) < 1e-9:
+            return True, f"speed was already {number:.2f} m/s"
+        # WARNING rather than INFO: "why was it going that fast" - or that slow -
+        # has to be answerable from the journal afterwards rather than from
+        # somebody's memory of what they typed.
+        log.warning(
+            "SPEED %.2f -> %.2f m/s (%.2f kn) - transits and every docking creep "
+            "are held to it",
+            was,
+            number,
+            number / KNOT_MS,
+        )
+        return True, (
+            f"speed {number:.2f} m/s ({number / KNOT_MS:.2f} kn) - transits run "
+            "at it and docking is held under it"
+        )
 
     def set_alternation(self, on):
         """Switch the cardinal alternation prior. `(ok, message)`."""
-        return self.run.set_alternation(on)
-
-    def set_careful(self, on):
-        """Switch careful mode. `(ok, message)` for the operator's ack."""
-        was = self.careful
-        self.careful = bool(on)
-        if was == self.careful:
-            state = "on" if self.careful else "off"
-            return True, f"careful mode was already {state}"
-        if self.careful:
+        was = self.alternation
+        self.alternation = bool(on)
+        if was == self.alternation:
+            return True, (
+                f"the alternation prior was already "
+                f"{'on' if self.alternation else 'off'}"
+            )
+        if self.alternation:
             log.warning(
-                "CAREFUL MODE ON - speed held to %.1f kn (%.2f m/s)",
-                CAREFUL_SPEED_KNOTS,
-                self.ceiling,
+                "ALTERNATION PRIOR ON - an uncommitted cardinal may now be "
+                "passed on the side the previous mark implies"
             )
             return True, (
-                f"careful mode ON - {CAREFUL_SPEED_KNOTS:.1f} kn "
-                f"({self.ceiling:.2f} m/s) maximum"
+                "alternation prior ON - a cardinal the camera has not committed "
+                "will be passed on the opposite side to the mark before it, and "
+                "said so on the panel"
             )
-        log.warning(
-            "careful mode OFF - speed back to the ordinary %.2f m/s ceiling",
-            self.ceiling,
-        )
+        log.warning("alternation prior OFF")
         return True, (
-            f"careful mode OFF - back to {self.ceiling / KNOT_MS:.1f} kn "
-            f"({self.ceiling:.2f} m/s) maximum"
+            "alternation prior OFF - an uncommitted cardinal holds the planned "
+            "line and slows down instead of guessing"
         )
 
     # ------------------------------------------------------------- engagement
@@ -526,10 +550,15 @@ class Commander:
         block["speed_limit_kn"] = SPEED_LIMIT_KNOTS
         block["speed_ceiling_ms"] = round(self.ceiling, 3)
         block["speed_ceiling_kn"] = round(self.ceiling / KNOT_MS, 2)
-        # The whole run mode, not just the careful flag: which profile is
-        # selected is the first thing anybody watching a fast pass wants to see,
-        # and the first thing anybody reading the trip file afterwards needs.
-        block.update(self.run.telemetry())
+        # The operator's setting under its own name as well as under
+        # `speed_ceiling_*`. They are the same number today and the panel reads
+        # this one, because "the speed I set" and "the ceiling being enforced"
+        # are two different questions and only one of them has an answer the
+        # operator typed.
+        block["speed_ms"] = round(self.speed, 3)
+        block["speed_kn"] = round(self.speed / KNOT_MS, 2)
+        block["speed_min_ms"] = round(SPEED_MIN_MS, 3)
+        block["alternation"] = self.alternation
         block["lateral_mode"] = LATERAL_MODE
         if LATERAL_MODE == "rc" and not LATERAL_RC_CHAN:
             block["lateral_warning"] = (

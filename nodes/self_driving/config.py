@@ -30,7 +30,7 @@ def _f(name, default):
     """A float from the environment, or the default. Never raises.
 
     **NaN and infinity are rejected**, and that is not pedantry. `float("nan")`
-    does not raise, so without this check `LIGMAX_AP_MAX_SPEED_MS=nan` sets the
+    does not raise, so without this check `LIGMAX_AP_SPEED_MS=nan` sets the
     speed cap to NaN - and every clamp downstream is a `min()`, which
     *propagates* NaN rather than rejecting it: `min(nan, 2.57)` is `nan` in
     Python (the comparison is False, so the first value stands). A single typo
@@ -179,66 +179,36 @@ def _speed(name, default):
     return _speed_value(_f(name, default))
 
 
-# ------------------------------------------------------------- careful mode
+# ------------------------------------------------------------- the one speed
 #
-# A second, much lower ceiling the operator can switch on and off while the boat
-# is running: **1 knot**. For a first pass down an unfamiliar course, a crowded
-# basin, a shakedown after changing a threshold, or any moment where somebody
-# wants the boat slow enough to watch and to take over from.
+# **There is one speed setting and the operator owns it.** `set_speed_limit`
+# from the dashboard sets it, in m/s, and it is two things at once:
 #
-# 1 kn is 0.51 m/s, which is about a boat length every four seconds - slow enough
-# that a person on the dock can walk alongside it, and slow enough that the 0.5 s
-# between one autonomy tick's decision and the next is 26 cm of travel.
+#   * what the boat runs an open leg at, and
+#   * the ceiling nothing may exceed - every behaviour, docking included.
 #
-# This is a *ceiling*, not a speed: everything already slower than it stays as it
-# is. Docking (0.30 m/s) and the lateral thruster (0.35 m/s) are both below it,
-# so careful mode changes nothing about a berth approach - which is correct,
-# because that manoeuvre is already at the speed it should be.
+# Anything the code already holds *below* it stays below it: the docking creep
+# (`PARK_SPEED_MS`, `DOCK_SPEED_MS`), the caution speed among marks, the corner
+# limiter. So setting 0.1 m/s slows the whole boat including a berth approach,
+# which is exactly what a first parking test wants, and setting 2.5 m/s speeds
+# up the transits without touching the creep.
 #
-# Unlike SPEED_LIMIT_KNOTS this one IS overridable, because it is ours rather
-# than a limit on the vessel. It can never rise above the 5 kn limit, though:
-# `_speed` clamps it like every other speed here.
-CAREFUL_SPEED_KNOTS = _f("LIGMAX_AP_CAREFUL_KNOTS", 1.0)
-CAREFUL_SPEED_MS = _speed_value(CAREFUL_SPEED_KNOTS * KNOT_MS)
+# What used to be here instead: careful mode (a 1 kn toggle) and three run
+# profiles (survey/normal/fast). Both are gone - one number an operator sets is
+# the whole of it, and `run_profile` never reached this node anyway because
+# `io_manager/autopilot_bridge.py` did not forward it.
+#
+# The boot value. NOT the limit - `SPEED_LIMIT_MS` above is the limit, it is
+# NJORD's 5 knots, it lives in the repo-root `config.py` and nothing here or on
+# the dashboard can raise it. 1.2 m/s is the old normal-profile cruise, so a
+# boat that comes up after a mid-run reboot behaves as it always did.
+SPEED_MS = _speed("LIGMAX_AP_SPEED_MS", 1.2)
 
-# Whether the boat boots into careful mode. Off by default - careful mode is a
-# deliberate act, and a boat that is quietly slow for a reason nobody remembers
-# setting is its own kind of confusing. Set LIGMAX_AP_CAREFUL=1 for a day of
-# shakedown runs where it should be the default.
-CAREFUL_DEFAULT = _b("LIGMAX_AP_CAREFUL", False)
-
-
-# The absolute ceiling on commanded speed, whatever a behaviour asks for. This
-# is the last line between a planner bug and a boat crossing the course at full
-# throttle - and it can never be raised past the 5 kn limit above.
-MAX_SPEED_MS = _speed("LIGMAX_AP_MAX_SPEED_MS", 1.6)
-
-
-# ------------------------------------------------------------- the fast run
-#
-# NJORD gives two attempts (§8.2), and the marks do not move between them. So
-# the two attempts are not the same run twice: the first one is slow enough for
-# the lidar to survey every mark properly, and the second one is driven off that
-# survey (`survey.py`) at whatever speed the course geometry actually allows.
-#
-# That is a real trade and it is worth being explicit about which way it goes.
-# Going faster costs sightings - a mark 10 m off subtends 2.3 deg, and at 2.5 m/s
-# it is inside the C1's useful range for a couple of seconds rather than ten, so
-# `TRACK_ESTABLISH_HITS` sweeps of it may simply never happen. The fast attempt
-# is therefore only honest when there IS a survey to fall back on, which is why
-# it is a mode an operator selects rather than a default.
-#
-# **The 5 kn limit still applies**, through `_speed` here and through all five
-# enforcement points listed above it. What the fast profile changes is which of
-# the *lower* ceilings the boat holds itself to, never the vessel limit itself.
-FAST_CEILING_MS = _speed("LIGMAX_AP_FAST_CEILING_MS", SPEED_LIMIT_MS)
-
-# What the fast profile asks for on an open leg and around marks. Both are below
-# the ceiling on purpose: the ceiling is what the boat may not exceed, these are
-# what it aims for, and leaving room between the two is what lets the corner
-# limiter below give speed back on a straight without ever touching the limit.
-FAST_CRUISE_SPEED_MS = _speed("LIGMAX_AP_FAST_CRUISE_MS", 2.2)
-FAST_CAUTION_SPEED_MS = _speed("LIGMAX_AP_FAST_CAUTION_MS", 1.6)
+# The slowest setting worth accepting. Below this the boat cannot hold a heading
+# against any wind at all, so a smaller number is a typo rather than a request.
+# 0.1 m/s is deliberately low enough for a dockside parking test - the same floor
+# `io_manager/guided.py` and the dashboard use, so all three agree.
+SPEED_MIN_MS = _speed("LIGMAX_AP_SPEED_MIN_MS", 0.1)
 
 # Extra metres of clearance per m/s the boat is doing, on top of the static
 # `BUOY_CLEARANCE_M` and the mark's own position uncertainty.
@@ -254,23 +224,19 @@ FAST_CAUTION_SPEED_MS = _speed("LIGMAX_AP_FAST_CAUTION_MS", 1.6)
 # buys 2.5 m of extra water, and the total clearance at full speed is about
 # 4.5 m plus uncertainty.
 #
-# **Zero on every profile but `fast`**, and that is deliberate rather than
-# cautious defaulting. Task 2's gates are red/green pairs 5 m apart (NJORD §9.2)
-# - half of that is 2.5 m, and `BUOY_CLEARANCE_M` at 2.0 m plus the 0.35 m
-# tracking sigma already very nearly fills it. Any speed term at all would make
-# the boat refuse a gate it is supposed to drive through. Task 1's buoys are
-# standalone (NJORD §9.1: "no red/green gate pairs are used in this task"), so
-# the wide berth is free there and only there.
-FAST_CLEARANCE_PER_MS = _f("LIGMAX_AP_FAST_CLEARANCE_PER_MS", 1.0)
+# **Zero by default**, and that is deliberate rather than cautious defaulting.
+# Task 2's gates are red/green pairs 5 m apart (NJORD §9.2) - half of that is
+# 2.5 m, and `BUOY_CLEARANCE_M` at 2.0 m plus the 0.35 m tracking sigma already
+# very nearly fills it. Any speed term at all would make the boat refuse a gate
+# it is supposed to drive through. Task 1's buoys are standalone (NJORD §9.1:
+# "no red/green gate pairs are used in this task"), so the wide berth is free
+# there and only there - set this from the environment for a Task 1 pass being
+# run fast, and leave it at zero for anything with a gate in it.
+CLEARANCE_PER_MS = _f("LIGMAX_AP_CLEARANCE_PER_MS", 0.0)
 
 # ...and a ceiling on that term, so a runaway speed reading cannot make the boat
 # claim half the course as its own.
 CLEARANCE_SPEED_MAX_M = _f("LIGMAX_AP_CLEARANCE_SPEED_MAX_M", 3.0)
-
-# Which profile the node boots into. "normal" unless somebody says otherwise:
-# booting into `fast` would mean a boat that comes up after a mid-competition
-# reboot doing 5 kn on a course it has not surveyed.
-DEFAULT_PROFILE = _s("LIGMAX_AP_PROFILE", "normal").strip().lower()
 
 
 # -------------------------------------------------------------------- speeds
@@ -279,10 +245,9 @@ DEFAULT_PROFILE = _s("LIGMAX_AP_PROFILE", "normal").strip().lower()
 # boat to accelerate to it immediately at the start of an attempt.
 TASK_SPEED_MS = _speed("LIGMAX_AP_TASK_SPEED_MS", 2.0 * KNOT_MS)  # NJORD, 2 kn
 
-# Cruise for the blind GNSS legs, where nothing is being scored on speed except
-# the 9 % time multiplier. Deliberately close to the task speed: a fast leg that
-# overshoots a waypoint costs more than it saves.
-CRUISE_SPEED_MS = _speed("LIGMAX_AP_CRUISE_SPEED_MS", 1.2)
+# Cruise for the blind GNSS legs is `SPEED_MS` above - the operator's one
+# setting - and there is deliberately no second knob for it here. Two names for
+# "how fast does it run a leg" is how the panel and the boat end up disagreeing.
 
 # Around buoys and cardinal marks, where a misread mark has to be recoverable.
 CAUTION_SPEED_MS = _speed("LIGMAX_AP_CAUTION_SPEED_MS", 0.8)
@@ -1218,9 +1183,37 @@ PARK_ALIGN_TOLERANCE_DEG = _f("LIGMAX_AP_PARK_ALIGN_DEG", 12.0)
 # How far to get away from the dot before the waypoint is finished.
 PARK_EXIT_M = _f("LIGMAX_AP_PARK_EXIT_M", 3.0)
 
-# How long to look before saying so. NJORD §8.2 gives the crew 20 s to take over,
-# so saying it at 15 leaves them all 20.
+# How long to look from the waypoint before probing forward. NJORD §8.2 gives the
+# crew 20 s to take over, so moving at 15 still leaves them all 20 once the probe
+# below has also run out.
 PARK_SEARCH_TIMEOUT_S = _f("LIGMAX_AP_PARK_SEARCH_TIMEOUT_S", 15.0)
+
+# ---- the probe: what to do when the waypoint sees nothing --------------------
+#
+# The waypoint before a park is laid *just outside* the docks, and the boat only
+# has a forward-looking lidar (the aft unit is broken - see PARK_* below and
+# docs/hardware.md), so a space a couple of metres further in is simply not in
+# view from there. Rather than sit at the waypoint declaring failure, the boat
+# creeps along a fixed bearing until it either finds the three lines or runs out
+# of probe.
+#
+# **120 degrees is Havet arena's answer, not a general one**: at that berth, in
+# towards land is east and a little south. It is a *true* bearing (degrees from
+# north, clockwise), it is the direction the bow points while probing, and a
+# waypoint's own `park_probe_deg` overrides it - which is what a different dock
+# needs rather than an environment variable.
+PARK_PROBE_BEARING_DEG = _f("LIGMAX_AP_PARK_PROBE_DEG", 120.0)
+
+# How far past the waypoint the probe may go, metres. Bounded because the whole
+# point of the waypoint is that somebody laid it in the right place: 8 m of probe
+# finds a berth that was 5 m further in than the GPS point suggested, and does not
+# quietly turn into a boat crossing the basin looking for a wall.
+PARK_PROBE_M = _f("LIGMAX_AP_PARK_PROBE_M", 8.0)
+
+# How fast to probe. The docking creep, because this is a blind move towards a
+# dock - and held to the operator's speed setting like everything else, so a
+# 0.1 m/s test probes at 0.1 m/s.
+PARK_PROBE_SPEED_MS = _speed("LIGMAX_AP_PARK_PROBE_SPEED_MS", 0.3)
 
 # Finding the space. How far the measured mouth and depth may sit from the figures
 # above, how far from parallel/perpendicular three lines may be and still be a
@@ -1234,13 +1227,22 @@ PARK_BOX_TOLERANCE_M = _f("LIGMAX_AP_PARK_BOX_TOL_M", 0.6)
 PARK_BOX_ANGLE_DEG = _f("LIGMAX_AP_PARK_BOX_ANGLE_DEG", 18.0)
 PARK_BOX_SPAN_FRACTION = _f("LIGMAX_AP_PARK_BOX_SPAN", 0.45)
 
-# Whether the aft lidar's returns may be fitted into a parking space. **Off**,
-# and not as a preference: the aft unit's mounting geometry is hand-measured and a
-# flipped `LIGMAX_AFT_LIDAR_ANGLE_DIR` produces a complete, plausible and
-# MIRRORED world astern (docs/testing.md 7c). A mirrored parking space is a
-# parking space on the wrong side of the boat, and this behaviour would drive into
-# it with confidence. Switch it on once the port-quarter check has passed.
-PARK_USE_AFT_LIDAR = _b("LIGMAX_AP_PARK_USE_AFT_LIDAR", False)
+# How much the space is allowed to move before the boat stops believing a new
+# measurement of it, once it is committed. See `behaviours/parking.py:_measure`:
+# from the turn onwards the box is a *memory*, and a fresh fit is only accepted
+# when it agrees with that memory on all three of the dot, the mouth width and
+# the way in. It has to be a tolerance rather than a flat refusal because a
+# floating dock moves; it has to be tight because a "space" fitted from a boat
+# lying across the berth - which is what an alongside park does, with the lone
+# line out of view - is a different space wearing the same name.
+PARK_LATCH_TOLERANCE_M = _f("LIGMAX_AP_PARK_LATCH_TOL_M", 0.4)
+
+# There is **no aft-lidar switch here any more.** The aft unit is broken (2026-08-11,
+# docs/hardware.md), and it was already refused for parking anyway: its mounting
+# geometry is hand-measured and a flipped `LIGMAX_AFT_LIDAR_ANGLE_DIR` produces a
+# complete, plausible and MIRRORED world astern (docs/testing.md 7c), which is a
+# parking space on the wrong side of the boat that this behaviour would drive into
+# with confidence. Parking fits lines to the front unit and nothing else.
 
 
 # ------------------------------------------------------- lateral thruster

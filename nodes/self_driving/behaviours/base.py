@@ -49,7 +49,6 @@ import math
 from .. import geo
 from ..commander import goto, move, stop
 from ..obsticales import ObstacleType, clearance_for
-from ..profiles import PROFILES, NORMAL
 
 # How many times to push the aim point before accepting it. Each pass moves it
 # clear of the worst offender; three is enough for the counts involved here and
@@ -74,7 +73,7 @@ def speed_for_radius(ctx, radius_m):
 
         v = sqrt(A * R)     grip. A turn needs `v^2 / R` of lateral acceleration
                             and the hull only supplies so much. This is what binds
-                            at the fast profile's speeds, and it is the law the
+                            at the top of the speed range, and it is the law the
                             first version of this file got wrong.
         v = omega * R       yaw authority. At a walking pace the acceleration law
                             would allow a turn on the spot; what actually stops
@@ -95,11 +94,11 @@ class Context:
 
     __slots__ = (
         "state", "world", "plan", "config", "now", "waypoint", "leg", "task",
-        "clusters", "sweeps", "ceiling", "run",
+        "clusters", "sweeps", "ceiling", "alternation",
     )
 
     def __init__(self, state, world, plan, config, now, waypoint, leg, task,
-                 clusters=(), ceiling=None, run=None, sweeps=()):
+                 clusters=(), ceiling=None, alternation=False, sweeps=()):
         self.state = state
         self.world = world
         self.plan = plan
@@ -126,45 +125,50 @@ class Context:
         # the line fitter relies on each array being in one sensor's angular
         # order, and two sweeps concatenated interleave at every shared bearing.
         self.sweeps = sweeps
-        # The speed ceiling in force this tick, m/s - `commander.Commander`'s,
-        # which is the 5 kn vessel limit or careful mode's 1 kn. Passed in rather
-        # than read from config so that switching careful mode on takes effect on
-        # the next tick, and so that a behaviour *plans* at the slower speed
-        # instead of asking for more and being silently clamped on the way out.
+        # **The operator's one speed setting, m/s** - `commander.Commander.speed`,
+        # which is what the boat runs a leg at and the ceiling nothing may exceed.
+        # Passed in rather than read from config so that a new setting takes
+        # effect on the next tick, and so that a behaviour *plans* at the speed it
+        # will actually get instead of asking for more and being silently clamped
+        # on the way out.
         self.ceiling = (
-            config.MAX_SPEED_MS if ceiling is None else float(ceiling)
+            config.SPEED_MS if ceiling is None else float(ceiling)
         )
-        # The run mode in force - which profile, and the optional switches that
-        # go with it (`profiles.RunMode`). Passed in for the same reason
-        # `ceiling` is: so a behaviour plans at the speed it will actually get.
-        # Defaulted rather than required, so a `Context` built by hand in a test
-        # or a replay tool behaves like an ordinary run without having to know
-        # this exists.
-        self.run = run
+        # Whether the cardinal alternation prior is switched on
+        # (`behaviours/alternation.py`). Defaulted, so a `Context` built by hand
+        # in a test or a replay tool behaves like an ordinary run.
+        self.alternation = bool(alternation)
 
     # -- the handful of derived figures every behaviour wants ---------------
 
     @property
-    def profile(self):
-        """The speed profile in force. Never None."""
-        if self.run is not None:
-            return self.run.profile
-        return PROFILES[NORMAL]
-
-    @property
     def cruise_speed(self):
-        """What to ask for on an open leg, this profile, this waypoint."""
-        return self.speed_limit(self.profile.cruise_ms)
+        """What to ask for on an open leg: the setting, or this waypoint's own.
+
+        The setting *is* the cruise. There is no separate cruise figure any more,
+        because two numbers meaning "how fast does it run a leg" is how the
+        dashboard and the boat end up disagreeing about which one is in force.
+        """
+        return self.speed_limit(self.ceiling)
 
     @property
     def caution_speed(self):
-        """What to ask for among marks, this profile, this waypoint."""
-        return self.speed_limit(self.profile.caution_ms)
+        """What to ask for among marks. **The same number as `cruise_speed`.**
 
-    @property
-    def alternation(self):
-        """Whether the cardinal alternation prior is switched on."""
-        return bool(self.run is not None and self.run.alternation)
+        Deliberately identical, and kept as its own name rather than collapsed
+        into one: the two used to differ because a profile carried a cruise figure
+        and a caution figure, and with one operator-set speed there is nothing
+        left for them to differ about. An operator who wants the boat slower among
+        marks sets it slower - that is what the setting is for, and it is honest in
+        a way "I asked for 5 knots and got 1.6 near the buoys" never was.
+
+        The name stays because a behaviour saying `ctx.caution_speed` is saying
+        something about *why* it wants that speed, and because the situational
+        slow-downs that remain (`CAUTION_SPEED_MS` for an uncommitted cardinal in
+        `buoys.py`, the corner limiter, the docking creeps) are the mechanisms that
+        actually keep the boat slow where it matters.
+        """
+        return self.cruise_speed
 
     @property
     def boat(self):
@@ -191,11 +195,11 @@ class Context:
     def speed_limit(self, default):
         """The waypoint's own speed if it set one, else `default`, else the cap.
 
-        `self.ceiling` rather than `config.MAX_SPEED_MS`, so careful mode is
-        obeyed here - where the behaviour is deciding - rather than only at the
-        wire. The difference is visible: a behaviour that knows it is limited to
-        1 kn reports that speed in its telemetry and reasons about arrival times
-        with it, instead of reporting 1.2 m/s while the boat does 0.51.
+        `self.ceiling` is the operator's setting, so it is obeyed here - where the
+        behaviour is deciding - rather than only at the wire. The difference is
+        visible: a behaviour that knows it is limited to 0.1 m/s reports that
+        speed in its telemetry and reasons about arrival times with it, instead of
+        reporting 1.2 m/s while the boat does 0.1.
         """
         if self.waypoint is not None and self.waypoint.speed is not None:
             return min(self.waypoint.speed, self.ceiling)
@@ -326,18 +330,18 @@ def dynamic_clearance(ctx):
     clearance therefore means the boat gets progressively less safe the faster it
     goes while the disc on the operator's chart says it has not changed.
 
-    So the profile carries metres-per-m/s (`profiles.py`), and it is **zero on
-    every profile but `fast`**: Task 2's gates are 5 m across and any speed term
-    at all would have the boat refuse a gate it is meant to drive through. See
-    `config.FAST_CLEARANCE_PER_MS`.
+    So the metres-per-m/s is a config figure, `CLEARANCE_PER_MS`, and it is
+    **zero by default**: Task 2's gates are 5 m across and any speed term at all
+    would have the boat refuse a gate it is meant to drive through. See
+    `config.CLEARANCE_PER_MS`, which is where the trade is written down.
 
-    Measured against the *larger* of what the boat is doing and what the profile
-    intends, not against the speedometer alone. A boat accelerating down a leg
-    would otherwise widen its berth as it went, which puts the correction late -
-    the whole value of a wide berth is that it is decided at the top of the leg
+    Measured against the *larger* of what the boat is doing and what it has been
+    told it may do, not against the speedometer alone. A boat accelerating down a
+    leg would otherwise widen its berth as it went, which puts the correction late
+    - the whole value of a wide berth is that it is decided at the top of the leg
     and steered once, rather than discovered next to the mark.
     """
-    gain = ctx.profile.clearance_per_ms
+    gain = getattr(ctx.config, "CLEARANCE_PER_MS", 0.0)
     if gain <= 0.0:
         return 0.0
     speed = 0.0
@@ -346,7 +350,7 @@ def dynamic_clearance(ctx):
             speed = abs(float(ctx.state.speed or 0.0))
         except (TypeError, ValueError):
             speed = 0.0
-    speed = max(speed, ctx.profile.caution_ms)
+    speed = max(speed, ctx.caution_speed)
     return min(ctx.config.CLEARANCE_SPEED_MAX_M, gain * speed)
 
 
@@ -360,10 +364,11 @@ def lookahead_for(ctx, remaining):
     overshoot, and weave down the leg with the jury watching the trace.
 
     So it is the larger of the fixed distance and `LOOKAHEAD_TIME_S` of travel -
-    which changes nothing below about 1.5 m/s and gives the fast profile the
-    longer rein it needs.
+    which changes nothing below about 1.5 m/s and gives a fast setting the longer
+    rein it needs.
 
-    Measured against the profile's intended cruise rather than the speedometer,
+    Measured against the speed the boat has been *told* to run rather than the
+    speedometer,
     deliberately. The lookahead moves the aim point, so a lookahead that tracked
     the measured speed would jitter the aim with every ripple in the log, and
     would also lengthen exactly when the corner limiter had just shortened the

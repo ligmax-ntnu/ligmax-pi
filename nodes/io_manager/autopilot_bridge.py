@@ -81,12 +81,27 @@ AUTOPILOT_COMMANDS = frozenset(
         # the world model, and it is the only thing that can answer whether the
         # id existed.
         "forget_object",
-        # Careful mode: hold the boat to 1 knot, and release it again. Owned by
-        # the autonomy node because the ceiling is enforced in its commander.
-        "careful_on",
-        "careful_off",
+        # The cardinal alternation prior (`self_driving/behaviours/alternation.py`).
+        # Listed since 2026-08-11: the dashboard has offered it since the day the
+        # prior was written and it was never in this set, so every press was acked
+        # `not implemented` by `handle_commands` and the autonomy node never saw
+        # it. Same class of bug as `goto` (docs/findings.md).
+        "alternation",
     }
 )
+
+# Commands **both** nodes act on, off one press. Forwarded to the autonomy node
+# like the set above, but NOT skipped in `handle_commands` - io_manager runs its
+# own half as well, and io_manager is the one that acks.
+#
+# There is exactly one, and it is one on purpose: `set_speed_limit` is the
+# operator's single speed. On this node it is the hand-flown go-to's cap and the
+# AUTO mission speed (`guided.py`); on the autonomy node it is the ceiling every
+# behaviour plans under, docking included (`self_driving/commander.py`). Two
+# commands for "how fast may the boat go" is how a dashboard ends up showing one
+# figure while the planner uses another - careful mode and `run_profile` were
+# exactly that, and both are gone.
+SHARED_COMMANDS = frozenset({"set_speed_limit"})
 
 # POSITION_TARGET_TYPEMASK bits. A set bit means IGNORE that field.
 _IGNORE_POS = 0b0000000000000111       # x, y, z
