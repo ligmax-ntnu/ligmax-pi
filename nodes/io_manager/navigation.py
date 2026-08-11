@@ -19,6 +19,27 @@ Where each number comes from, and why it matters which
     NAV_CONTROLLER_OUTPUT   wp_dist and xtrack_error - the autopilot's own view
                             of how the mission is going.
     MISSION_CURRENT         which waypoint that distance is *to*.
+    ATTITUDE                roll, pitch and their rates, from the EKF.
+
+**Why attitude is in a navigation module at all.** It is not a navigation figure
+and it is here because it is a *geometric* one, and this is the module that owns
+turning the autopilot's messages into geometry. Two consumers need it and neither
+existed when this file was written:
+
+  * **anything measured off a camera.** A marker's pose comes out of `solvePnP` in
+    the camera frame, and turning that into "the berth is 3 m ahead and 0.4 m to
+    port" needs to know which way is down. Assume level and the cross-track error
+    is `range * sin(roll)`: at 4 m and 5 degrees that is 0.35 m, inside a 2 m
+    berth. The camera calibration cannot help with this - a Kannala-Brandt fit is
+    intrinsics, it says what the lens does and nothing about where it points.
+  * **the stabiliser, judged rather than trusted.** This hull's whole claim is
+    that it holds roll and pitch; until this was published, nothing on shore could
+    say by how much, and `SCR_USER5`/`SCR_USER6` were being tuned from the
+    dashboard against no readback of the thing they move.
+
+Published as its own `attitude` sub-block rather than folded into `motion`,
+because `motion` is where-the-boat-is-going and this is how-the-hull-is-lying;
+they go wrong independently and an operator reads them for different reasons.
 
 **Heading and COG are different numbers and the dashboard shows both on purpose.**
 Heading is where the bow points; COG is where the boat is actually going. On a
@@ -167,6 +188,7 @@ class Navigation:
         self._global = None
         self._hud = None
         self._nav = None
+        self._attitude = None
         self._mission_seq = None
         self._warned_no_position = False
         self._origin = _load_origin()
@@ -184,6 +206,8 @@ class Navigation:
             self._hud = message
         elif kind == "NAV_CONTROLLER_OUTPUT":
             self._nav = message
+        elif kind == "ATTITUDE":
+            self._attitude = message
         elif kind == "MISSION_CURRENT":
             self._mission_seq = getattr(message, "seq", None)
         else:
@@ -205,6 +229,7 @@ class Navigation:
         self._global = None
         self._hud = None
         self._nav = None
+        self._attitude = None
         self._mission_seq = None
 
     # -- derived figures ----------------------------------------------------
@@ -454,11 +479,47 @@ class Navigation:
             if bearing is not None and bearing != INT16_MAX:
                 motion["bearing_to_target"] = round(_wrap360(float(bearing)), 1)
 
+        attitude = {}
+        if self._attitude is not None:
+            # ATTITUDE is radians, and every consumer of this wants degrees: the
+            # panel shows degrees, `rig.json`'s mounting angles are degrees, and
+            # the tuning parameters an operator sets against this readback are
+            # degrees. Converted once, here, rather than in each of them.
+            for name, field in (
+                ("roll_deg", "roll"),
+                ("pitch_deg", "pitch"),
+                ("yaw_deg", "yaw"),
+            ):
+                value = getattr(self._attitude, field, None)
+                if value is not None and math.isfinite(value):
+                    degrees = math.degrees(float(value))
+                    # Yaw is a compass bearing and wraps; roll and pitch are
+                    # signed deflections from level and must NOT be wrapped to
+                    # 0-360, or a 2 degree list to port reads as 358.
+                    attitude[name] = (
+                        round(_wrap360(degrees), 1)
+                        if name == "yaw_deg"
+                        else round(_wrap180(degrees), 2)
+                    )
+            for name, field in (
+                ("roll_rate_dps", "rollspeed"),
+                ("pitch_rate_dps", "pitchspeed"),
+            ):
+                value = getattr(self._attitude, field, None)
+                if value is not None and math.isfinite(value):
+                    # The rates are what tell a stabiliser that is *fighting* the
+                    # sea from one that is riding it: a hull held at 1 degree and
+                    # a hull passing through 1 degree at 20 deg/s read the same
+                    # from the angles alone.
+                    attitude[name] = round(math.degrees(float(value)), 1)
+
         out = {}
         if gps:
             out["gps"] = gps
         if motion:
             out["motion"] = motion
+        if attitude:
+            out["attitude"] = attitude
         if self._mission_seq is not None:
             # Which waypoint `distance_to_target` is measured to. Without it the
             # distance is a number with no referent.
