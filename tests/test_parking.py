@@ -1429,6 +1429,213 @@ def test_front_lidar_only():
     )
 
 
+# --------------------------------------------------------------- the AR tags
+#
+# The tag path has one thing in it that no amount of care makes obvious, and it is
+# what these cover: **the sign of the way in**. A berth built from three points can
+# come out rotated by 180 degrees (drive out to sea instead of in) or by twice the
+# corner angle (53 degrees for a 2 m berth, i.e. into a wall), and both produce a
+# confident, complete, plausible box. The lidar version has `test_always_normal`
+# for the same reason; this is its counterpart.
+#
+# The tags themselves are synthesised at exact positions rather than rendered
+# through a camera. What a real lens does to them is measured in
+# `ligmax-edge/artags.py` and is not this file's question.
+
+def tag_at(tag_id, point, cam=0, incidence=5.0, facing=None):
+    """One tag as it arrives off the wire: rig frame, `[x, y, z]` metres."""
+    return {
+        "id": tag_id, "cam": cam,
+        "pos_rig": [point[0], 0.0, point[1]],
+        "range_m": math.hypot(*point), "edge_px": 60.0,
+        "incidence_deg": incidence, "facing_deg": facing,
+    }
+
+
+def berth_tags(into_deg, mouth_mid, span, depth, ids, present=("r", "l", "b")):
+    """The three tags of one berth, placed from its pose. Boat frame."""
+    into = lines.unit_of(into_deg)
+    width = lines.normal_of(into_deg)          # from the left tag toward the right
+    corners = {
+        "r": lines.add(mouth_mid, lines.scale(width, 0.5 * span)),
+        "l": lines.add(mouth_mid, lines.scale(width, -0.5 * span)),
+        "b": lines.add(mouth_mid, lines.scale(into, depth)),
+    }
+    facing = lines.bearing_of(lines.scale(into, -1.0))
+    return [tag_at(ids[i], corners[key], facing=facing)
+            for i, key in enumerate(("r", "l", "b")) if key in present]
+
+
+def test_tag_geometry():
+    section("a berth built from AR tags, and which way it faces")
+    from nodes.self_driving.perception import artags as tag_geometry
+
+    # Every axis source, at poses chosen to catch a mirrored or double-rotated
+    # answer: dead ahead, well off to each side, and behind the beam.
+    worst_into, worst_centre, cases = 0.0, 0.0, 0
+    for into_deg in (0.0, 37.0, -52.0, 118.0, -160.0):
+        for present in (("r", "l", "b"), ("r", "l"), ("r", "b"), ("l", "b"), ("b",)):
+            mid = (0.7, 3.4)
+            tags = berth_tags(into_deg, mid, 2.0, 2.0, (0, 1, 7), present)
+            berth, report = tag_geometry.find_berth(
+                tags, mouth_m=2.0, depth_m=2.0, parallel=False,
+                prior_into_deg=into_deg)
+            if berth is None:
+                check(False, f"{''.join(present)} at {into_deg:.0f} deg found "
+                             f"nothing: {report.get('why')}")
+                continue
+            cases += 1
+            truth = lines.add(mid, lines.scale(lines.unit_of(into_deg), 1.0))
+            worst_into = max(worst_into,
+                             abs(geo.angle_diff(berth.box.into_deg, into_deg)))
+            worst_centre = max(worst_centre, math.dist(berth.box.centre, truth))
+    check(cases == 25, f"all 25 pose/visibility combinations produced a berth")
+    check(worst_into < 0.5,
+          f"the way in is never mirrored or double-rotated "
+          f"(worst {worst_into:.3f} deg over {cases} cases)")
+    check(worst_centre < 0.02,
+          f"the middle of the berth lands where it should "
+          f"(worst {worst_centre * 100:.2f} cm)")
+
+    # The sign test in its sharpest form: swap the two side tags' ids and the berth
+    # must turn round, because the ids are the ONLY thing saying which side is which
+    # when there is no closed-end tag.
+    swapped = berth_tags(0.0, (0.0, 3.0), 2.0, 2.0, (1, 0, 7), ("r", "l"))
+    turned, _ = tag_geometry.find_berth(swapped, mouth_m=2.0, depth_m=2.0,
+                                        parallel=False, prior_into_deg=0.0)
+    check(turned is not None
+          and abs(abs(geo.angle_diff(turned.box.into_deg, 0.0)) - 180.0) < 0.5,
+          "swapping the two side tags turns the berth round - the ids, not the "
+          "boat, decide which way is in")
+
+
+def test_tag_berth_choice():
+    section("which berth, and whether anything is in it")
+    from nodes.self_driving.perception import artags as tag_geometry
+
+    # Two bow-in berths side by side opening south-to-north (way in = 000), sharing
+    # the middle finger. Berth 1 to starboard, berth 2 to port, exactly as the
+    # organisers' drawing lays them out.
+    T = {0: tag_at(0, (1.0, 3.0)), 1: tag_at(1, (-1.0, 3.0)),
+         3: tag_at(3, (-3.0, 3.0)), 7: tag_at(7, (0.0, 5.0)),
+         2: tag_at(2, (-2.0, 5.0))}
+
+    def pick(ids, **kw):
+        return tag_geometry.find_berth(
+            [T[i] for i in ids], mouth_m=2.0, depth_m=2.0, parallel=False,
+            prior_into_deg=0.0, **kw)
+
+    berth, _ = pick([0, 1, 3, 7])
+    check(berth is not None and berth.name == "berth 1"
+          and berth.occupancy == "free",
+          "berth 2's end tag hidden -> berth 1 is taken, and called free")
+    berth, _ = pick([0, 1, 3, 2])
+    check(berth is not None and berth.name == "berth 2",
+          "berth 1's end tag hidden -> berth 2 is taken")
+    berth, _ = pick([0, 1, 3])
+    check(berth is not None and berth.occupancy == "unknown",
+          "neither end tag in view -> a berth is still found, but occupancy is "
+          "'unknown' rather than assumed free")
+    berth, _ = pick([0, 1, 3, 7, 2], prefer="berth 2")
+    check(berth is not None and berth.name == "berth 2"
+          and "operator" in berth.why,
+          "the operator's named berth overrules the tags, and says so")
+
+    # The shared finger identifies nothing on its own, and two tags from DIFFERENT
+    # berths must not be paired into a 4 m berth that does not exist.
+    berth, report = pick([1])
+    check(berth is None and "belongs to berth 1 and berth 2" in report["why"],
+          "the shared finger tag alone is refused, and the message says why")
+    berth, report = pick([0, 3])
+    check(berth is None,
+          "one tag from each berth is not a 4 m berth (the span check refuses it)")
+
+    # The alongside berth, at its own measured span.
+    P = [tag_at(4, (2.065, 3.0)), tag_at(6, (-2.065, 3.0)), tag_at(5, (0.0, 5.0))]
+    berth, _ = tag_geometry.find_berth(P, mouth_m=4.0, depth_m=2.0, parallel=True,
+                                       prior_into_deg=0.0)
+    check(berth is not None and abs(berth.mouth_m - 4.13) < 0.01,
+          f"the alongside berth measures its 4.13 m span "
+          f"({berth.mouth_m:.2f} m) rather than the 4.00 m clear opening")
+
+    # A tag too far away, or seen too obliquely, is not used. Both are the same
+    # failure in practice: the other task's tags, or the next berth's, seen from
+    # outside.
+    far = [tag_at(0, (1.0, 30.0)), tag_at(1, (-1.0, 30.0)), tag_at(7, (0.0, 32.0))]
+    berth, _ = tag_geometry.find_berth(far, mouth_m=2.0, depth_m=2.0,
+                                       parallel=False, prior_into_deg=0.0)
+    check(berth is None, "tags beyond MAX_RANGE_M are not a berth")
+    oblique = [tag_at(0, (1.0, 3.0), incidence=85.0),
+               tag_at(1, (-1.0, 3.0), incidence=85.0)]
+    berth, _ = tag_geometry.find_berth(oblique, mouth_m=2.0, depth_m=2.0,
+                                       parallel=False, prior_into_deg=0.0)
+    check(berth is None, "tags seen edge-on are dropped before they can be a berth")
+
+
+def test_tag_behaviour():
+    section("the manoeuvre, driven by tags instead of a lidar")
+    behaviour = Parking(config, parallel=False, source="artag")
+    check(behaviour.name == "park_tag", "the role names itself park_tag")
+
+    # The same fixed world space the lidar tests use: mouth plane at north 4, space
+    # running to north 6, opening south, way in due north. The boat sits south of it.
+    def ctx_at(position, heading=0.0, now=0.0, present=("r", "l", "b")):
+        # The berth in the BOAT frame, from where the boat is.
+        east, north = position
+        mid_world = (SPACE_EAST_M, MOUTH_NORTH_M)
+        rel = (mid_world[0] - east, mid_world[1] - north)
+        stbd, fwd = geo.world_to_boat(rel[0], rel[1], heading)
+        tags = berth_tags(geo.angle_diff(0.0, heading), (stbd, fwd),
+                          2.0, 2.0, (0, 1, 7), present)
+        ctx = _ctx_for(behaviour, [], position=position, heading=heading, now=now,
+                       waypoint_xy=(SPACE_EAST_M, MOUTH_NORTH_M - 2.0))
+        ctx.tags = tags
+        return ctx
+
+    ctx = ctx_at((0.0, 0.0))
+    behaviour.start(ctx)
+    behaviour.update(ctx)
+    check(behaviour.box is not None,
+          "the berth is found from the tags, with no sweep at all")
+    if behaviour.box is not None:
+        check(abs(geo.angle_diff(behaviour.box["into_deg"], 0.0)) < 1.0,
+              f"the way in comes out due north "
+              f"({behaviour.box['into_deg']:.1f} deg), not out to sea")
+        check(math.dist(behaviour.box["centre"], (SPACE_EAST_M,
+                                                 MOUTH_NORTH_M + 1.0)) < 0.05,
+              "the middle of the berth lands in the middle of the berth")
+    told = behaviour.status.get("parking", {})
+    check(told.get("sensor") == "artag",
+          "the panel says which sensor found it")
+
+    # No tags at all: the behaviour has to say so rather than steer on a memory it
+    # never had. This is the state an operator sees if cv2.aruco is missing on the
+    # Jetson, which is the failure most likely to reach the water.
+    blind = Parking(config, parallel=False, source="artag")
+    ctx = ctx_at((0.0, 0.0))
+    ctx.tags = []
+    blind.start(ctx)
+    blind.update(ctx)
+    check(blind.box is None, "no tags in view means no berth")
+    told = blind.status.get("parking", {})
+    check(told.get("seen") is False and told.get("sensor") == "artag",
+          "and the panel says it is looking for tags and has none")
+    check("no tags in view" in (told.get("tags") or {}).get("why", ""),
+          "with the reason in words the operator can act on")
+
+    # An alongside tag park is NOT blind after the turn - the cameras look abeam,
+    # which is exactly where the closed end ends up. This is the one place losing
+    # the lidars improved the manoeuvre, so it is worth pinning down.
+    alongside = Parking(config, parallel=True, source="artag")
+    ctx = ctx_at((0.0, 0.0))
+    alongside.start(ctx)
+    alongside.phase = "hold"
+    alongside.update(ctx)
+    check(alongside._blind(ctx) is False,
+          "an alongside park on tags never reports itself blind, because the "
+          "cameras point where the closed end goes")
+
+
 def main():
     test_lines()
     test_finding()
@@ -1447,6 +1654,9 @@ def main():
     test_blind_alongside_hold()
     test_speed_setting_is_obeyed()
     test_front_lidar_only()
+    test_tag_geometry()
+    test_tag_berth_choice()
+    test_tag_behaviour()
 
     print()
     if FAILURES:

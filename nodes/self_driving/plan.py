@@ -88,14 +88,26 @@ DOCK = "dock"
 DOCK_PARALLEL = "dock_parallel"
 PARK = "park"
 PARK_PARALLEL = "park_parallel"
+#: The same two manoeuvres, found with the dock's AR tags instead of the lidar.
+#: **These are the working docking roles as of 2026-08-11**: both lidars are down,
+#: so `dock`, `dock_parallel`, `park` and `park_parallel` have no sensor and every
+#: one of them will sit in SEARCH until the operator takes over. Kept rather than
+#: deleted because a repaired lidar brings them straight back.
+PARK_TAG = "park_tag"
+PARK_TAG_PARALLEL = "park_tag_parallel"
 
-ROLES = (TRANSIT, BUOYS, AVOID, HOLD, DOCK, DOCK_PARALLEL, PARK, PARK_PARALLEL)
+ROLES = (TRANSIT, BUOYS, AVOID, HOLD, DOCK, DOCK_PARALLEL, PARK, PARK_PARALLEL,
+         PARK_TAG, PARK_TAG_PARALLEL)
+
+#: Roles that find their berth from the AR tags rather than from a lidar.
+TAG_ROLES = frozenset({PARK_TAG, PARK_TAG_PARALLEL})
 
 # Roles whose waypoint is a place to *arrive at and settle*, rather than a point
 # to sweep through. They get the tighter acceptance radius and they are not
 # allowed to be passed by the passing-plane test - "stop at GPS point 4" is not
 # satisfied by driving past it.
-SETTLE_ROLES = frozenset({HOLD, DOCK, DOCK_PARALLEL, PARK, PARK_PARALLEL})
+SETTLE_ROLES = frozenset({HOLD, DOCK, DOCK_PARALLEL, PARK, PARK_PARALLEL,
+                          PARK_TAG, PARK_TAG_PARALLEL})
 
 #: Default seconds stationary, from the rules, per role (NJORD §9.3). Both parking
 #: roles hold ten, which is what the team asked for and is the stricter of the
@@ -105,6 +117,11 @@ DEFAULT_HOLD_S = {
     DOCK_PARALLEL: 5.0,
     PARK: 10.0,
     PARK_PARALLEL: 10.0,
+    # Ten for the alongside tag berth as well, for the same reason as its lidar
+    # twin: §9.3 asks five and holding longer than the rules require cannot lose a
+    # point, while a clock that stops a second early can lose the task.
+    PARK_TAG: 10.0,
+    PARK_TAG_PARALLEL: 10.0,
     HOLD: 0.0,
 }
 
@@ -128,7 +145,7 @@ class Waypoint:
     __slots__ = (
         "index", "name", "lat", "lon", "role", "speed", "radius", "hold_s",
         "channel_bearing", "berth_width_m", "park_offset_m", "park_probe_deg",
-        "notes",
+        "berth", "notes",
     )
 
     def __init__(self, index, name, lat, lon, role, **kwargs):
@@ -155,6 +172,13 @@ class Waypoint:
         # a berth, not about the boat - Havet arena's is about 120 degrees, in
         # towards land, and `config.PARK_PROBE_BEARING_DEG` is that default.
         self.park_probe_deg = kwargs.get("park_probe_deg")
+        # Which berth to take, by name ("berth 1" / "berth 2" / "alongside"), for
+        # the tag roles only. Normally left unset: two bow-in berths are laid side
+        # by side with one occupied, and the boat picks the free one by which
+        # closed-end tag it can see (`perception/artags.py`). This is the override
+        # for when it has picked wrong, or when the tags disagree with what the
+        # jury said - a name the operator types rather than an argument.
+        self.berth = kwargs.get("berth")
         self.notes = kwargs.get("notes") or ""
 
     # ------------------------------------------------------------------ query
@@ -182,7 +206,7 @@ class Waypoint:
         }
         for key in (
             "speed", "radius", "hold_s", "channel_bearing", "berth_width_m",
-            "park_offset_m", "park_probe_deg",
+            "park_offset_m", "park_probe_deg", "berth",
         ):
             value = getattr(self, key)
             if value is not None:
@@ -545,8 +569,44 @@ def _waypoint(position, item, origin, default_bearing):
         park_probe_deg=_optional_float(
             item.get("park_probe_deg"), 0.0, 360.0, position, "park_probe_deg"
         ),
+        berth=_berth(position, item, role),
         notes=str(item.get("notes") or "")[:120],
     )
+
+
+def _berth(position, item, role):
+    """The named berth override, checked against the ones that exist for this role.
+
+    Refused at upload rather than ignored at run time. A misspelt berth name would
+    otherwise fall through to "let the tags decide" and look identical to not having
+    asked - which is the worst possible outcome for an override whose whole purpose
+    is overruling the tags.
+    """
+    raw = item.get("berth")
+    if raw is None or str(raw).strip() == "":
+        return None
+    name = str(raw).strip().lower()
+    if role not in TAG_ROLES:
+        raise PlanError(
+            f"waypoint {position + 1}: 'berth' only means something for the tag "
+            f"roles ({', '.join(sorted(TAG_ROLES))}), and this one is '{role}'"
+        )
+    # Imported here, not at module scope. The berth names belong to the tag
+    # geometry - it is the thing that knows which ids make which berth - and a
+    # top-level import would put `perception` on `plan`'s import path, which is
+    # backwards: a plan is data and has no business needing a sensor to load.
+    # Deferring it also keeps one source of truth instead of a fourth copy of a
+    # list of names.
+    from .perception.artags import BOW_IN_BERTHS, PARALLEL_BERTHS
+
+    allowed = sorted(PARALLEL_BERTHS if role == PARK_TAG_PARALLEL
+                     else BOW_IN_BERTHS)
+    if name not in allowed:
+        raise PlanError(
+            f"waypoint {position + 1}: '{raw}' is not a berth for {role} "
+            f"({', '.join(allowed)})"
+        )
+    return name
 
 
 def _coordinates(position, item, origin):

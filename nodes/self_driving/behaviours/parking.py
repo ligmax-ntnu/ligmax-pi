@@ -152,6 +152,7 @@ import math
 from .. import geo
 from ..commander import goto, station_keep, stop
 from ..config import LATERAL_MAX_MS, LATERAL_MODE, LATERAL_RC_CHAN
+from ..perception import artags as tag_geometry
 from ..perception import lines as line_fit
 from ..perception import parking as parking_geometry
 from .base import Behaviour, creep, next_leg
@@ -168,7 +169,19 @@ EXIT = "exit"
 
 
 class Parking(Behaviour):
-    """Line-based parking. `parallel=True` switches to the alongside variant."""
+    """Parking. `parallel` picks the variant, `source` picks the sensor.
+
+    `source="lidar"` fits three straight edges to the front sweep
+    (`perception/lines.py`). `source="artag"` builds the same box out of the dock's
+    three AR markers (`perception/artags.py`). **Everything from ALIGN onwards is
+    identical** - the phases, the bow-first travel down the normal, the trim-only
+    lateral rule, the hold and the reverse out - because all of it works off a
+    `ParkingBox` and neither sensor appears in it.
+
+    That is why the tag work is thirty lines in `_measure` and a new perception
+    module, rather than a second docking behaviour. The manoeuvre was never the
+    part that depended on the lidar.
+    """
 
     name = "park"
     # What the classifier is told the boat is doing. Nothing in this file reads a
@@ -177,10 +190,17 @@ class Parking(Behaviour):
     # the big white things around the boat are.
     task = "dock"
 
-    def __init__(self, config, parallel=False):
+    def __init__(self, config, parallel=False, source="lidar"):
         super().__init__(config)
         self.parallel = parallel
-        self.name = "park_parallel" if parallel else "park"
+        self.source = source
+        if source == "artag":
+            self.name = "park_tag_parallel" if parallel else "park_tag"
+        else:
+            self.name = "park_parallel" if parallel else "park"
+        # What the tags last said, for the panel. None until a look has happened.
+        self._tag_report = None
+        self._berth = None
         self.phase = SEARCH
         self.box = None          # the space in WORLD metres, or None
         self._phase_at = None
@@ -217,6 +237,8 @@ class Parking(Behaviour):
         self._latched_at = None
         self._ignored = 0
         self._probe_from = None
+        self._tag_report = None
+        self._berth = None
 
     # ------------------------------------------------------------------ tick
 
@@ -943,23 +965,8 @@ class Parking(Behaviour):
         measured from the dot while it could still see all three lines, and holds
         the middle of *that* on GNSS.
         """
-        segments = line_fit.fit_sweeps(
-            ctx.sweeps, config=ctx.config, sources=self._sources(ctx)
-        )
-        self._segments = len(segments)
-        if not segments:
-            return
-
-        box = parking_geometry.find_box(
-            segments,
-            mouth_m=self._mouth(ctx),
-            depth_m=self._depth(),
-            tolerance_m=ctx.config.PARK_BOX_TOLERANCE_M,
-            angle_deg=ctx.config.PARK_BOX_ANGLE_DEG,
-            span_fraction=ctx.config.PARK_BOX_SPAN_FRACTION,
-            min_line_m=ctx.config.LINE_MIN_M,
-            max_range_m=ctx.config.LINE_MAX_RANGE_M,
-        )
+        box = (self._measure_tags(ctx) if self.source == "artag"
+               else self._measure_lines(ctx))
         if box is None:
             return
 
@@ -972,23 +979,142 @@ class Parking(Behaviour):
                 return
         self.box = found
 
+    def _measure_lines(self, ctx):
+        """Fit three straight edges to the front sweep. The original sensor."""
+        segments = line_fit.fit_sweeps(
+            ctx.sweeps, config=ctx.config, sources=self._sources(ctx)
+        )
+        self._segments = len(segments)
+        if not segments:
+            return None
+        return parking_geometry.find_box(
+            segments,
+            mouth_m=self._mouth(ctx),
+            depth_m=self._depth(),
+            tolerance_m=ctx.config.PARK_BOX_TOLERANCE_M,
+            angle_deg=ctx.config.PARK_BOX_ANGLE_DEG,
+            span_fraction=ctx.config.PARK_BOX_SPAN_FRACTION,
+            min_line_m=ctx.config.LINE_MIN_M,
+            max_range_m=ctx.config.LINE_MAX_RANGE_M,
+        )
+
+    def _measure_tags(self, ctx):
+        """Build the berth out of the dock's three AR markers.
+
+        The prior handed to `find_berth` is the piece worth understanding. A berth
+        found from two side tags needs nothing else - the tag ids say which side is
+        which, and that fixes the way in on its own. A berth found from **one** tag
+        does not, and the honest source for the missing direction is not a tag
+        normal (unusable, see `perception/artags.py`) but the **operator's own
+        waypoint**: whoever laid it laid it outside the mouth pointing in. That is
+        the "AR tags and GPS points" combination doing real work rather than being
+        a slogan - the tags say where, GNSS says which way.
+
+        `_prior_into_deg` is that bearing made relative to the boat's heading,
+        because everything in the tag pipeline is boat-relative.
+
+        **Losing the tags does not lose the berth, and that is deliberate.** The box
+        is kept in WORLD metres (`_to_world`), so a tick that finds nothing leaves
+        the last good one standing and the boat goes on flying it against its own
+        GNSS. That covers the case this manoeuvre ends in: from a metre or so out
+        the markers go out of frame, or too oblique, or behind the bow - and it does
+        not matter, because the hold is ten seconds and the pontoon is a floating
+        dock that does not travel far in ten seconds on RTK. `parking.age_s` on the
+        panel is how stale the box is, and it is the number to watch rather than the
+        tag count. Do not "fix" a berth that stops being re-measured near the end of
+        an approach; that is the design.
+        """
+        tags = ctx.tags or ()
+        self._segments = len(tags)
+        berth, report = tag_geometry.find_berth(
+            tags,
+            mouth_m=self._mouth(ctx),
+            depth_m=self._depth(),
+            parallel=self.parallel,
+            prior_into_deg=self._prior_into_deg(ctx),
+            tag_span_m=self._tag_span(ctx),
+            prefer=self._prefer_berth(ctx),
+        )
+        self._tag_report = report
+        if berth is None:
+            self._berth = None
+            return None
+        self._berth = berth
+        return berth.box
+
+    def _prior_into_deg(self, ctx):
+        """Which way the berth faces, according to the operator, boat-relative.
+
+        The bearing of the leg *into* the docking waypoint: the operator drove a
+        line at the dock, so that line is the way in. Falls back to the waypoint's
+        own `park_probe_deg` - which already means "which way the docks are" - and
+        then to nothing, in which case a single-tag berth simply is not found and
+        the panel says so.
+
+        Returned relative to the heading because `find_berth` works in the boat
+        frame. `None` when there is no heading, which is also when nothing else in
+        this behaviour runs.
+        """
+        if ctx.heading is None:
+            return None
+        absolute = None
+        leg = ctx.leg
+        if leg is not None and leg[0] is not None and leg[1] is not None:
+            start, end = leg
+            if geo.distance(start, end) > 1.0:
+                absolute = geo.bearing_to(start, end)
+        if absolute is None and ctx.waypoint is not None:
+            probe = getattr(ctx.waypoint, "park_probe_deg", None)
+            if probe is not None:
+                absolute = float(probe)
+        if absolute is None:
+            absolute = ctx.config.PARK_PROBE_BEARING_DEG
+        return geo.angle_diff(absolute, ctx.heading)
+
+    def _tag_span(self, ctx):
+        """Centre-to-centre distance between the two side tags, metres.
+
+        A different number from `_mouth` by about a wall thickness, and its own
+        setting for that reason -- see `perception/artags.TAG_SPAN_M`.
+        """
+        return (ctx.config.PARK_TAG_SPAN_PARALLEL_M if self.parallel
+                else ctx.config.PARK_TAG_SPAN_M)
+
+    def _prefer_berth(self, ctx):
+        """A berth the operator has named, or None to let the tags decide."""
+        if ctx.waypoint is not None:
+            return getattr(ctx.waypoint, "berth", None)
+        return None
+
     def _latched(self):
         """Whether the box is a memory. True from the turn onwards."""
         return self.phase in (TURN, HOLD, EXIT)
 
     def _blind(self, ctx):
-        """Whether the closed end is out of the front lidar's view right now.
+        """Whether the closed end is out of view right now.
 
-        True for an **alongside** park from the moment it starts turning until it
-        has turned back to leave: that is the stretch where the boat lies across
-        the space with the lone line abeam, and with no aft lidar there is nothing
-        looking at it. Not a guess about what the sweep contains - it is a
-        statement about where the hull is pointing, which is the thing that is
-        actually known.
+        True for an **alongside** park on the LIDAR from the moment it starts
+        turning until it has turned back to leave: that is the stretch where the
+        boat lies across the space with the lone line abeam, and with no aft lidar
+        there is nothing looking at it. Not a guess about what the sweep contains -
+        it is a statement about where the hull is pointing, which is the thing that
+        is actually known.
 
         False for a bow-in park throughout. It sits square to the closed end, so
         the one lidar there is has all three lines in front of it the whole time.
+
+        **False for the tag source, in every phase, and this is the one place where
+        losing the lidars made the manoeuvre better.** The whole reason an alongside
+        park went blind was a forward-looking sensor and a closed end that ends up
+        abeam. The cameras point port and starboard (`rig.json`), so abeam is where
+        they are *best*: after the 90 degree turn the end tag sits about a metre off
+        the beam, square on, 150-odd pixels across - the strongest sighting of the
+        whole manoeuvre. The tag ahead is still in view too, so `find_berth` keeps a
+        real "end + side" fit right through the hold instead of dead-reckoning it.
+        The tag astern is lost, and it is not needed.
         """
+        if self.source == "artag":
+            return False
         if not self.parallel or self.box is None:
             return False
         if not self._latched():
@@ -1137,6 +1263,12 @@ class Parking(Behaviour):
                 "seen": False,
                 "segments": self._segments,
                 "speed_cap_ms": round(ctx.ceiling, 2),
+                # Which sensor is being asked, and what it said. With the tags this
+                # is the whole story while nothing is found: `why` is a sentence
+                # naming the ids in view and what is missing, which is exactly the
+                # question an operator is asking at that moment.
+                "sensor": self.source,
+                **({"tags": self._tag_report} if self._tag_report else {}),
                 # Only while probing, so a panel that is not showing a probe is
                 # showing nothing about one.
                 **(
@@ -1162,6 +1294,7 @@ class Parking(Behaviour):
             # below it is either a measurement or a dead-reckoned memory, and the
             # operator cannot tell which from the numbers themselves.
             "source": "remembered" if self._latched() else "measured",
+            "sensor": self.source,
             "blind": self._blind(ctx),
             "remembered_s": (
                 round(_since(self._latched_at, ctx.now), 1)

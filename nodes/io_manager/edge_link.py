@@ -113,6 +113,12 @@ class EdgeLink(threading.Thread):
         self._sweeps = 0
         self._dets = [0, 0]         # detections in the newest frame, per camera
         self._detections = [[], []]  # the detections themselves, newest per camera
+        self._tags = [[], []]       # the dock's AR tags, newest per camera
+        # None until a frame arrives that carries `tags` AT ALL. Absent and empty
+        # are different states on this wire and they need different words on the
+        # operator's panel: "nothing on the boat is looking for the berth" against
+        # "looking, and it is not in view". See edge_protocol.py.
+        self._tags_at = [None, None]
         self._frame_at = [None, None]
         self._fps = None
         self._peer = None
@@ -165,6 +171,48 @@ class EdgeLink(threading.Thread):
                     out.append(dict(det, cam=cam))
         return out
 
+    def tags(self, max_age=1.0):
+        """The dock's AR tags from both cameras, merged. `[]` if none are fresh.
+
+        NJORD §9.3's three markers, already measured in the rig frame by the Jetson
+        (`edge_protocol.py`). With both lidars down this is the docking task's only
+        sensor, so the merge is deliberate: **a 2 m berth's two side tags land one
+        in each camera** - the pair's fields only overlap for about 24 deg across
+        the bow - so a berth cannot be assembled from one camera's list.
+
+        Aged out like the detections, and for the same reason with more force: a
+        tag is a claim about where a pontoon was at `t_capture`, and inside a berth
+        the boat is tens of centimetres from it. A stale tag is not noise, it is a
+        wall in the wrong place.
+
+        `cam` is already on each entry, so nothing is added here.
+        """
+        now = time.time()
+        out = []
+        with self._lock:
+            for cam in (0, 1):
+                seen_at = self._tags_at[cam]
+                if seen_at is None or now - seen_at > max_age:
+                    continue
+                out.extend(self._tags[cam])
+        return out
+
+    def tags_searching(self, max_age=5.0):
+        """Whether the Jetson is looking for tags at all. `True`/`False`/`None`.
+
+        `None` means no frame has arrived recently enough to say - the Jetson is
+        not connected, or not sending. The three answers map onto three different
+        things for an operator to do, which is why this is not a bool.
+        """
+        now = time.time()
+        with self._lock:
+            if self._peer is None:
+                return None
+            fresh = [t for t in self._frame_at if t is not None and now - t <= max_age]
+            if not fresh:
+                return None
+            return any(t is not None and now - t <= max_age for t in self._tags_at)
+
     @property
     def connected(self):
         return self._peer is not None
@@ -183,6 +231,23 @@ class EdgeLink(threading.Thread):
                 "detections": list(self._dets),
                 "sweep_age_s": age,
             }
+            # The docking task's sensor, reported separately from the detections
+            # because it is a different question with a different answer. `null`
+            # for `searching` is "this build is not looking", which during Task 3
+            # is the most important thing on the panel.
+            now = time.time()
+            tag_ages = [None if at is None else round(now - at, 2)
+                        for at in self._tags_at]
+            block["tags"] = [len(t) for t in self._tags]
+            block["tag_age_s"] = tag_ages
+            block["tags_searching"] = (
+                None if all(a is None for a in tag_ages)
+                else any(a is not None and a <= 5.0 for a in tag_ages)
+            )
+            seen = sorted({t.get("id") for cam in self._tags for t in cam
+                           if isinstance(t.get("id"), int)})
+            if seen:
+                block["tag_ids"] = seen
             if self._peer:
                 block["peer"] = self._peer
             if self._fps is not None:
@@ -320,9 +385,19 @@ class EdgeLink(threading.Thread):
         if cam not in (0, 1):
             return
         dets = header.get("dets") or []
+        # `in`, not `.get() or []`: a sender that is looking and sees nothing sends
+        # an empty list, and collapsing that into the same value as "this build
+        # does not look" is the one mistake this field exists to prevent.
+        has_tags = "tags" in header
+        tags = header.get("tags") or []
         with self._lock:
             self._frames += 1
             self._dets[cam] = len(dets)
+            if has_tags:
+                # Bounded like the detections. Nine tags exist on the dock and a
+                # reflection off wet steel can decode as a tenth.
+                self._tags[cam] = [t for t in tags if isinstance(t, dict)][:16]
+                self._tags_at[cam] = time.time()
             # Kept, not just counted: `nodes/self_driving` needs the detections
             # themselves - they carry `card`/`card_conf`, which is the ONLY
             # source on the boat for which cardinal a mark is. Bounded, because

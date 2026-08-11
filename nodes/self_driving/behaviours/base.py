@@ -94,11 +94,12 @@ class Context:
 
     __slots__ = (
         "state", "world", "plan", "config", "now", "waypoint", "leg", "task",
-        "clusters", "sweeps", "ceiling", "alternation",
+        "clusters", "sweeps", "tags", "ceiling", "alternation",
     )
 
     def __init__(self, state, world, plan, config, now, waypoint, leg, task,
-                 clusters=(), ceiling=None, alternation=False, sweeps=()):
+                 clusters=(), ceiling=None, alternation=False, sweeps=(),
+                 tags=()):
         self.state = state
         self.world = world
         self.plan = plan
@@ -125,6 +126,17 @@ class Context:
         # the line fitter relies on each array being in one sensor's angular
         # order, and two sweeps concatenated interleave at every shared bearing.
         self.sweeps = sweeps
+        # This tick's AR tags, both cameras merged, already measured in the boat
+        # frame by the Jetson (`nodes/io_manager/edge_protocol.py`). Only the
+        # `park_tag` roles read them, and with both lidars down they are the whole
+        # of what the docking task can see.
+        #
+        # Raw, like `clusters` and `sweeps`, and for the same reason: a berth is a
+        # measurement made right now, and routing it through the world model's
+        # tracker would smooth away the centimetres a 2 m berth is decided by. The
+        # tracker is also built to keep believing in a mark it can no longer see,
+        # which inside a berth is the opposite of what is wanted.
+        self.tags = tags
         # **The operator's one speed setting, m/s** - `commander.Commander.speed`,
         # which is what the boat runs a leg at and the ceiling nothing may exceed.
         # Passed in rather than read from config so that a new setting takes

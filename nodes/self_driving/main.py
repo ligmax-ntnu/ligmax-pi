@@ -185,8 +185,13 @@ class Node:
         # straight edges to the raw returns, which is a different question from the
         # one clustering answers (`perception/lines.py`). Both lidars are offered
         # and the behaviour decides which of them it trusts.
+        # The AR tags, straight from the Jetson and NOT through the world model.
+        # With both lidars down these are the docking task's only sensor, and they
+        # are aged out hard (1 s) inside `EdgeLink.tags` because a tag is a claim
+        # about where a pontoon was, and the boat parks tens of centimetres from it.
+        tags = self.edge.tags() if self.edge is not None else ()
         intent = self.pilot.tick(
-            state, self.world, self._front_clusters, now, sweeps=scans
+            state, self.world, self._front_clusters, now, sweeps=scans, tags=tags
         )
         if state is not None:
             self.commander.send(intent, state, now)
@@ -515,9 +520,60 @@ class Node:
             },
             "tracks": self.world.telemetry(now=now),
         }
+        if (payload := self._artag_payload()) is not None:
+            blocks["artags"] = payload
         if (layers := self._paths_payload(state, intent, now)) is not None:
             blocks["paths"] = layers
         self.link.telemetry(**blocks)
+
+    def _artag_payload(self):
+        """`telemetry.artags` - the raw tag sightings, for the operator's chart.
+
+        Its own block rather than a field on `autopilot`, because it is a *sensor
+        reading* and it has to be visible whether or not a docking behaviour is
+        running: on the day the first question is "can the boat see the tags from
+        here", asked while driving the boat around by hand looking for somewhere to
+        put the middle waypoint. `autopilot.parking.tags` is the other half - what
+        was *decided* from these - and the two are deliberately at different levels
+        because one of them exists without the other.
+
+        Boat-relative metres, `[starboard, forward]`, exactly like `scans`: the
+        browser already knows how to rotate that onto the chart against the boat's
+        pose, and a world-frame tag would need a fix the bench does not have.
+
+        `None` when the Jetson has never said whether it is looking, so the page can
+        tell "not searching" from "searching and sees nothing" - the distinction
+        `edge_protocol.py` keeps on the wire for exactly this.
+        """
+        if self.edge is None:
+            return None
+        searching = self.edge.tags_searching()
+        if searching is None:
+            return None
+        seen = self.edge.tags()
+        return {
+            "searching": bool(searching),
+            "n": len(seen),
+            "tags": [
+                {
+                    "id": tag.get("id"),
+                    "cam": tag.get("cam"),
+                    # [starboard, forward] from [x, y=down, z=forward].
+                    "point": [round(float(tag["pos_rig"][0]), 3),
+                              round(float(tag["pos_rig"][2]), 3)],
+                    "range_m": tag.get("range_m"),
+                    "bearing_deg": tag.get("bearing_deg"),
+                    # The resolution figure. On the panel because it is what says
+                    # whether a tag is worth believing, and because it is the number
+                    # that decides how close the boat has to get.
+                    "edge_px": tag.get("edge_px"),
+                    "incidence_deg": tag.get("incidence_deg"),
+                }
+                for tag in seen
+                if isinstance(tag.get("pos_rig"), (list, tuple))
+                and len(tag["pos_rig"]) >= 3
+            ][:16],
+        }
 
     def _paths_payload(self, state, intent, now):
         """The chart's two lines, or None when there is nothing new to say.

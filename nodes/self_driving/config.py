@@ -1086,6 +1086,19 @@ PARK_DEPTH_M = _f("LIGMAX_AP_PARK_DEPTH_M", 2.0)
 PARK_PARALLEL_MOUTH_M = _f("LIGMAX_AP_PARK_PARALLEL_MOUTH_M", 4.0)
 PARK_PARALLEL_DEPTH_M = _f("LIGMAX_AP_PARK_PARALLEL_DEPTH_M", 2.0)
 
+# **Centre-to-centre between the two side AR tags**, for the `park_tag` roles. A
+# DIFFERENT NUMBER from the mouth above, and that is the whole reason it exists: the
+# markers are taped to walls 0.13 m thick, so tag-to-tag is the clear opening plus
+# about one wall. The team's measurements are 2 m for the bow-in berth and 4.13 m
+# for the alongside one, and 4.13 = 4.00 + 0.13 reads as exactly that.
+#
+# Only ever used to CHECK a pair of tags and to draw the box, never to place the
+# boat: the dot is the midpoint of the two tags, and a symmetric error in this
+# figure does not move a midpoint. Park once, read `parking.mouth_m` off the panel,
+# and set this to what the dock actually is.
+PARK_TAG_SPAN_M = _f("LIGMAX_AP_PARK_TAG_SPAN_M", 2.0)
+PARK_TAG_SPAN_PARALLEL_M = _f("LIGMAX_AP_PARK_TAG_SPAN_PARALLEL_M", 4.13)
+
 # **The static depth offset, one per parking type.** How far off the middle of the
 # space to sit, in metres, measured along the depth axis: **positive is deeper in**
 # - towards the lone line, the side of the space with no partner, which is the

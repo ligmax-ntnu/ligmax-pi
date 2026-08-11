@@ -94,7 +94,7 @@ class Pilot:
 
     # ------------------------------------------------------------------ tick
 
-    def tick(self, state, world, clusters, now, sweeps=()):
+    def tick(self, state, world, clusters, now, sweeps=(), tags=()):
         """One decision. Returns the `Intent` to send. Never raises.
 
         `sweeps` is this tick's raw lidar scans, boat frame, passed through to the
@@ -145,6 +145,7 @@ class Pilot:
             task="transit",
             clusters=clusters,
             sweeps=sweeps,
+            tags=tags,
             ceiling=self.commander.ceiling,
             alternation=self.commander.alternation,
         )
