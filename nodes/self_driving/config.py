@@ -1146,7 +1146,16 @@ PARK_CENTRE_TOLERANCE_M = _f("LIGMAX_AP_PARK_CENTRE_TOL_M", 0.20)
 # at the mercy of any tide on the water. Holding station is a different job - a few
 # centimetres against a set, with time to do it - and it gets the full
 # `LATERAL_MAX_MS` (`behaviours/parking.py:_approach_move`, `travel=False`).
-PARK_TRIM_LATERAL_MS = _speed("LIGMAX_AP_PARK_TRIM_LATERAL_MS", 0.12)
+#
+# **Half the forward creep, and it has to stay under it.** This was 0.12 while the
+# entry creep was 0.3; the creep came down to 0.1 on 2026-08-11 and a 0.12 trim
+# against a 0.1 creep would have made the sideways term the LARGER of the two - a
+# boat moving more across the berth than into it, which is the opposite of every
+# rule in `behaviours/parking.py`. The two axes are scaled together rather than
+# clipped separately, so this does not bend the approach; it bounds how much of the
+# commanded motion may be sideways, and at 0.05 against 0.1 that is at most about
+# 27 degrees off the normal.
+PARK_TRIM_LATERAL_MS = _speed("LIGMAX_AP_PARK_TRIM_LATERAL_MS", 0.05)
 
 # How far off the parking angle the boat may be during the hold. The countdown
 # needs the *angle* as well as the position for the whole of its ten seconds,
@@ -1179,11 +1188,31 @@ PARK_DEADBAND_M = _f("LIGMAX_AP_PARK_DEADBAND_M", 0.06)
 # `HOLD_P` because the space is 2 m wide and the boat is most of that.
 PARK_ENTRY_P = _f("LIGMAX_AP_PARK_ENTRY_P", 0.45)
 
-# Speeds. The creep in and out is the docking creep; the run to the operator's
-# parking waypoint is allowed to be brisker because it happens in open water.
-PARK_SPEED_MS = _speed("LIGMAX_AP_PARK_SPEED_MS", 0.3)
-PARK_REVERSE_SPEED_MS = _speed("LIGMAX_AP_PARK_REVERSE_SPEED_MS", 0.25)
-PARK_APPROACH_SPEED_MS = _speed("LIGMAX_AP_PARK_APPROACH_SPEED_MS", 0.8)
+# Speeds, and they are deliberately **very** slow inside the berth: 0.1 m/s, the
+# floor of the whole speed system (`MIN_SPEED_LIMIT_MS`), asked for by the team on
+# 2026-08-11. There is nothing to gain from entering faster and a great deal to
+# lose - the berth is 2 m across, the hull is most of that, and the only things
+# between it and the pontoon are the operator and the physical E-stop
+# (`behaviours/parking.py` turns the ordinary avoidance off in here on purpose).
+#
+# 0.1 m/s is 10 cm a second: crossing a 2 m berth takes 20 s, and the whole
+# bow-in manoeuvre - align, enter, hold 10 s, reverse out - is comfortably inside
+# the 15 minute slot even repeated. A contact is a deduction *and* the completion
+# points, so slow is not the cautious choice here, it is the fast one.
+#
+# These are caps, never floors: `Parking._speed` takes the lesser of the figure
+# here and the operator's `set_speed_limit`, so a setting *below* these still wins.
+# Raising `set_speed_limit` cannot make the berth creep faster - to do that you
+# would have to change the number here, which is the point of it being here.
+PARK_SPEED_MS = _speed("LIGMAX_AP_PARK_SPEED_MS", 0.1)
+PARK_REVERSE_SPEED_MS = _speed("LIGMAX_AP_PARK_REVERSE_SPEED_MS", 0.1)
+# SEARCH (running to the operator's waypoint, in open water) and ALIGN (getting
+# onto the centreline one 3 m standoff out, and squaring up) share this one. It is
+# 0.3 rather than 0.1 because it covers real distance - GPS 7 to the docking
+# waypoint is about 15 m, which is 50 s at 0.3 and 150 s at 0.1 - and rather than
+# the 0.8 it was until 2026-08-11, because half of what it governs happens three
+# metres from a pontoon. Nothing here is inside the berth.
+PARK_APPROACH_SPEED_MS = _speed("LIGMAX_AP_PARK_APPROACH_SPEED_MS", 0.3)
 
 # Where the approach starts: hold station this far out from the dot, on the
 # centreline, and square up before committing to a space the boat barely fits.
@@ -1223,10 +1252,13 @@ PARK_PROBE_BEARING_DEG = _f("LIGMAX_AP_PARK_PROBE_DEG", 120.0)
 # quietly turn into a boat crossing the basin looking for a wall.
 PARK_PROBE_M = _f("LIGMAX_AP_PARK_PROBE_M", 8.0)
 
-# How fast to probe. The docking creep, because this is a blind move towards a
-# dock - and held to the operator's speed setting like everything else, so a
-# 0.1 m/s test probes at 0.1 m/s.
-PARK_PROBE_SPEED_MS = _speed("LIGMAX_AP_PARK_PROBE_SPEED_MS", 0.3)
+# How fast to probe. The berth creep, 0.1 m/s, because this is the one move on the
+# whole boat that drives deliberately **towards a hard structure it cannot see** -
+# a forward-looking sensor outside the docks cannot make out a berth a few metres
+# further in, so the boat goes and looks. 8 m of probe is therefore 80 s, which is
+# the price of the fallback path and is why the waypoint being laid in the right
+# place matters: with the tags visible from the waypoint this never runs at all.
+PARK_PROBE_SPEED_MS = _speed("LIGMAX_AP_PARK_PROBE_SPEED_MS", 0.1)
 
 # Finding the space. How far the measured mouth and depth may sit from the figures
 # above, how far from parallel/perpendicular three lines may be and still be a

@@ -1636,6 +1636,44 @@ def test_tag_behaviour():
           "cameras point where the closed end goes")
 
 
+def test_berth_speeds_are_low():
+    section("the berth creep is 0.1 m/s, and nothing can raise it")
+    # A regression guard on four numbers the team set deliberately on 2026-08-11,
+    # not a test of behaviour. They are the difference between touching a pontoon
+    # and not, and the failure mode is somebody "tidying" them back up to the old
+    # 0.3/0.25/0.8 while looking at a time budget.
+    check(config.PARK_SPEED_MS <= 0.1 + 1e-9,
+          f"entering the berth is {config.PARK_SPEED_MS} m/s")
+    check(config.PARK_REVERSE_SPEED_MS <= 0.1 + 1e-9,
+          f"reversing out is {config.PARK_REVERSE_SPEED_MS} m/s")
+    check(config.PARK_PROBE_SPEED_MS <= 0.1 + 1e-9,
+          f"probing blind towards a dock is {config.PARK_PROBE_SPEED_MS} m/s")
+    check(config.PARK_APPROACH_SPEED_MS <= 0.3 + 1e-9,
+          f"the run to the waypoint and squaring up outside it is "
+          f"{config.PARK_APPROACH_SPEED_MS} m/s")
+    # The trim must stay UNDER the forward creep, or the sideways term becomes the
+    # larger of the two and the boat travels more across the berth than into it.
+    check(config.PARK_TRIM_LATERAL_MS < config.PARK_SPEED_MS,
+          f"the sideways trim ({config.PARK_TRIM_LATERAL_MS} m/s) is under the "
+          f"forward creep ({config.PARK_SPEED_MS} m/s), so travel stays bow-first")
+
+    # And the same thing measured rather than read: a tag park entering the berth at
+    # the default (high) speed setting still creeps at 0.1.
+    behaviour = Parking(config, parallel=False, source="artag")
+    ctx = _ctx_for(behaviour, [], position=(0.0, 0.0), heading=0.0,
+                   waypoint_xy=(SPACE_EAST_M, MOUTH_NORTH_M - 2.0))
+    ctx.tags = berth_tags(0.0, (0.0, MOUTH_NORTH_M), 2.0, 2.0, (0, 1, 7))
+    behaviour.start(ctx)
+    behaviour.update(ctx)
+    behaviour.phase = "enter"
+    behaviour._phase_at = ctx.now
+    intent = behaviour.update(ctx)
+    speed = math.hypot(intent.vx or 0.0, intent.vy or 0.0)
+    check(speed <= 0.1 + 1e-6,
+          f"entering on tags at the {config.SPEED_MS} m/s setting still creeps at "
+          f"{speed:.3f} m/s")
+
+
 def main():
     test_lines()
     test_finding()
@@ -1657,6 +1695,7 @@ def main():
     test_tag_geometry()
     test_tag_berth_choice()
     test_tag_behaviour()
+    test_berth_speeds_are_low()
 
     print()
     if FAILURES:
