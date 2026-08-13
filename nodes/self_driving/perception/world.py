@@ -760,12 +760,13 @@ class WorldModel:
         }
 
     def absorb_detections(self, detections, boat_xy, heading_deg, now):
-        """Fold in the Jetson's camera detections. Only ever *refines*.
+        """Fold in the Jetson's camera detections. Refines, and for ONE class
+        creates.
 
-        A detection never creates a track. The detector is weak, its range from
-        apparent size degrades as the square of distance, and a phantom buoy on
-        the chart is worse than a missing one - so its job here is to answer
-        questions the lidar posed, not to pose new ones.
+        For marks a detection never creates a track. The buoy detector is weak,
+        its range from apparent size degrades as the square of distance, and a
+        phantom buoy on the chart is worse than a missing one - so its job here
+        is to answer questions the lidar posed, not to pose new ones.
 
         It answers two:
 
@@ -773,6 +774,15 @@ class WorldModel:
             it), through `Track.note_cardinal`;
           * a weak vote on red vs green, for a mark the colour path left
             UNKNOWN because no camera happened to cover it.
+
+        **And since 2026-08-12 it may create a VESSEL, and only a vessel.** That
+        is not a loosening of the rule above, it is the rule meeting a boat with
+        no lidars: class 3 comes from a separate model (`sender.py
+        --vessel-engine`) with its own measured operating point, and if the
+        camera may not create the track then `colregs.py` has no vessel to give
+        way to and NJORD 9.2 cannot run at all. It is behind
+        `CAMERA_CREATES_VESSELS` so that a boat with a working lidar can go back
+        to the stricter rule with one environment variable. See the block below.
 
         The position used for matching comes from the detection's own `lidar`
         block where it has one - those returns are the same measurement this
@@ -788,13 +798,100 @@ class WorldModel:
                 continue
             pos, slack = placed
             track = self._nearest(pos, slack)
-            if track is None:
-                continue
+            # NOTE: `track is None` is no longer an early exit. It used to be,
+            # and it was the mechanism of "a detection never creates a track" -
+            # the vessel branch below is the single exception, and it needs to
+            # see the None. Every other class still gives up on it, a few lines
+            # further down.
 
             kind = FROM_DETECTOR_CLASS.get(det.get("cls"))
             if kind is None:
                 continue
             confidence = float(det.get("conf") or 0.0)
+
+            # ---- the one exception to "a detection never creates a track".
+            #
+            # A vessel, and only a vessel, and only when the config says so. The
+            # rule above exists because the buoy detector is weak and a phantom
+            # buoy on the chart is worse than a missing one - the lidar poses the
+            # questions and the camera answers them. **Both lidars are dead**
+            # (2026-08-12), so for the Otter there is no question to answer:
+            # either the camera creates the track or NJORD 9.2 does not run at
+            # all.
+            #
+            # Three things keep it honest, and none of them is optional:
+            #
+            #   * it is a SEPARATE model with its own measured operating point
+            #     (`ligmax-ai/vessel/`) rather than the buoy detector guessing;
+            #   * `VESSEL_MIN_CONF` is a much higher bar than the 0.4 the colour
+            #     vote below uses, because this one moves the boat;
+            #   * `TRACK_CONFIRM_HITS` still applies, so a single frame's
+            #     detection is on the chart and is NOT yet steered around.
+            #
+            # And it is deliberately narrow: nothing here lets a camera invent a
+            # buoy, a cardinal or a piece of land.
+            if kind == ObstacleType.BOAT:
+                if not self._config.CAMERA_CREATES_VESSELS:
+                    continue
+                if confidence < self._config.VESSEL_MIN_CONF:
+                    continue
+                if track is not None and track.kind in (ObstacleType.BOAT,) + UNNAMED:
+                    track.observe(
+                        pos, ObstacleType.BOAT, confidence, track.width_m, now,
+                        self._config, f"camera sees a vessel at {confidence:.0%}",
+                    )
+                elif track is None and not self._is_suppressed(
+                        pos, ObstacleType.BOAT, now):
+                    # `width_m` from the Otter's own beam rather than from the
+                    # box: the detection's width is in pixels and the metric
+                    # figure the edge computed IS this constant (it is what the
+                    # range was derived from), so measuring it back off the
+                    # detection would be circular.
+                    self._tracks.append(
+                        Track(
+                            self._next_id, pos, ObstacleType.BOAT, confidence,
+                            self._config.OTTER_BEAM_M, now, self._config, "camera",
+                        )
+                    )
+                    self._tracks[-1].reason = (
+                        f"camera sees a vessel at {confidence:.0%} (no lidar)"
+                    )
+                    self._next_id += 1
+                continue
+
+            # ---- the second exception: a red or green MARK, for the surprise task.
+            #
+            # Same shape as the vessel branch above and the same three guards, and
+            # it is aimed straight at the reason the rule exists, so the reasoning
+            # is worth having here rather than only in `config.py`:
+            #
+            #   * OFF unless an operator switched it on for this run
+            #     (`CAMERA_CREATES_MARKS`, `set_mark_source`), where the vessel
+            #     exception is on by default. Every other course is better served
+            #     by the strict rule;
+            #   * only the sources named in `MARK_SOURCES`, so "colour" - a hue test
+            #     below the lidar line, the same test that colours the lidar - can be
+            #     trusted while the YOLO is not, which is the actual state of this
+            #     boat;
+            #   * `TRACK_CONFIRM_HITS` still applies, so one frame draws a mark on
+            #     the chart and does NOT yet shift the corridor.
+            #
+            # What makes this bearable where a phantom vessel would not be: a mark is
+            # a constraint on the *corridor*, not a stop. `buoys._lateral` shifts the
+            # aim line a couple of metres and drives on. And range is bounded
+            # (`MARK_MAX_RANGE_M`) because it comes from apparent size and degrades
+            # as its square - past that the mark's own sigma is wider than the
+            # clearance the rule is trying to enforce, and it would shove the line
+            # sideways for a buoy nobody can properly see.
+            if kind in (ObstacleType.RED, ObstacleType.GREEN) and self._create_mark(
+                det, pos, kind, confidence, track, now, boat_xy
+            ):
+                continue
+
+            # Everything below refines an existing track and nothing else, so a
+            # detection that matched nothing is finished with here.
+            if track is None:
+                continue
 
             if kind == ObstacleType.CARDINAL:
                 track.note_cardinal(det.get("card"), float(det.get("card_conf") or 0.0))
@@ -818,6 +915,88 @@ class WorldModel:
                     f"camera says {label(kind)} at {confidence:.0%} (no lidar colour)",
                 )
 
+    def _create_mark(self, det, pos, kind, confidence, track, now, boat_xy):
+        """A camera-created red or green mark. True if this detection is finished.
+
+        True means "handled, do not fall through" - either a track was created or
+        an existing one was refined as a mark. False leaves the detection to the
+        ordinary weak-vote path below, which is what keeps the strict rule's
+        behaviour byte-for-byte identical while the switch is off.
+        """
+        config = self._config
+        if not config.CAMERA_CREATES_MARKS:
+            return False
+        source = str(det.get("src") or "yolo").strip().lower()
+        if source not in config.MARK_SOURCES:
+            return False
+
+        floor = (
+            config.MARK_MIN_CONF_COLOUR
+            if source == "colour"
+            else config.MARK_MIN_CONF_YOLO
+        )
+        if confidence < floor:
+            return False
+
+        # Range, and it is the reason most detections stop here. `_detection_position`
+        # has already turned bearing plus range into a world point, so the check is on
+        # how far that point is from the boat rather than on the detection's own
+        # `range` block - which is null on a colour blob that fell outside the
+        # detector's crop.
+        if boat_xy is not None:
+            reach = math.dist(boat_xy, pos)
+            if reach > config.MARK_MAX_RANGE_M:
+                return False
+
+        if track is not None:
+            # An existing track: name it, do not duplicate it. This is a stronger
+            # statement than the weak vote below - the vote only speaks where the
+            # lidar's colour path had nothing to say, whereas a source the operator
+            # has switched on is allowed to name a track outright. It still may not
+            # overrule a mark the lidar already coloured differently: a red track
+            # that the camera thinks is green is a disagreement worth keeping, not a
+            # value worth overwriting.
+            if track.kind in UNNAMED or track.kind == kind:
+                track.observe(
+                    pos, kind, confidence, track.width_m, now, config,
+                    f"{source} says {label(kind)} at {confidence:.0%}",
+                )
+                return True
+            return False
+
+        if self._is_suppressed(pos, kind, now):
+            return False
+
+        self._tracks.append(
+            Track(
+                self._next_id, pos, kind, confidence,
+                config.MARK_DIAMETER_M, now, config, source,
+            )
+        )
+        self._tracks[-1].reason = (
+            f"{source} sees {label(kind)} at {confidence:.0%} (no lidar)"
+        )
+        self._next_id += 1
+        return True
+
+    def _note_no_rig_bearing(self):
+        """Say once a minute that every camera-only detection is being dropped.
+
+        Rate-limited rather than per detection: this fires for every box in every
+        frame, so at 10 fps it would be the only thing in the journal - and a log
+        nobody can read is how the one line that mattered gets missed. Once a minute
+        is often enough to be seen and rare enough to leave the rest legible.
+        """
+        now = time.time()
+        if now - getattr(self, "_no_rig_at", 0.0) < 60.0:
+            return
+        self._no_rig_at = now
+        log.warning(
+            "camera detections carry no bearing_rig_deg, so none of them can be "
+            "placed - the Jetson needs rig.json and a build from 2026-08-12 or "
+            "later. With no lidar this means NO marks and NO vessel at all"
+        )
+
     def _detection_position(self, det, boat_xy, heading_deg):
         """`(world position, extra match slack)` for a detection, or None.
 
@@ -836,7 +1015,25 @@ class WorldModel:
             if not fallback.get("valid"):
                 return None
             range_m = fallback.get("range_m")
-            bearing = det.get("bearing_deg")
+            # **`bearing_rig_deg`, not `bearing_deg`.** The plain one is measured
+            # from that camera's OPTICAL AXIS and the two lenses are yawed +-75 deg
+            # (`rig.json`), so using it here put a mark seen dead ahead of camera 0
+            # seventy-five degrees from where it actually was. It cost nothing while
+            # a detection could only refine a lidar track that already had a
+            # position - the refine path uses `track.pos` and the match gate is
+            # metres wide - and it became the whole answer the moment both lidars
+            # died and the camera started creating the track. See
+            # `ligmax-edge/estimate.py`, which computes the rig-frame angle from the
+            # ray and the mount.
+            bearing = det.get("bearing_rig_deg")
+            if bearing is None:
+                # An older Jetson build, or one running without `rig.json`. Refuse
+                # rather than fall back to the camera-frame angle: a mark 75 deg
+                # from where it is will be dutifully avoided, reported, and drawn on
+                # the operator's chart, and nothing about it looks wrong. A missing
+                # mark is recoverable and a confidently misplaced one is not.
+                self._note_no_rig_bearing()
+                return None
             # Range from apparent size degrades as z**2 - about 6 % at 20 m -
             # so a match against it needs a much wider gate than a lidar range.
             slack = 2.0 + 0.15 * float(range_m or 0.0)

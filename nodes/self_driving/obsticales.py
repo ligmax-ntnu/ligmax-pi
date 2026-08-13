@@ -142,6 +142,12 @@ FROM_DETECTOR_CLASS = {
     0: ObstacleType.GREEN,
     1: ObstacleType.RED,
     2: ObstacleType.CARDINAL,
+    # Class 3 does NOT come out of the buoy engine. It is the collision-avoidance
+    # detector, a second engine on the Jetson (`sender.py --vessel-engine`), and
+    # it is the ONLY class here that may create a track of its own rather than
+    # merely refine one - see `world.absorb_detections`. With both lidars dead
+    # there is nothing else that can see the Otter at all.
+    3: ObstacleType.BOAT,
 }
 
 #: The detector's second-stage cardinal classifier (`card`) as our types.

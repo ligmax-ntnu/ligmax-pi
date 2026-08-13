@@ -423,6 +423,15 @@ class Node:
                 ok, result = self.commander.set_alternation(
                     bool(args.get("on", True))
                 )
+            elif name == "set_mark_source":
+                # The surprise task's two modes (/surprise_task on the dashboard):
+                # which camera sources may create red and green marks now that no
+                # lidar can. Off by default - see `config.CAMERA_CREATES_MARKS` for
+                # why this one exception to "a camera never creates a mark" was
+                # worth opening, and `commander.set_mark_source` for what it does.
+                ok, result = self.commander.set_mark_source(
+                    args.get("sources", args.get("source"))
+                )
             elif name == "autopilot_pause":
                 ok, result = self.pilot.pause()
             elif name == "autopilot_resume":

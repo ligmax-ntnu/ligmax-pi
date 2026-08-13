@@ -2428,6 +2428,362 @@ def _fake_cluster(centre, colour, width=0.4):
     )
 
 
+def test_camera_marks():
+    """A camera may create a mark, and only when it has been told it may.
+
+    The second breach of "a detection never creates a track"
+    (`world.absorb_detections`), opened 2026-08-12 because with both lidars dead
+    nothing else can put a red or green mark on the chart and a scored buoy leg
+    silently becomes blind GNSS transit. Every guard on it is checked here, because
+    the guards ARE the feature - without them this is the phantom-buoy machine the
+    original rule existed to prevent.
+    """
+    section("camera-created marks (the surprise task's colour mode)")
+
+    from nodes.self_driving.perception.world import WorldModel as WM
+
+    # A colour detection as `edge_link.detections()` delivers it: no lidar block, a
+    # rig-frame bearing, and a range from apparent size.
+    def det(kind_cls, conf, range_m=8.0, bearing=0.0, src="colour"):
+        return {
+            "id": None, "cls": kind_cls, "src": src, "conf": conf,
+            "bearing_rig_deg": bearing, "in_valid_cone": True,
+            "range": {"range_m": range_m, "sigma_m": 0.5, "valid": True},
+        }
+
+    #: 0 green, 1 red - `edge/protocol.CLASS_NAMES`, mirrored in `obsticales`.
+    GREEN_CLS, RED_CLS = 0, 1
+    was = (config.CAMERA_CREATES_MARKS, config.MARK_SOURCES)
+    try:
+        # ---- off by default: the strict rule still holds ------------------
+        config.CAMERA_CREATES_MARKS, config.MARK_SOURCES = False, ("colour",)
+        world = WM(config)
+        world.absorb_detections([det(RED_CLS, 0.9)], (0.0, 0.0), 0.0, 1000.0)
+        check(not world.marks(), "with the switch off a colour detection creates nothing")
+
+        # ---- on: it creates, and it is still not steered for yet ----------
+        config.CAMERA_CREATES_MARKS = True
+        world = WM(config)
+        world.absorb_detections([det(RED_CLS, 0.9)], (0.0, 0.0), 0.0, 1000.0)
+        made = world.all()
+        check(len(made) == 1, f"with the switch on it creates one track ({len(made)})")
+        check(
+            made and made[0].kind == ObstacleType.RED,
+            "...and it is a RED mark",
+        )
+        check(
+            not world.marks(),
+            "...but TRACK_CONFIRM_HITS still applies: one frame is on the chart "
+            "and is NOT yet steered around",
+        )
+        for tick in range(1, config.TRACK_CONFIRM_HITS + 1):
+            world.absorb_detections(
+                [det(RED_CLS, 0.9)], (0.0, 0.0), 0.0, 1000.0 + 0.1 * tick
+            )
+        check(len(world.marks()) == 1, "after its confirm hits the mark is real")
+
+        # ---- the source has to be one the operator switched on ------------
+        config.MARK_SOURCES = ("colour",)
+        world = WM(config)
+        world.absorb_detections(
+            [det(RED_CLS, 0.9, src="yolo")], (0.0, 0.0), 0.0, 1000.0
+        )
+        check(
+            not world.all(),
+            "a yolo detection creates nothing while only 'colour' is switched on",
+        )
+
+        # ---- and its confidence has to clear that source's own floor ------
+        world = WM(config)
+        world.absorb_detections(
+            [det(GREEN_CLS, config.MARK_MIN_CONF_COLOUR - 0.05)],
+            (0.0, 0.0), 0.0, 1000.0,
+        )
+        check(not world.all(), "a blob under MARK_MIN_CONF_COLOUR creates nothing")
+
+        # ---- range: apparent size degrades as z**2, so far marks are dropped
+        world = WM(config)
+        world.absorb_detections(
+            [det(GREEN_CLS, 0.9, range_m=config.MARK_MAX_RANGE_M + 5.0)],
+            (0.0, 0.0), 0.0, 1000.0,
+        )
+        check(
+            not world.all(),
+            f"a mark beyond MARK_MAX_RANGE_M ({config.MARK_MAX_RANGE_M:.0f} m) is "
+            f"dropped rather than shipped with a huge sigma",
+        )
+
+        # ---- the bug that made all of this necessary ---------------------
+        #
+        # `bearing_deg` is measured from the camera's optical axis and the lenses
+        # are yawed +-75 deg. A build that sends only that must be refused, not
+        # believed: a mark 75 deg from where it is gets avoided, reported and drawn,
+        # and nothing about it looks wrong.
+        world = WM(config)
+        stale = det(RED_CLS, 0.9)
+        stale.pop("bearing_rig_deg")
+        stale["bearing_deg"] = 0.0
+        world.absorb_detections([stale], (0.0, 0.0), 0.0, 1000.0)
+        check(
+            not world.all(),
+            "a detection with no rig-frame bearing is refused, not placed with the "
+            "camera-frame one",
+        )
+
+        # ---- placement: the rig bearing is used, and it is a boat-frame angle
+        world = WM(config)
+        for tick in range(config.TRACK_CONFIRM_HITS + 1):
+            world.absorb_detections(
+                [det(RED_CLS, 0.9, range_m=10.0, bearing=90.0)],
+                (0.0, 0.0), 0.0, 1000.0 + 0.1 * tick,
+            )
+        marks = world.marks()
+        check(len(marks) == 1, "a mark 90 deg to starboard is created")
+        if marks:
+            east, north = marks[0].pos
+            check(
+                east > 9.0 and abs(north) < 2.0,
+                f"...and it lands to the EAST of a north-facing boat "
+                f"({east:.1f}, {north:.1f})",
+            )
+    finally:
+        config.CAMERA_CREATES_MARKS, config.MARK_SOURCES = was
+
+
+def test_park_no_exit():
+    """The surprise task ends INSIDE the final berth, so the parking exit is skipped.
+
+    The organisers' clarification of 2026-08-12. Checked at the plan level, which is
+    where the mistake would be made - a flag typed onto the wrong waypoint.
+    """
+    section("park_no_exit - staying in the berth")
+
+    plan = Plan.parse({"waypoints": [
+        {"name": "17", "x": 0, "y": 10, "role": "park_tag_parallel",
+         "park_no_exit": True},
+    ]}, ORIGIN)
+    check(plan.waypoints[0].park_no_exit is True, "a parking waypoint accepts it")
+    check(
+        plan.waypoints[0].to_dict().get("park_no_exit") is True,
+        "...and it survives the round trip through to_dict, so it reaches the chart, "
+        "the saved plan and the trip header",
+    )
+
+    quiet = Plan.parse({"waypoints": [
+        {"name": "16", "x": 0, "y": 10, "role": "buoys"},
+    ]}, ORIGIN)
+    check(
+        quiet.waypoints[0].to_dict().get("park_no_exit") is None,
+        "a waypoint that did not ask for it does not carry it at all",
+    )
+
+    try:
+        Plan.parse({"waypoints": [
+            {"name": "16", "x": 0, "y": 10, "role": "buoys", "park_no_exit": True},
+        ]}, ORIGIN)
+        check(False, "park_no_exit on a non-parking role is refused")
+    except PlanError as exc:
+        check("park_no_exit" in str(exc), f"park_no_exit on 'buoys' is refused: {exc}")
+
+    # And the behaviour reads it off the waypoint rather than off its own state, so
+    # an operator can still change their mind during the ten second hold.
+    from nodes.self_driving.behaviours.parking import Parking
+
+    parking = Parking(config, parallel=True, source="artag")
+
+    class Ctx:
+        waypoint = plan.waypoints[0]
+
+    check(parking._no_exit(Ctx()), "the behaviour sees it on the waypoint")
+    Ctx.waypoint = quiet.waypoints[0]
+    check(not parking._no_exit(Ctx()), "...and does not see it where it is not set")
+
+
+def test_ring_course():
+    """The surprise task's two course-level rules: `buoyage` and `cardinal_rule`.
+
+    Both are new on 2026-08-13 and both decide which side of every mark on the
+    course the boat goes, so what is checked here is the SIGNS. A sign error in
+    either one is a boat that rounds the whole ring backwards while reporting that
+    it is obeying the rule - the failure mode `docs/findings.md` item 41 is about.
+    """
+    section("a ring course - buoyage 'route' and cardinal_rule 'inside'")
+
+    from nodes.self_driving.behaviours.buoys import Buoys
+    from nodes.self_driving.plan import SIDE_PORT, SIDE_STARBOARD
+
+    # A counter-clockwise square in grid metres: east along y=0, north, west, home.
+    # Counter-clockwise is entered with its interior to PORT, and that is the whole
+    # derivation `interior_side` does.
+    LOOP = [(30, 0), (30, 30), (0, 30), (0, 2)]
+
+    def ring(**extra):
+        return Plan.parse({
+            "waypoints": [
+                {"name": str(i), "x": x, "y": y, "role": "buoys"}
+                for i, (x, y) in enumerate(LOOP)
+            ],
+            **extra,
+        }, ORIGIN)
+
+    plan = ring(buoyage="route", cardinal_rule="inside")
+    check(plan.interior_side() == SIDE_PORT,
+          "a counter-clockwise course has its interior to PORT")
+    reversed_plan = Plan.parse({
+        "waypoints": [
+            {"name": str(i), "x": x, "y": y, "role": "buoys"}
+            for i, (x, y) in enumerate(reversed(LOOP))
+        ],
+        "cardinal_rule": "inside",
+    }, ORIGIN)
+    check(reversed_plan.interior_side() == SIDE_STARBOARD,
+          "...and running the same loop the other way puts it to STARBOARD")
+
+    # ---- buoyage: the leg that used to invert.
+    #
+    # 199 deg is 161 deg off the venue's north reference, past the 135 deg boundary,
+    # so the venue rule inverts red and green on it. On the real course that leg is
+    # 32 m long and scored. "route" is the statement that a ring has no such
+    # reference: the direction of travel is the direction of buoyage, all the way
+    # round.
+    behaviour = Buoys(config)
+
+    class LegCtx:
+        heading = 199.0
+
+    LegCtx.leg = ((0.0, 0.0), geo.offset_point((0.0, 0.0), 199.0, 32.0))
+    LegCtx.waypoint = plan.waypoints[0]
+
+    LegCtx.plan = ring()                      # defaults: the venue rule
+    check(not behaviour._with_the_buoyage(LegCtx),
+          "under 'venue' a 199 deg leg inverts - red would go to starboard")
+    LegCtx.plan = plan                        # buoyage: route
+    check(behaviour._with_the_buoyage(LegCtx),
+          "under 'route' the same leg does NOT invert: red stays to port")
+
+    # And the rule the operator described as the brute force - "red on the right,
+    # turn right" - is what that then produces. A red mark 8 m ahead and 2 m to
+    # STARBOARD is on the wrong side, so the aim point must move to STARBOARD, which
+    # is what puts the mark to port of the line.
+    # Attributes assigned after the class body, not inside it: a class body cannot
+    # read an enclosing function's locals once it assigns the same name, which is
+    # why `plan = plan` in here is a NameError rather than a shadow.
+    class LateralCtx:
+        boat = (0.0, 0.0)
+        heading = 0.0
+        leg = ((0.0, 0.0), (0.0, 20.0))
+        caution_speed = 1.0
+        world = None
+
+    LateralCtx.plan = plan
+    LateralCtx.waypoint = plan.waypoints[0]
+    LateralCtx.config = config
+
+    red = _FakeMark(1, (2.0, 8.0), ObstacleType.RED)
+    green = _FakeMark(2, (-2.0, 8.0), ObstacleType.GREEN)
+    LateralCtx.world = _FakeWorld([red])
+    shifted, notes = behaviour._lateral(LateralCtx, (0.0, 20.0))
+    check(shifted[0] > 0.5,
+          f"a RED to starboard shifts the aim to starboard (x={shifted[0]:.2f} m)")
+    LateralCtx.world = _FakeWorld([green])
+    shifted, notes = behaviour._lateral(LateralCtx, (0.0, 20.0))
+    check(shifted[0] < -0.5,
+          f"a GREEN to port shifts the aim to port (x={shifted[0]:.2f} m)")
+
+    # ---- cardinal_rule: inside, on a mark the camera never committed to.
+    #
+    # This is what "inside" buys and it is the reason it exists on this boat: an
+    # unresolved CARDINAL is routed round exactly as well as a committed one,
+    # because which side is inside came from the plan and not from a topmark.
+    mark = _FakeMark(7, (0.0, 12.0), ObstacleType.CARDINAL, sigma_m=0.3)
+
+    class CardCtx:
+        boat = (0.0, 0.0)
+        heading = 90.0
+        # Running east along y=0, so the interior (port) is NORTH.
+        leg = ((0.0, 0.0), (30.0, 0.0))
+        caution_speed = 1.0
+
+    CardCtx.plan = plan
+    CardCtx.waypoint = plan.waypoints[0]
+    CardCtx.config = config
+    CardCtx.world = _FakeWorld([mark])
+
+    # On the leg itself, not off to one side, so the via-point has to be a decision
+    # rather than a rounding of the planned line.
+    mark.pos = (15.0, 0.0)
+    via, note, speed = behaviour._cardinal(CardCtx)
+    check(via is not None, "an UNCOMMITTED cardinal still produces a via-point")
+    check(via[1] > 3.0,
+          f"...and it is on the interior (port, north) side of the mark "
+          f"(north={via[1]:.2f} m)")
+    check("INSIDE" in note, f"the operator is told which rule ran: {note}")
+    check(abs(speed - CardCtx.caution_speed) < 1e-9,
+          "and it is not slowed down waiting for a vote it does not need")
+
+    # The mirrored course must mirror the answer. Nothing else changes.
+    CardCtx.plan = reversed_plan
+    via_mirrored, _note, _speed = behaviour._cardinal(CardCtx)
+    check(via_mirrored[1] < -3.0,
+          f"the same mark on a clockwise loop is passed on the other side "
+          f"(north={via_mirrored[1]:.2f} m)")
+
+    # ---- and the refusals.
+    for field, bad in (("buoyage", "rout"), ("cardinal_rule", "insde")):
+        try:
+            ring(**{field: bad})
+            check(False, f"{field}={bad!r} is refused")
+        except PlanError as exc:
+            check(field in str(exc), f"{field}={bad!r} is refused: {exc}")
+
+    try:
+        Plan.parse({"cardinal_rule": "inside", "waypoints": [
+            {"name": "a", "x": 0, "y": 0, "role": "buoys"},
+            {"name": "b", "x": 0, "y": 15, "role": "buoys"},
+            {"name": "c", "x": 0, "y": 30, "role": "buoys"},
+        ]}, ORIGIN)
+        check(False, "'inside' on a course laid straight is refused")
+    except PlanError as exc:
+        check("encloses" in str(exc),
+              f"'inside' on a course with no inside is refused: {exc}")
+
+    # ---- the course as it will actually be flown, off disk.
+    path = os.path.join(os.path.dirname(__file__), "..", "plans", "surprise-task.json")
+    with open(path, "r", encoding="utf-8") as handle:
+        real = Plan.parse(json.load(handle))
+    check(len(real) == 6, f"plans/surprise-task.json is six waypoints ({len(real)})")
+    check(real.follows_route_buoyage() and real.passes_cardinals_inside(),
+          "...and it carries both ring rules")
+    check(real.interior_side() == SIDE_PORT,
+          "...and the handed-out loop runs counter-clockwise, interior to port")
+    check(real.waypoints[1].role == "park_tag_parallel",
+          "the FIRST docking is the alongside one (GPS 14)")
+    check(real.waypoints[5].role == "park_tag" and real.waypoints[5].park_no_exit,
+          "the LAST is bow-in and the run ends inside it (GPS 18)")
+
+
+class _FakeMark:
+    """The few attributes `buoys` reads off a track. Not a `Track`: building one
+    needs a config, a birth time and an observation history, none of which the
+    lateral or cardinal arithmetic touches, and a fake makes the test say which
+    fields the behaviour actually depends on."""
+
+    def __init__(self, id_, pos, kind, sigma_m=0.2):
+        self.id = id_
+        self.pos = pos
+        self.kind = kind
+        self.sigma_m = sigma_m
+        self.width_m = 0.4
+
+
+class _FakeWorld:
+    def __init__(self, marks):
+        self._marks = list(marks)
+
+    def marks(self):
+        return self._marks
+
+
 def main():
     start = time.time()
     for test in (
@@ -2454,6 +2810,9 @@ def main():
         test_fast_course,
         test_speed_clearance,
         test_alternation,
+        test_camera_marks,
+        test_park_no_exit,
+        test_ring_course,
         test_real_jetson_sample,
     ):
         try:

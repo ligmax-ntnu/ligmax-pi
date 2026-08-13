@@ -718,6 +718,23 @@ class Parking(Behaviour):
             )
 
         if held >= required:
+            if self._no_exit(ctx):
+                # The hold is the end of the run. Finish parked rather than
+                # reversing out - the surprise task's clarification of 2026-08-12
+                # ends the task inside the final berth, and an exit nobody asked
+                # for is one more manoeuvre against a pontoon after the scored part
+                # is already won.
+                #
+                # `done` without an intent of its own: `pilot.py` advances on the
+                # flag, and this being the last waypoint it advances to the end of
+                # the plan, which station-keeps. What must NOT happen here is a
+                # `stop()` that also means "clear of the space" - the boat is in the
+                # space, and the panel has to say so.
+                self.done = True
+                self.note(exit_skipped="park_no_exit - staying in the berth")
+                return self._approach_move(
+                    ctx, target, "parked - holding the berth, no exit asked for",
+                )
             self._to(EXIT, ctx)
             return self._exit(ctx)
 
@@ -1238,6 +1255,18 @@ class Parking(Behaviour):
             self.config.PARK_PARALLEL_DEPTH_M
             if self.parallel
             else self.config.PARK_DEPTH_M
+        )
+
+    def _no_exit(self, ctx):
+        """Whether this waypoint asked to be left in the berth. See `plan.py`.
+
+        Read off the waypoint every time rather than latched at entry, because the
+        one thing an operator may need to do during a ten second hold is change
+        their mind about what happens at the end of it - and the plan is what they
+        can reach from the dashboard while the boat sits there.
+        """
+        return ctx.waypoint is not None and bool(
+            getattr(ctx.waypoint, "park_no_exit", False)
         )
 
     def _required_hold(self, ctx):

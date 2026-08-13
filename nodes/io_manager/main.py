@@ -55,8 +55,11 @@ What it does:
     waypoints as a real MAVLink mission (`mission.py`) for AUTO to run, and
     `clear_waypoints` empties it; `set_param` writes one stabilisation gain or
     trim and `get_params` re-reads the lot (`tuning.py`); `set_lights_mode`,
-    `set_lights_pattern` and `set_lights_fps` are `/led_control`'s
-    standard/custom switch, its pattern, and its refresh rate (`lights.py`);
+    `set_lights_pattern`, `set_lights_fps` and `set_lights_servos` are
+    `/led_control`'s standard/custom switch, its pattern, its refresh rate, and
+    the two headlight-cover servos' angles (`lights.py`) - that last one moves a
+    mechanism, so it refuses an angle outside the cover's travel instead of
+    clamping it;
     `set_ride_height` walks the amas up or down as an RC override on channel 14
     (`pixhalwk.py`), refreshed here every loop because the autopilot expires
     one that goes quiet, and `release_ride_height` hands that channel back to
@@ -742,6 +745,17 @@ def handle_commands(
             else:
                 lights.set_fps(args.get("fps"))
                 ok, result = True, "fps updated"
+        elif name == "set_lights_servos":
+            # The two headlight-cover servos on the lights ESP32, straight to an
+            # angle each, from /led_control's sliders. The only command on this
+            # node's lights path that moves a mechanism rather than lighting
+            # one, which is why it is the only one that refuses rather than
+            # clamps: `set_servos()` bounds each side by that cover's own
+            # measured travel and answers in the operator's words.
+            if lights is None:
+                ok, result = False, "no lights driver on this node"
+            else:
+                ok, result = lights.set_servos(args.get("left"), args.get("right"))
         elif name in ("safety_on", "safety_off"):
             # The Pixhawk's own safety switch, pressed from the dashboard.
             # ArduPilot forces the board's safety state directly for this

@@ -1,0 +1,54 @@
+{
+  "name": "surprise-task",
+  "buoyage": "route",
+  "cardinal_rule": "inside",
+  "waypoints": [
+    {
+      "name": "13",
+      "lat": 63.441135,
+      "lon": 10.424155,
+      "role": "transit",
+      "notes": "GPS 13 - the run-in. Autonomy is engaged here, so NJORD 8.1's timer starts here. 8.0 m at 185 to the alongside berth."
+    },
+    {
+      "name": "14",
+      "lat": 63.441063,
+      "lon": 10.424141,
+      "role": "park_tag_parallel",
+      "hold_s": 10,
+      "park_probe_deg": 148,
+      "notes": "GPS 14 - the FIRST docking and it is the PARALLEL one (2026-08-13). 2.7 m from the old handout's 17, which is where park_probe_deg comes from - CONFIRM ON THE WATER."
+    },
+    {
+      "name": "15",
+      "lat": 63.441155,
+      "lon": 10.423620,
+      "role": "buoys",
+      "notes": "GPS 15 - first ring leg, 27.9 m at 291 out of the berth, and the longest on the course. Needs a live mark source (set_mark_source) or it is blind transit."
+    },
+    {
+      "name": "16",
+      "lat": 63.440927,
+      "lon": 10.423630,
+      "role": "buoys",
+      "notes": "GPS 16 - second ring leg, 25.2 m at 179. Moved 12 m on 2026-08-13. At 179 the old venue buoyage rule inverts red and green: see buoyage 'route'."
+    },
+    {
+      "name": "17",
+      "lat": 63.440810,
+      "lon": 10.423840,
+      "role": "buoys",
+      "notes": "GPS 17 - third ring leg, 16.6 m at 141, and this one inverts under the venue rule too. 1.7 m from the old handout's 13."
+    },
+    {
+      "name": "18",
+      "lat": 63.440950,
+      "lon": 10.423950,
+      "role": "park_tag",
+      "hold_s": 10,
+      "park_no_exit": true,
+      "park_probe_deg": 86,
+      "notes": "GPS 18 - the SECOND docking, BOW-IN, and the end. 16.4 m at 020 in. park_no_exit: the task ends inside this berth. 3.0 m from the old handout's 14, hence the probe bearing."
+    }
+  ]
+}

@@ -49,6 +49,16 @@ So there are two cases and they are handled differently on purpose:
                  clearance, slow down, and say so loudly enough that the
                  operator can use §8.2's twenty seconds if the camera never
                  makes up its mind.
+
+Unless the course is a ring - `plan.CARDINAL_INSIDE`
+-----------------------------------------------------
+Everything above is NJORD §10.3, where a cardinal is a statement about the water
+around itself. A course whose cardinals ring the *outside* of a closed circuit is
+a different instruction - "stay inside them" - and `cardinal_rule: "inside"` obeys
+that one instead (`_inside`). Which side is inside comes from the shape of the plan,
+so the two cases above collapse into one: the topmark never comes up, and an
+uncommitted cardinal is as actionable as a committed one. The surprise task is laid
+that way; Task 1 is not.
 """
 
 from .. import geo
@@ -210,7 +220,17 @@ class Buoys(Transit):
         at true north in `plan.BUOYAGE_BEARING_DEG`. What varies is the leg, and
         anything short of running back down the channel counts as with it - see
         `BUOYAGE_INVERTS_BEYOND_DEG` for why that boundary is not 90 deg.
+
+        Unless the course said it is a **ring** (`plan.BUOYAGE_ROUTE`), in which
+        case the direction of travel *is* the direction of buoyage and this is
+        always true. That is not a shortcut around the paragraph above, it is the
+        paragraph above not applying: a closed loop run once visits every compass
+        bearing, so there is no reference the window could be measured from. The
+        rule the boat then obeys is the one the marks were laid for - red to port,
+        green to starboard, all the way round.
         """
+        if ctx.plan is not None and ctx.plan.follows_route_buoyage():
+            return True
         channel = ctx.plan.bearing_of_buoyage(ctx.waypoint)
         if ctx.leg is None:
             leg_bearing = ctx.heading if ctx.heading is not None else channel
@@ -247,6 +267,9 @@ class Buoys(Transit):
         if nearest is None:
             return None, "", ctx.caution_speed
         distance, track = nearest
+
+        if ctx.plan is not None and ctx.plan.passes_cardinals_inside():
+            return self._inside(ctx, track, distance)
 
         outbound = self._with_the_buoyage(ctx)
         safe_bearing = CARDINAL_SAFE_BEARING.get(track.kind)
@@ -306,6 +329,64 @@ class Buoys(Transit):
             f"{track.kind.name.lower()} cardinal #{track.id} at {distance:.0f} m - "
             f"passing on its {track.kind.name.lower()} side, per {side_from}",
             speed,
+        )
+
+
+    def _inside(self, ctx, track, distance):
+        """`(via, note, speed)` for a cardinal passed INSIDE the loop.
+
+        The course's own shape says which side that is (`plan.interior_side`), so
+        **what kind of cardinal this is never comes up.** No topmark, no
+        second-stage classifier, no alternation prior, and no slow-down waiting for
+        a vote that may never land: an unresolved `CARDINAL` is routed round exactly
+        as well as a committed north one. On a boat whose cardinal classifier is
+        weak and whose lidars are dead, that is the difference between the rule
+        working and the rule sitting at `CAUTION_SPEED_MS` hoping.
+
+        Which is also the danger, and it is worth being plain about: this pass is
+        only right if the marks really do ring the outside of the loop. Told to
+        "stay inside them" that is what they do, and the geometry then agrees with
+        the jury. Pointed at a channel it would be confidently wrong, which is why
+        `cardinal_rule` is a deliberate per-course choice and not a fallback for a
+        classifier that would not commit.
+
+        The offset runs perpendicular to the **leg**, not to the bearing of the mark
+        from the boat. A via-point placed off the boat-to-mark line moves as the boat
+        moves, so the aim point would walk sideways as the mark is approached and the
+        turn would tighten into it; off the leg it is a fixed point in the water and
+        the boat arcs round it once.
+        """
+        side = ctx.plan.interior_side()
+        if side is None or ctx.leg is None:
+            # `parse` refuses this combination, so reaching here means the leg has
+            # gone away mid-run rather than that the plan was bad. Hold the line.
+            return (
+                None,
+                f"cardinal #{track.id} at {distance:.0f} m - no inside to pass on; "
+                f"holding the planned line",
+                ctx.caution_speed,
+            )
+
+        leg_bearing = geo.bearing_to(ctx.leg[0], ctx.leg[1])
+        # `side` is -1 for port and +1 for starboard, and the via-point goes on the
+        # INTERIOR side of the mark - which is the side the boat then passes it on.
+        toward_inside = leg_bearing + 90.0 * side
+        via = geo.offset_point(
+            track.pos, toward_inside, CARDINAL_OFFSET_M + track.sigma_m
+        )
+        hand = "port" if side < 0 else "starboard"
+        if geo.distance(ctx.boat, via) < 2.0:
+            return (
+                None,
+                f"cardinal #{track.id} cleared on its {hand} side (inside)",
+                ctx.caution_speed,
+            )
+        return (
+            via,
+            f"cardinal #{track.id} at {distance:.0f} m - passing INSIDE it, "
+            f"{CARDINAL_OFFSET_M + track.sigma_m:.1f} m to its {hand}, "
+            f"per the course's own loop",
+            ctx.caution_speed,
         )
 
 

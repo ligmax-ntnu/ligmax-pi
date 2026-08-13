@@ -87,6 +87,12 @@ AUTOPILOT_COMMANDS = frozenset(
         # `not implemented` by `handle_commands` and the autonomy node never saw
         # it. Same class of bug as `goto` (docs/findings.md).
         "alternation",
+        # Which camera sources may create red/green marks - the surprise task's
+        # colour vs YOLO modes (`self_driving/commander.set_mark_source`). Listed
+        # here on the day it was written, because the two commands above it are both
+        # records of what forgetting to costs: an operator pressing a button that
+        # acks `not implemented` for a feature that exists on the vessel.
+        "set_mark_source",
     }
 )
 

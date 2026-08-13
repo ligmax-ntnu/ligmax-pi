@@ -379,6 +379,63 @@ class Commander:
             "line and slows down instead of guessing"
         )
 
+    def set_mark_source(self, sources):
+        """Which camera sources may create red/green marks. `(ok, message)`.
+
+        The dashboard's two surprise-task modes, and it writes straight onto the
+        config module - which every consumer holds a reference to, so the change is
+        live on the next tick and lands in the trip header via `config.snapshot`.
+
+        Switching sources deliberately does NOT clear the existing marks. A mark the
+        colour test created is a real observation of a real buoy whichever detector
+        found it, and throwing the map away mid-leg would leave the boat blind for
+        the several ticks `TRACK_CONFIRM_HITS` needs to build it again - in the
+        middle of the one leg it is scored on. `forget_world` is the button for
+        starting clean, and it is a separate press for that reason.
+        """
+        allowed = ("colour", "yolo")
+        if sources is None:
+            requested = ()
+        elif isinstance(sources, str):
+            requested = tuple(
+                part.strip().lower() for part in sources.split(",") if part.strip()
+            )
+        else:
+            try:
+                requested = tuple(str(part).strip().lower() for part in sources)
+            except TypeError:
+                return False, f"{sources!r} is not a source or a list of them"
+
+        unknown = [part for part in requested if part not in allowed]
+        if unknown:
+            return False, (
+                f"unknown mark source{'s' if len(unknown) > 1 else ''} "
+                f"{', '.join(unknown)} - the sources are {', '.join(allowed)}"
+            )
+
+        requested = tuple(dict.fromkeys(requested))  # de-duplicate, keep the order
+        self._config.MARK_SOURCES = requested
+        # One switch, not two. `CAMERA_CREATES_MARKS` is the gate `world.py` reads
+        # and this list is what it lets through, so an operator who empties the list
+        # means "off" and should not have to find a second control to say it.
+        self._config.CAMERA_CREATES_MARKS = bool(requested)
+
+        if not requested:
+            log.warning(
+                "MARK SOURCES OFF - the camera can no longer create marks, so a "
+                "'buoys' leg is blind GNSS transit"
+            )
+            return True, (
+                "mark sources OFF - no camera-created marks, and with both lidars "
+                "down a 'buoys' waypoint is now blind transit"
+            )
+        log.warning("MARK SOURCES: %s", ", ".join(requested))
+        return True, (
+            f"mark sources {', '.join(requested)} - these may now create red and "
+            f"green marks, and a 'buoys' leg will shift its corridor for them "
+            f"after {self._config.TRACK_CONFIRM_HITS} sightings"
+        )
+
     # ------------------------------------------------------------- engagement
 
     def engage(self, state):
@@ -559,6 +616,12 @@ class Commander:
         block["speed_kn"] = round(self.speed / KNOT_MS, 2)
         block["speed_min_ms"] = round(SPEED_MIN_MS, 3)
         block["alternation"] = self.alternation
+        # Which camera sources may create marks, always sent as a list even when it
+        # is empty - `[]` on the panel is "off, and the vessel said so", where a
+        # missing key is "this build does not have the feature". /surprise_task
+        # shows those two differently on purpose, because with both lidars down the
+        # first is a decision and the second is a boat that needs a git pull.
+        block["mark_sources"] = list(self._config.MARK_SOURCES)
         block["lateral_mode"] = LATERAL_MODE
         if LATERAL_MODE == "rc" and not LATERAL_RC_CHAN:
             block["lateral_warning"] = (

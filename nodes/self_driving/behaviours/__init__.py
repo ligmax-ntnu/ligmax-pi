@@ -9,6 +9,10 @@ with a jury watching.
     transit         `transit.Transit`   blind GNSS following        NJORD §9.1 pt 1
     buoys           `buoys.Buoys`       + lateral marks, cardinals  NJORD §9.1 pt 2
     avoid           `colregs.Colregs`   + give way to a vessel      NJORD §9.2
+    collision_front `collision.CollisionFront`  see it ahead -> starboard, rejoin
+    collision_right `collision.CollisionRight`  see it to starboard -> stop
+    collision_front_backup  `collision.CollisionFrontBackup`  the same, blind
+    collision_right_backup  `collision.CollisionRightBackup`  the same, blind
     hold            `hold.Hold`         arrive and station-keep     NJORD §9.1
     dock            `dock.Dock`         bow-in, hold 10 s, reverse  NJORD §9.3.1
     dock_parallel   `dock.Dock`         alongside, hold 5 s, ahead  NJORD §9.3.2
@@ -45,6 +49,13 @@ up with neither.
 from .. import plan as plan_roles
 from .base import Behaviour, Context
 from .buoys import Buoys
+from .collision import (
+    Collision,
+    CollisionFront,
+    CollisionFrontBackup,
+    CollisionRight,
+    CollisionRightBackup,
+)
 from .colregs import Colregs
 from .dock import Dock
 from .hold import Hold
@@ -55,6 +66,11 @@ __all__ = [
     "Behaviour",
     "Context",
     "Buoys",
+    "Collision",
+    "CollisionFront",
+    "CollisionFrontBackup",
+    "CollisionRight",
+    "CollisionRightBackup",
     "Colregs",
     "Dock",
     "Hold",
@@ -81,6 +97,14 @@ def for_role(role, config):
         return Buoys(config)
     if role == plan_roles.AVOID:
         return Colregs(config)
+    if role == plan_roles.COLLISION_FRONT:
+        return CollisionFront(config)
+    if role == plan_roles.COLLISION_RIGHT:
+        return CollisionRight(config)
+    if role == plan_roles.COLLISION_FRONT_BACKUP:
+        return CollisionFrontBackup(config)
+    if role == plan_roles.COLLISION_RIGHT_BACKUP:
+        return CollisionRightBackup(config)
     if role == plan_roles.HOLD:
         return Hold(config)
     if role == plan_roles.DOCK:

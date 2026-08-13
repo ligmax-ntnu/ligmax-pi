@@ -69,6 +69,19 @@ def _s(name, default):
     return value or default
 
 
+def _list(name, default):
+    """A comma-separated environment list, lowercased, as a tuple.
+
+    An empty variable means the empty tuple and not the default - `MARK_SOURCES=`
+    is how a run says "no camera marks at all", and falling back to the default
+    there would be the opposite of what was typed.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return tuple(default)
+    return tuple(part for part in (p.strip().lower() for p in raw.split(",")) if part)
+
+
 # ---------------------------------------------------------------- loop timing
 
 # The autonomy tick. 10 Hz matches the lidar's own rotation rate, so every tick
@@ -972,6 +985,265 @@ COLREG_TURN_DEG = _f("LIGMAX_AP_COLREG_TURN_DEG", 45.0)
 COLREG_PANIC_M = _f("LIGMAX_AP_COLREG_PANIC_M", 4.0)
 
 
+# ------------------------------ the vessel comes from the CAMERA now, not lidar
+#
+# Both lidars died on 2026-08-12 and the Otter has to be found with the cameras
+# alone. `perception/world.absorb_detections` normally refuses to create a track
+# from a camera detection - the buoy detector is weak, and a phantom mark on the
+# chart is worse than a missing one - so the collision-avoidance detector is
+# given a single, narrow exception, and this is its switch.
+#
+# **ON by default**, because with no lidar the alternative is a boat that cannot
+# see the one object NJORD 9.2 is scored on. Turn it OFF if a lidar is repaired:
+# geometry beats a monocular box, and the old rule is the better rule whenever
+# there is something else posing the questions.
+CAMERA_CREATES_VESSELS = _b("LIGMAX_AP_CAMERA_CREATES_VESSELS", True)
+
+# The bar a vessel detection must clear to become a track. **Much higher than
+# the 0.4 the colour vote uses**, and the asymmetry is the point: a camera vote
+# on a buoy's colour shifts a corridor, whereas a camera-invented vessel stops
+# the boat dead in the middle of a scored run. Measured on
+# `ligmax-ai/vessel/synth`: at 0.25 the detector found nothing at all on open
+# water over the whole test set, and recall was still 90-100 % down to a 26 px
+# hull. Raise it if the shoreline at Havet starts inventing vessels; the cost is
+# range, and the table in that README says how much.
+VESSEL_MIN_CONF = _f("LIGMAX_AP_VESSEL_MIN_CONF", 0.25)
+
+# ------------------------------- and for the surprise task, so do the MARKS
+#
+# The second breach of "a camera detection never creates a track", opened
+# 2026-08-12 for the surprise task, and the one that needed the most argument
+# against it - `perception/world.absorb_detections`' rule exists *because* the buoy
+# detector is weak, so this is the exception aimed straight at the reason for the
+# rule. Three things decided it:
+#
+#   * the surprise task scores passing red and green marks on the correct side, and
+#     with both lidars dead `behaviours/buoys.py` has an empty `world.marks()` and
+#     silently degrades to blind GNSS transit. Nothing else on the boat can put a
+#     mark on the chart;
+#   * the marks are a *corridor* constraint, not a stop: a wrong one shifts the aim
+#     line by a couple of metres (`buoys._lateral`), where a wrong vessel stops the
+#     boat dead. The cost of a phantom is bounded here in a way it is not there;
+#   * the colour source is not the YOLO. It is a hue/saturation test on the frame
+#     below the lidar line - the same test that colours the lidar - which is a much
+#     smaller thing to be wrong about than a detector trained on 40 photographs.
+#
+# **OFF by default, and that is deliberate.** Every other task on this boat is
+# better served by the strict rule, and a course that has never been driven with
+# camera-invented marks should not acquire them because somebody flashed a new
+# build. `set_mark_source` on the dashboard turns it on for the run that wants it,
+# which is also what makes it switchable *between* two attempts of the same task.
+CAMERA_CREATES_MARKS = _b("LIGMAX_AP_CAMERA_CREATES_MARKS", False)
+
+# Which detections may do it, as the `src` the Jetson stamps on each one.
+#
+# "colour" is `ligmax-edge/colour_marks.py`, the hue test below the lidar line.
+# "yolo" is the buoy detector proper. Both, either, or neither - the dashboard's
+# two modes are this string, and the reason it is a *list* rather than a boolean is
+# that "run them both and see whether they agree" is the most useful thing an
+# operator can do with fifteen minutes on the water before a run.
+MARK_SOURCES = _list("LIGMAX_AP_MARK_SOURCES", ("colour",))
+
+# The bar a mark detection must clear to become a track, per source. The colour
+# test's "confidence" is the fraction of its blob that passed the hue window, so
+# 0.5 means "half the blob was convincingly that colour"; the YOLO's is a YOLO
+# score and gets the higher bar because it is the weaker instrument of the two on
+# this boat. Neither replaces `TRACK_CONFIRM_HITS`: a single frame puts a mark on
+# the chart and does NOT yet move the boat.
+MARK_MIN_CONF_COLOUR = _f("LIGMAX_AP_MARK_MIN_CONF_COLOUR", 0.5)
+MARK_MIN_CONF_YOLO = _f("LIGMAX_AP_MARK_MIN_CONF_YOLO", 0.6)
+
+# How far out a camera-created mark is believed at all. Range comes from apparent
+# size and degrades as the square of it (~6 % at 20 m), and beyond this the
+# position is worse than the clearance the rule is trying to enforce - a mark whose
+# own uncertainty is wider than the corridor cannot say which side of it the boat
+# is on. Marks further away are dropped rather than shipped with a huge sigma,
+# because `buoys._lateral` adds sigma to the clearance and would otherwise shove
+# the aim line metres sideways for a buoy nobody can see properly yet.
+MARK_MAX_RANGE_M = _f("LIGMAX_AP_MARK_MAX_RANGE_M", 25.0)
+
+# NJORD marks are 40 cm spheres (`--buoy-diameter` on the Jetson). Used as a
+# created mark's width for the same reason `OTTER_BEAM_M` is used for a vessel's:
+# the range was derived from the apparent width, so measuring the width back off
+# the detection would be circular.
+MARK_DIAMETER_M = _f("LIGMAX_AP_MARK_DIAMETER_M", 0.40)
+
+
+# NJORD §9.2: the Otter is 2.0 x 1.08 m. Its BEAM, used as a created track's
+# width. Deliberately the same constant the Jetson derives the range from
+# (`protocol.OTTER_BEAM_M`) - measuring the width back off the detection would
+# be circular, since the range and the width come from the same pixel box.
+OTTER_BEAM_M = _f("LIGMAX_AP_OTTER_BEAM_M", 1.08)
+
+
+# ------------------------------------- what the boat DOES about it, per geometry
+#
+# NJORD 9.2 as it will actually be run (confirmed 2026-08-12): the Otter
+# simulates a vessel that is **out of control** - it holds one straight line
+# whatever we do - and it can only come from **ahead or from starboard**, never
+# from port.
+#
+# Both of those change the rule that applies, and they change it in the same
+# direction. COLREG Rule 18(a): a power-driven vessel underway keeps out of the
+# way of a vessel not under command. So we are the give-way vessel in *every*
+# case, Rule 17's stand-on branch cannot arise, and there is never a reason to
+# hold course into a closing target and hope. `COLREG_STAND_ON` exists to switch
+# that branch back on if the Otter is ever a normal give-way vessel again.
+COLREG_STAND_ON = _b("LIGMAX_AP_COLREG_STAND_ON", False)
+
+# Head-on (Rule 14): turn to starboard, run a track PARALLEL to the leg this far
+# off it, and come back. Not a circle and not a swerve - an offset.
+#
+# Why an offset rather than the aim-astern manoeuvre `_give_way` does: a head-on
+# target has no stern to aim behind, the leg has a **gate at each end** (NJORD
+# 9.2: red/green pairs 5 m apart, 20-80 m between gates) so the boat has to be
+# back on the centreline before it arrives, and a jury reading the chart sees a
+# deliberate dogleg rather than a wobble.
+#
+# 8 m against a `COLREG_MIN_CPA_M` of 8: the two vessels pass port to port with
+# the full offset between them, plus whatever the Otter's own track contributes.
+# Wider is not free - the gate is 5 m wide and the boat has to fit back through
+# it.
+COLREG_OFFSET_M = _f("LIGMAX_AP_COLREG_OFFSET_M", 8.0)
+
+# How far ahead of the boat to plant the offset track's aim point while running
+# out to it. Small makes the turn abrupt and hard to hold; large makes it lazy
+# and Rule 8 wants it "readily apparent". TUNE.
+COLREG_OFFSET_LEAD_M = _f("LIGMAX_AP_COLREG_OFFSET_LEAD_M", 6.0)
+
+# Crossing from starboard (Rule 15): **stop and let it go past.**
+#
+# Rule 15 says keep clear and avoid crossing ahead; Rule 8(e) says in as many
+# words that slackening speed or taking all way off is a legitimate way of doing
+# it. For this encounter it is also the better one. The Otter is not going to
+# manoeuvre, its track is a straight line and therefore exactly predictable, and
+# the boat is on a leg with a 5 m gate at each end - so a turn spends the one
+# thing the geometry does not have, which is room. Standing still and letting a
+# vessel that cannot steer pass ahead is what a mariner does in a channel, and it
+# is unmistakable to a jury.
+#
+# This is the speed held while waiting rather than zero: a hull with no way on
+# has no steering authority at all and will lie across the leg in any wind.
+COLREG_WAIT_SPEED_MS = _speed("LIGMAX_AP_COLREG_WAIT_SPEED_MS", 0.15)
+
+# The wait ends when the vessel is drawing clear, which is two conditions and
+# both must hold - a range that has begun to open is not enough on its own,
+# because it is also what a target that has just passed close ahead looks like
+# one second before it is abeam.
+#
+#   * its bearing has gone abaft this angle, i.e. it is level with us or behind;
+#   * and the projected CPA is no longer a problem, or the range is opening.
+COLREG_CLEAR_ASTERN_DEG = _f("LIGMAX_AP_COLREG_CLEAR_ASTERN_DEG", 100.0)
+
+# A ceiling on the wait, so a detector that latches onto the pontoon does not
+# park the boat on the course for the rest of the attempt. NJORD §8.2 gives a
+# 20 s autonomous window before the team must take over; this expires first and
+# says so loudly, leaving the operator time to use those seconds.
+COLREG_WAIT_MAX_S = _f("LIGMAX_AP_COLREG_WAIT_MAX_S", 45.0)
+
+
+# --------------------------------------------- the four declared collision roles
+#
+# `behaviours/collision.py`, and the whole point of them is that **the operator
+# declares which encounter this is before the boat moves**. Which side the Otter
+# comes from is in the briefing and there are only two cases, so it is a waypoint
+# role picked on the dock rather than something classified from a monocular
+# bearing thirty seconds before it matters.
+#
+#   collision_front         vessel in -45..+45 deg  -> alter to starboard, rejoin
+#   collision_right         vessel in +45..+110     -> hold, let it cross ahead
+#   collision_front_backup  the same alteration, larger, on geometry alone
+#   collision_right_backup  the same hold, longer, on geometry alone
+#
+# The sectors below do NOT decide what the boat does - the role already did that.
+# They decide which bearings count as "the vessel we were told to expect", so a
+# hull at the quay 120 deg off the bow cannot trigger a manoeuvre laid on for a
+# target ahead.
+COLLISION_FRONT_SECTOR = (
+    _f("LIGMAX_AP_COLLISION_FRONT_LOW_DEG", -45.0),
+    _f("LIGMAX_AP_COLLISION_FRONT_HIGH_DEG", 45.0),
+)
+COLLISION_RIGHT_SECTOR = (
+    _f("LIGMAX_AP_COLLISION_RIGHT_LOW_DEG", 45.0),
+    _f("LIGMAX_AP_COLLISION_RIGHT_HIGH_DEG", 110.0),
+)
+
+# How close a tracked vessel has to be, inside the sector, to fire the manoeuvre.
+# The same 25 m `COLREG_DETECT_RANGE_M` uses, restated rather than shared because
+# these roles are allowed to move independently of the general COLREG behaviour -
+# and because at 25 m the Otter is 42 px in the detector's tensor, comfortably
+# inside the flat part of the recall curve (`ligmax-ai/vessel/README.md`).
+COLLISION_TRIGGER_RANGE_M = _f("LIGMAX_AP_COLLISION_TRIGGER_M", 25.0)
+
+# How far to starboard the detected alteration runs, as a track PARALLEL to the
+# leg. 8 m against a `COLREG_MIN_CPA_M` of 8: the two pass port to port with the
+# full offset between them. Wider is not free - the gate is 5 m and the boat has
+# to fit back through it.
+COLLISION_OFFSET_M = _f("LIGMAX_AP_COLLISION_OFFSET_M", 8.0)
+
+# How far ahead on the offset track to aim while running out to it. Small makes
+# the turn abrupt and hard to hold, large makes it lazy, and COLREG rule 8 wants
+# it "readily apparent". TUNE.
+COLLISION_OFFSET_LEAD_M = _f("LIGMAX_AP_COLLISION_OFFSET_LEAD_M", 6.0)
+
+# Held while waiting for a vessel to cross ahead. NOT zero: a hull with no way on
+# has no steering authority at all and lies across the leg in any wind, which is
+# both a worse place to be when the Otter goes by and a mess to recover from.
+COLLISION_WAIT_SPEED_MS = _speed("LIGMAX_AP_COLLISION_WAIT_SPEED_MS", 0.15)
+
+# A detected manoeuvre ends when the vessel is abaft this AND opening. Both,
+# because a range that has begun to open is also what a target looks like one
+# second before it crosses close ahead.
+COLLISION_CLEAR_ASTERN_DEG = _f("LIGMAX_AP_COLLISION_CLEAR_ASTERN_DEG", 100.0)
+
+# ...and ceilings on both, so nothing can run for ever on a detector that has
+# latched onto a pontoon.
+COLLISION_WAIT_MAX_S = _f("LIGMAX_AP_COLLISION_WAIT_MAX_S", 45.0)
+COLLISION_OFFSET_MAX_S = _f("LIGMAX_AP_COLLISION_OFFSET_MAX_S", 40.0)
+
+# After a manoeuvre finishes, how long before the leg will trigger another one.
+#
+# It re-arms rather than finishing for good, and that is the safer of the two.
+# A spurious early trigger - a moored hull inside the sector at the top of the
+# leg - would otherwise spend the boat's one manoeuvre before the Otter ever
+# appeared, and the rest of the leg would be driven blind past the thing the task
+# is about. Re-arming costs a second manoeuvre in the worst case; not re-arming
+# costs the run. The delay only exists to stop the boat dithering in and out of
+# the same encounter.
+COLLISION_REARM_S = _f("LIGMAX_AP_COLLISION_REARM_S", 5.0)
+
+
+# ----------------------------------------------- and the backups, which are blind
+#
+# **Nothing here consults the world model.** No detector, no tracks, no camera.
+# These fire on the boat's own progress along the leg and cannot be stopped by
+# anything being broken, which is the entire reason they exist: nothing in this
+# stack has been on the water, and a run where the detector says nothing is
+# otherwise a run where the boat drives straight down the line into the Otter.
+#
+# Where the manoeuvre starts: this far BEFORE the midpoint of the two waypoints,
+# measured along the leg rather than as a range to the midpoint, so a boat a few
+# metres off the line does not start early or late.
+COLLISION_BACKUP_LEAD_M = _f("LIGMAX_AP_COLLISION_BACKUP_LEAD_M", 10.0)
+
+# How far past the midpoint the scripted alteration holds its offset before
+# rejoining. Symmetric with the lead, so the dogleg is centred on the midpoint -
+# which is where the two vessels were always going to meet.
+COLLISION_BACKUP_RUN_M = _f("LIGMAX_AP_COLLISION_BACKUP_RUN_M", 10.0)
+
+# The scripted alteration is bigger than the detected one, and the scripted hold
+# is longer. That is not timidity, it is the price of being blind: a manoeuvre
+# timed off our own progress rather than off where the Otter actually is has to
+# be wide enough to be right despite not knowing. 12 m against the detected 8.
+COLLISION_BACKUP_OFFSET_M = _f("LIGMAX_AP_COLLISION_BACKUP_OFFSET_M", 12.0)
+
+# The scripted hold, in seconds. At the Otter's 2.5 kn this is about 26 m of its
+# travel, which clears a crossing track with room to spare. It is a fixed count
+# and not a look, because a backup that waits for something to be seen is not a
+# backup for a boat that cannot see.
+COLLISION_BACKUP_WAIT_S = _f("LIGMAX_AP_COLLISION_BACKUP_WAIT_S", 20.0)
+
+
 # ------------------------------------------------------------------- docking
 
 # NJORD §9.3 berth sizes.
@@ -1424,8 +1696,13 @@ def snapshot():
     A trip is only reviewable if you know what the boat believed at the time,
     and half of that is which numbers it was running.
     """
-    return {
+    out = {
         name: value
         for name, value in sorted(globals().items())
         if name.isupper() and isinstance(value, (int, float, str, bool))
     }
+    # A tuple is not a scalar, so the comprehension above skips it - and which mark
+    # sources were live is the first thing a post-mortem of a buoy leg has to know,
+    # since it decides whether `world.marks()` could have held anything at all.
+    out["MARK_SOURCES"] = ",".join(MARK_SOURCES)
+    return out

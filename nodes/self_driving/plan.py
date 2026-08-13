@@ -50,6 +50,13 @@ forward-looking lidar (the aft unit is broken), so a berth a few metres further 
 is not visible from the waypoint at all, and the honest answer is to creep that
 way and look rather than to declare failure standing still.
 
+Two fields that are the course's, not a waypoint's
+--------------------------------------------------
+`buoyage` and `cardinal_rule` ride on the plan rather than on each point, because
+they describe **how the course was laid** rather than what to do at a place. See
+`BUOYAGE_ROUTE` and `CARDINAL_INSIDE`: between them they are the difference between
+a channel run up and down and a ring run once, and both default to the channel.
+
 Coordinates
 -----------
 A waypoint may be given as `lat`/`lon` or as `x`/`y` grid metres - the dashboard
@@ -72,6 +79,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 
@@ -96,11 +104,37 @@ PARK_PARALLEL = "park_parallel"
 PARK_TAG = "park_tag"
 PARK_TAG_PARALLEL = "park_tag_parallel"
 
+#: NJORD §9.2, declared rather than classified. Which side the Otter comes from
+#: is in the briefing and there are only two cases, so the operator picks the
+#: manoeuvre on the dock instead of the boat inferring it from a monocular
+#: bearing thirty seconds before it matters. `AVOID` still exists and still
+#: classifies; these are what the Njord runs should actually be laid with.
+#:
+#: The `_BACKUP` pair consult **no sensor at all** and fire on the boat's own
+#: progress along the leg. They are the answer to "what happens if the cameras
+#: see nothing", which on a stack that has never been in the water is not a
+#: hypothetical. See `behaviours/collision.py`.
+COLLISION_FRONT = "collision_front"
+COLLISION_RIGHT = "collision_right"
+COLLISION_FRONT_BACKUP = "collision_front_backup"
+COLLISION_RIGHT_BACKUP = "collision_right_backup"
+
 ROLES = (TRANSIT, BUOYS, AVOID, HOLD, DOCK, DOCK_PARALLEL, PARK, PARK_PARALLEL,
-         PARK_TAG, PARK_TAG_PARALLEL)
+         PARK_TAG, PARK_TAG_PARALLEL,
+         COLLISION_FRONT, COLLISION_RIGHT,
+         COLLISION_FRONT_BACKUP, COLLISION_RIGHT_BACKUP)
+
+#: The four above, for anything that needs to ask "is this leg a Task 2 leg".
+COLLISION_ROLES = frozenset({COLLISION_FRONT, COLLISION_RIGHT,
+                             COLLISION_FRONT_BACKUP, COLLISION_RIGHT_BACKUP})
 
 #: Roles that find their berth from the AR tags rather than from a lidar.
 TAG_ROLES = frozenset({PARK_TAG, PARK_TAG_PARALLEL})
+
+#: Every role `behaviours/parking.Parking` runs, whichever sensor finds the space.
+#: What they have in common, and the reason this set exists, is that each one has a
+#: berth it enters and an exit it can be told to skip (`park_no_exit`).
+PARKING_ROLES = frozenset({PARK, PARK_PARALLEL, PARK_TAG, PARK_TAG_PARALLEL})
 
 # Roles whose waypoint is a place to *arrive at and settle*, rather than a point
 # to sweep through. They get the tighter acceptance radius and they are not
@@ -134,6 +168,67 @@ DEFAULT_HOLD_S = {
 #: it is being ignored; `bearing_of_buoyage` returns this and only this.
 BUOYAGE_BEARING_DEG = 0.0
 
+#: How the lateral rule reads the direction of buoyage. Plan-level, not per
+#: waypoint, because it is a fact about **how the course was laid** and a plan that
+#: mixed the two would be right about four legs and wrong about one - which is the
+#: failure `buoys.BUOYAGE_INVERTS_BEYOND_DEG` exists to avoid, reintroduced by the
+#: back door.
+#:
+#:  "venue"  The default and everything before 2026-08-13: the direction of
+#:           buoyage is the water's, `BUOYAGE_BEARING_DEG`, and a leg running more
+#:           than `buoys.BUOYAGE_INVERTS_BEYOND_DEG` back down it inverts red and
+#:           green. Right for Task 1 and Task 2, which run up and down a channel.
+#:  "route"  The direction of buoyage is **the direction of travel**: red to port
+#:           and green to starboard on every leg, never inverted.
+#:
+#: "route" exists for a **ring**, and a ring is why "venue" cannot describe it. The
+#: surprise task's marks are laid as a closed loop run once in one direction, so
+#: every compass bearing occurs somewhere on it - the 2026-08-13 course runs 185,
+#: 291, 179, 141 and 020 - and no fixed reference plus a window can call all of
+#: them "with the buoyage". Under "venue" the 179 and 141 deg legs both invert, and
+#: those are TWO OF THE THREE scored ring legs: the boat would pass every mark on
+#: them the wrong side, confidently and consistently. See docs/findings.md item 41.
+BUOYAGE_VENUE = "venue"
+BUOYAGE_ROUTE = "route"
+BUOYAGE_MODES = (BUOYAGE_VENUE, BUOYAGE_ROUTE)
+
+#: How a cardinal mark is passed.
+#:
+#:  "safe_side"  The default, NJORD 10.3: a cardinal says which side of *itself* is
+#:               safe water, so route through a via-point on that side. Needs the
+#:               camera to have committed to which cardinal it is, and no lidar can
+#:               tell a north mark from a south one - so an uncommitted mark buys a
+#:               slow-down and the planned line (`behaviours/buoys._cardinal`).
+#:  "inside"     Pass **inside** the mark: between it and the interior of the loop
+#:               the course itself traces. What the marks mean is not consulted.
+#:
+#: "inside" is not a relaxation of "safe_side", it is a different statement about a
+#: different course. It is right when the cardinals ring the *outside* of a closed
+#: circuit and the jury's instruction is "stay inside them" - the 2026-08-13
+#: surprise task, whose five marks 4.1-4.5 sit outside a loop the boat runs once.
+#:
+#: What it buys is the thing "safe_side" cannot have on this boat: **an unresolved
+#: cardinal is fully actionable.** Which side is inside comes from the geometry of
+#: the plan (`interior_side`), so the topmark, the second-stage classifier and the
+#: alternation prior are all out of the loop, and a mark the camera will never
+#: commit to is routed round exactly as well as one it does.
+CARDINAL_SAFE_SIDE = "safe_side"
+CARDINAL_INSIDE = "inside"
+CARDINAL_RULES = (CARDINAL_SAFE_SIDE, CARDINAL_INSIDE)
+
+#: `interior_side` returns one of these: which hand the inside of the course is on.
+SIDE_PORT = -1
+SIDE_STARBOARD = +1
+
+#: The smallest loop `interior_side` will read a hand off. Ten times smaller than
+#: the 2026-08-13 surprise course encloses (~730 m2), and far larger than the few
+#: square metres of GNSS noise a course laid straight comes out with.
+MIN_LOOP_AREA_M2 = 70.0
+
+#: Sentinel for "not computed yet", so that a genuine `None` - a course with no
+#: loop - is cached instead of being recomputed and re-warned about every tick.
+_UNSET = object()
+
 
 class Waypoint:
     """One point on the course, and what to do on the way to it.
@@ -145,7 +240,7 @@ class Waypoint:
     __slots__ = (
         "index", "name", "lat", "lon", "role", "speed", "radius", "hold_s",
         "channel_bearing", "berth_width_m", "park_offset_m", "park_probe_deg",
-        "berth", "notes",
+        "berth", "park_no_exit", "notes",
     )
 
     def __init__(self, index, name, lat, lon, role, **kwargs):
@@ -179,6 +274,19 @@ class Waypoint:
         # for when it has picked wrong, or when the tags disagree with what the
         # jury said - a name the operator types rather than an argument.
         self.berth = kwargs.get("berth")
+        # Stay in the berth when the hold is over, instead of reversing out of it.
+        # For the parking roles alone, and it exists because of one sentence in the
+        # organisers' 2026-08-12 clarification of the surprise task: "The task ends
+        # inside the final dock. You do not need to exit the dock after completing
+        # the final docking manoeuvre."
+        #
+        # Default False, i.e. every other course keeps the behaviour NJORD 9.3
+        # describes - the berth is left the way it was entered, and the next
+        # waypoint does the forward part. This is not a shortcut for a boat that
+        # cannot get out: an exit that is skipped is an exit nobody watched, so it
+        # is per waypoint and typed by an operator rather than inferred from a
+        # waypoint being last in the plan. See `behaviours/parking.py:_hold`.
+        self.park_no_exit = bool(kwargs.get("park_no_exit") or False)
         self.notes = kwargs.get("notes") or ""
 
     # ------------------------------------------------------------------ query
@@ -211,6 +319,12 @@ class Waypoint:
             value = getattr(self, key)
             if value is not None:
                 out[key] = value
+        # Only when set. It is a bool with a default rather than an optional, so
+        # the `is not None` loop above would put `"park_no_exit": false` on every
+        # waypoint of every course - and this dict is what the dashboard draws, what
+        # `save()` writes and what a trip header carries.
+        if self.park_no_exit:
+            out["park_no_exit"] = True
         if self.notes:
             out["notes"] = self.notes
         return out
@@ -231,7 +345,8 @@ class Plan:
     instead of driving back to the start of the course.
     """
 
-    def __init__(self, waypoints, name="plan", channel_bearing=0.0, created=None):
+    def __init__(self, waypoints, name="plan", channel_bearing=0.0, created=None,
+                 buoyage=BUOYAGE_VENUE, cardinal_rule=CARDINAL_SAFE_SIDE):
         self.waypoints = waypoints
         self.name = name
         # The direction of buoyage: sailing this way, red is to port. Njord lays
@@ -239,9 +354,15 @@ class Plan:
         # leg that runs back down the course inverts the sense and a boat that
         # does not know it passes every gate on the wrong side.
         self.channel_bearing = channel_bearing
+        # How the lateral rule and the cardinals are read on THIS course. Both
+        # default to what every plan before 2026-08-13 did, so a course that says
+        # nothing behaves exactly as it always has.
+        self.buoyage = buoyage
+        self.cardinal_rule = cardinal_rule
         self.created = created or time.time()
         self.index = 0
         self.last_passed = -1
+        self._interior_side = _UNSET
 
     # ------------------------------------------------------------------ parse
 
@@ -295,7 +416,35 @@ class Plan:
             name=str(payload.get("name") or "plan")[:64],
             channel_bearing=default_bearing,
             created=payload.get("created"),
+            buoyage=_choice(payload.get("buoyage"), BUOYAGE_MODES, BUOYAGE_VENUE,
+                            "buoyage"),
+            cardinal_rule=_choice(payload.get("cardinal_rule"), CARDINAL_RULES,
+                                  CARDINAL_SAFE_SIDE, "cardinal_rule"),
         )
+        # Said out loud at upload, and both halves of it. A course laid as a ring
+        # behaves differently on every leg from the same course laid as a channel,
+        # the difference is invisible on the chart, and the ack is the one place an
+        # operator sees which of the two the boat thinks it has.
+        if plan.buoyage != BUOYAGE_VENUE or plan.cardinal_rule != CARDINAL_SAFE_SIDE:
+            side = plan.interior_side()
+            log.info(
+                "plan %r: buoyage=%s, cardinals=%s, inside is to %s",
+                plan.name, plan.buoyage, plan.cardinal_rule,
+                "port" if side == SIDE_PORT
+                else "starboard" if side == SIDE_STARBOARD
+                else "NOWHERE - the course encloses nothing",
+            )
+            # Refused, not warned about. `cardinal_rule: "inside"` on a course with
+            # no inside is a plan whose two halves contradict each other, and the
+            # run-time behaviour - hold the planned line past every cardinal - is
+            # indistinguishable from the rule working. That is exactly the kind of
+            # silence this file is strict to avoid.
+            if plan.cardinal_rule == CARDINAL_INSIDE and side is None:
+                raise PlanError(
+                    "cardinal_rule 'inside' needs a course that encloses "
+                    f"something, and this one encloses under {MIN_LOOP_AREA_M2:.0f} "
+                    "m2 - lay the loop, or use 'safe_side'"
+                )
         # A plan may name where to resume, for the §8.2 re-entry case: the
         # operator drives the boat back behind the last good waypoint by hand
         # and re-uploads with `start_at` set rather than watching it run the
@@ -432,6 +581,76 @@ class Plan:
             "passed_index": self.last_passed,
         }
 
+    def follows_route_buoyage(self):
+        """Whether the direction of buoyage is this course's own direction of travel.
+
+        True only for `buoyage: "route"`. `behaviours/buoys._with_the_buoyage` reads
+        it and stops asking the compass; see `BUOYAGE_ROUTE` for why a ring needs it.
+        """
+        return self.buoyage == BUOYAGE_ROUTE
+
+    def passes_cardinals_inside(self):
+        """Whether cardinals are passed inside the loop rather than on their safe side."""
+        return self.cardinal_rule == CARDINAL_INSIDE
+
+    def interior_side(self):
+        """Which hand the inside of this course is on: `SIDE_PORT`/`SIDE_STARBOARD`.
+
+        The signed area of the waypoint polygon, closed back to the first point. A
+        counter-clockwise loop is entered with its interior to **port**, a clockwise
+        one to starboard, and that is the whole derivation - `cardinal_rule:
+        "inside"` needs a side and this is where it comes from.
+
+        Computed from the plan and nothing else, which is the point. The alternative
+        was an operator typing "port" on a competition morning, and the two ways of
+        being wrong are not comparable: a mis-derived side is a course whose own
+        shape contradicts it and which `commander` can therefore refuse, while a
+        mis-typed one is a boat that rounds every mark on the wrong side and looks
+        entirely deliberate doing it.
+
+        `None` when there is no loop to speak of - fewer than three convertible
+        points, or a polygon so thin that its own sign is noise. A course laid
+        straight has no inside, and saying so is better than picking a hand out of
+        rounding error. `behaviours/buoys` falls back to holding the planned line.
+
+        In local flat metres about the first waypoint rather than against the grid
+        origin: handedness is scale-free, an origin the operator may since have
+        re-zeroed is one more thing to be wrong, and `geo.to_world` would make this
+        depend on a fix the boat may not have yet.
+        """
+        if self._interior_side is not _UNSET:
+            return self._interior_side
+        self._interior_side = self._compute_interior_side()
+        return self._interior_side
+
+    def _compute_interior_side(self):
+        points = [(point.lat, point.lon) for point in self.waypoints]
+        if len(points) < 3:
+            return None
+        lat0 = points[0][0]
+        per_lat = geo.METRES_PER_DEGREE_LAT
+        per_lon = per_lat * math.cos(math.radians(lat0))
+        flat = [
+            ((lon - points[0][1]) * per_lon, (lat - lat0) * per_lat)
+            for lat, lon in points
+        ]
+        twice_area = 0.0
+        for (east, north), (next_east, next_north) in zip(flat, flat[1:] + flat[:1]):
+            twice_area += east * next_north - next_east * north
+        # A threshold on the area itself, not on its sign. A course of six points
+        # laid nearly in a line has a signed area of a few square metres made
+        # entirely of GNSS noise, and its sign flips between two uploads of what an
+        # operator would call the same course. `MIN_LOOP_AREA_M2` is a tenth of the
+        # smallest circuit anyone would call a ring.
+        if abs(twice_area) < 2.0 * MIN_LOOP_AREA_M2:
+            log.warning(
+                "plan %r encloses only %.0f m2 - too thin to say which side is "
+                "inside; cardinals will hold the planned line",
+                self.name, abs(twice_area) / 2.0,
+            )
+            return None
+        return SIDE_PORT if twice_area > 0.0 else SIDE_STARBOARD
+
     def bearing_of_buoyage(self, waypoint):
         """The direction of buoyage on the leg into `waypoint`, degrees true.
 
@@ -450,6 +669,8 @@ class Plan:
             "name": self.name,
             "created": self.created,
             "channel_bearing": self.channel_bearing,
+            "buoyage": self.buoyage,
+            "cardinal_rule": self.cardinal_rule,
             "index": self.index,
             "last_passed": self.last_passed,
             "waypoints": [waypoint.to_dict() for waypoint in self.waypoints],
@@ -509,6 +730,20 @@ class Plan:
                 else None
             ),
             "finished": self.finished,
+            # On the wire every tick, because the two of them decide which side of
+            # every mark on the course the boat goes and there is nothing else on the
+            # dashboard that would show it. `interior_side` only for the rule that
+            # uses one.
+            "buoyage": self.buoyage,
+            "cardinal_rule": self.cardinal_rule,
+            **(
+                {"inside": (
+                    "port" if self.interior_side() == SIDE_PORT
+                    else "starboard" if self.interior_side() == SIDE_STARBOARD
+                    else None
+                )}
+                if self.passes_cardinals_inside() else {}
+            ),
         }
 
     def __len__(self):
@@ -570,8 +805,26 @@ def _waypoint(position, item, origin, default_bearing):
             item.get("park_probe_deg"), 0.0, 360.0, position, "park_probe_deg"
         ),
         berth=_berth(position, item, role),
+        # Refused on a role that has no berth to stay in, rather than ignored: a
+        # `park_no_exit` an operator typed onto the wrong waypoint is a boat they
+        # expect to stop and which drives on, and silence is how that is found out
+        # too late. The parking roles are the only ones with an exit to skip.
+        park_no_exit=_park_no_exit(position, item, role),
         notes=str(item.get("notes") or "")[:120],
     )
+
+
+def _park_no_exit(position, item, role):
+    if "park_no_exit" not in item:
+        return False
+    if not bool(item["park_no_exit"]):
+        return False
+    if role not in PARKING_ROLES:
+        raise PlanError(
+            f"waypoint {position + 1}: 'park_no_exit' is only for the parking "
+            f"roles ({', '.join(sorted(PARKING_ROLES))}), and this one is '{role}'"
+        )
+    return True
 
 
 def _berth(position, item, role):
@@ -634,6 +887,24 @@ def _coordinates(position, item, origin):
         return converted
 
     raise PlanError(f"waypoint {position + 1} has neither lat/lon nor x/y")
+
+
+def _choice(value, allowed, default, field):
+    """One of `allowed`, or `default` when absent. Anything else is refused.
+
+    Refused rather than defaulted, because both of these fields have a *safe-looking*
+    default that is the wrong answer for the course that bothered to set them: a
+    misspelt `"rout"` would silently fly a ring under the channel rule and invert
+    red and green on the legs that run back down it.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    text = str(value).strip().lower()
+    if text not in allowed:
+        raise PlanError(
+            f"{field} '{value}' is not one of {', '.join(allowed)}"
+        )
+    return text
 
 
 def _float(value, default):
