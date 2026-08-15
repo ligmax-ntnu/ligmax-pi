@@ -55,11 +55,12 @@ What it does:
     waypoints as a real MAVLink mission (`mission.py`) for AUTO to run, and
     `clear_waypoints` empties it; `set_param` writes one stabilisation gain or
     trim and `get_params` re-reads the lot (`tuning.py`); `set_lights_mode`,
-    `set_lights_pattern`, `set_lights_fps` and `set_lights_servos` are
-    `/led_control`'s standard/custom switch, its pattern, its refresh rate, and
-    the two headlight-cover servos' angles (`lights.py`) - that last one moves a
-    mechanism, so it refuses an angle outside the cover's travel instead of
-    clamping it;
+    `set_lights_pattern` and `set_lights_fps` are `/led_control`'s
+    standard/custom switch, its pattern and its refresh rate on the hull strips
+    (`lights.py`), while `set_lights_servos` and `set_headlights` reach the
+    **second** lighting board over USB (`headlights.py`) - the two cover servos'
+    angles and the two forward strips' colours. The servo one moves a mechanism,
+    so it refuses an angle outside the cover's travel instead of clamping it;
     `set_ride_height` walks the amas up or down as an RC override on channel 14
     (`pixhalwk.py`), refreshed here every loop because the autopilot expires
     one that goes quiet, and `release_ride_height` hands that channel back to
@@ -110,6 +111,7 @@ from .bms import BmsReader
 from .edge_link import ENABLED as EDGE_LINK_ENABLED, EdgeLink
 from .emergency_stop import BatteryHoming, EstopRelay
 from .guided import MODE as GUIDED_MODE, Guided
+from .headlights import Headlights
 from .lidar import LidarReader
 from .lights import Lights
 from .mission import MissionUploader, parse_waypoints
@@ -464,6 +466,7 @@ def handle_commands(
     mission=None,
     tuning=None,
     lights=None,
+    headlights=None,
     bridge=None,
     ride_height=None,
     preflight=None,
@@ -746,16 +749,32 @@ def handle_commands(
                 lights.set_fps(args.get("fps"))
                 ok, result = True, "fps updated"
         elif name == "set_lights_servos":
-            # The two headlight-cover servos on the lights ESP32, straight to an
-            # angle each, from /led_control's sliders. The only command on this
-            # node's lights path that moves a mechanism rather than lighting
-            # one, which is why it is the only one that refuses rather than
-            # clamps: `set_servos()` bounds each side by that cover's own
-            # measured travel and answers in the operator's words.
-            if lights is None:
-                ok, result = False, "no lights driver on this node"
+            # The two headlight-cover servos, straight to an angle each, from
+            # /led_control's sliders. The only command on this node's lighting
+            # path that moves a mechanism rather than lighting one, which is why
+            # it is the only one that refuses rather than clamps: `set_servos()`
+            # bounds each side by that cover's own measured travel and answers in
+            # the operator's words.
+            #
+            # The name predates 2026-08-13, when the covers moved off the hull
+            # lights board onto their own ESP32 (`headlights.py`). Kept as it is:
+            # it is still the servos on the lighting subsystem, and renaming an
+            # operator-visible command to record an internal split would cost
+            # every saved dashboard shortcut for nothing.
+            if headlights is None:
+                ok, result = False, "no headlights driver on this node"
             else:
-                ok, result = lights.set_servos(args.get("left"), args.get("right"))
+                ok, result = headlights.set_servos(args.get("left"), args.get("right"))
+        elif name == "set_headlights":
+            # The two forward strips, one solid colour each, on the same board as
+            # the covers. Working lights, not signals: no status drives them, the
+            # /led_control override switch does not touch them, and KILLED does
+            # not either - solid red on the hull is a promise about the thrusters
+            # and says nothing about whether the boat can see where it is going.
+            if headlights is None:
+                ok, result = False, "no headlights driver on this node"
+            else:
+                ok, result = headlights.set_front(args.get("left"), args.get("right"))
         elif name in ("safety_on", "safety_off"):
             # The Pixhawk's own safety switch, pressed from the dashboard.
             # ArduPilot forces the board's safety state directly for this
@@ -1026,6 +1045,13 @@ def main():
     # Say something immediately rather than waiting for the first publish: until
     # the autopilot is heard from, the honest colour is not green.
     lights.set_status(machine.evaluate(relay.engaged, propulsion.propulsion_permitted))
+    # The bow: the two forward strips and the two cover servos, on their own ESP32
+    # over USB (headlights.py). Constructed unconditionally and cheap if the board
+    # is not plugged in - it holds no port and resets no board until an operator
+    # actually asks for a colour or an angle, which is also why nothing here tells
+    # it anything at startup. There is no status to follow: headlights are working
+    # lights and the covers are a mechanism.
+    headlights = Headlights()
 
     # Navigation and trim are fed from the MAVLink pump below; the BMS runs itself.
     navigation = Navigation()
@@ -1337,6 +1363,7 @@ def main():
                 mission,
                 tuning,
                 lights,
+                headlights,
                 bridge,
                 ride_height,
                 preflight,
@@ -1415,6 +1442,12 @@ def main():
                     # pressed E-stop from a kicked CAN cable.
                     "propulsion": propulsion.telemetry(),
                     "lights": lights.telemetry(),
+                    # The bow, reported separately from the hull because it is a
+                    # separate board on a separate link: the hull can be lit
+                    # while this is unplugged, and one `link` field covering
+                    # both would make each failure look like the other. Same
+                    # reasoning as the two lidars.
+                    "headlights": headlights.telemetry(),
                     # Where the Pixhawk's safety switch was last put from here,
                     # and when the compass was last swung. Neither is a
                     # read-back - nothing in ArduPilot's telemetry reports
@@ -1551,6 +1584,10 @@ def main():
         lights.set_status("KILLED")
         time.sleep(0.15)  # long enough for the worker to get one write out
         lights.close()
+        # Blanks the forward strips and deliberately leaves the covers alone -
+        # see `Headlights.close()`. A light nobody is maintaining should go out;
+        # a cover should stay where the operator put it.
+        headlights.close()
         bms.close()
         # Both lidars before the autopilot link: the aft one holds a USB serial
         # port that the next run has to be able to reopen, and a C1 left

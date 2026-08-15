@@ -20,8 +20,8 @@ chosen here rather than left to look like a fault:
 
 The link
 --------
-The ESP32 is now a dumb pixel driver. It listens at 115200 8N1 for two pixel
-commands and answers nothing this module reads:
+The ESP32 is a dumb pixel driver. It listens at 115200 8N1 for two commands and
+answers nothing at all:
 
     DATA <NUM_LEDS*3 hex chars>\\n     one LED per RGB nibble - half the
                                         precision of COL, so a full per-pixel
@@ -29,10 +29,11 @@ commands and answers nothing this module reads:
     COL <6 hex chars>\\n               set the whole strip to one full-precision
                                         RRGGBB
 
-and, since 2026-08-13, one that moves hardware rather than lighting it:
-
-    SRV <L|R> <deg>\\n                 one headlight-cover servo to an explicit
-                                        angle (`set_servos()` below)
+**This module owns the two AFT hull strips and nothing else.** The front strips
+and the two headlight-cover servos were on the same board until 2026-08-13 and
+are now on an ESP32-S3 over USB - `headlights.py`, which is a separate link, a
+separate failure and a separate telemetry block. The split is why this file is
+only about the safety colour again.
 
 Every pattern `render()` produces is a single colour repeated across the
 strip, so `COL` is what this module actually sends, at full 8-bit-per-channel
@@ -173,30 +174,6 @@ BREATHE_FLOOR = 0.04  # never fully off, so "powered" stays readable
 MAX_PATTERN_FRAMES = 60  # generous for a hand-authored loop, small enough to log
 MIN_HOLD_S = 0.02  # below one FRAME_PERIOD tick, a frame could never show anyway
 MAX_HOLD_S = 60.0
-
-# -- Headlight cover servos --------------------------------------------------
-#
-# The two servos on the lights ESP32 (its GPIO 25 and 26) that swing the
-# headlight covers. `/led_control` drives them directly with `set_servos()`, so
-# an angle is a command the same way a colour is: held here as "the latest
-# wanted" and re-asserted on the keepalive, because the ESP32 comes back from a
-# reset with both covers CLOSED and nothing on this link says that it rebooted.
-#
-# The numbers are the sketch's own SERVO_L_CLOSED/OPEN and SERVO_R_CLOSED/OPEN
-# (`ligmax-subsystems/esp32s/lights_esp/lights_esp.ino`) and they are the only
-# travel anything has measured: past an endpoint the horn drives the cover into
-# its mechanical stop and the servo sits there at stall current. The firmware
-# clamps to the same span, so this copy is the early "no" and not the safety
-# one - but a mismatch between the two is silent, so change both or neither.
-#
-# The sides are MIRRORED: left opens by increasing the angle, right by
-# decreasing it. 90 deg is not the same place on the two covers, which is why
-# nothing here takes an angle without a side.
-SERVO_ENDPOINTS = {
-    "left": {"closed": 20, "open": 110},
-    "right": {"closed": 160, "open": 70},
-}
-SERVO_SIDES = ("left", "right")
 
 # --- The mapping. This is the authoritative copy. ---------------------------
 #
@@ -374,29 +351,11 @@ def data_frame(pixels):
     return "DATA " + body + "\n"
 
 
-def servo_range(side):
-    """`(min_deg, max_deg)` for one cover - the span between its endpoints.
-
-    Derived rather than written out a second time, because the two sides are
-    mirrored and it is the mirroring that makes a hand-written pair of bounds
-    easy to get backwards.
-    """
-    ends = SERVO_ENDPOINTS[side]
-    return (min(ends["closed"], ends["open"]), max(ends["closed"], ends["open"]))
-
-
-def servo_line(side, deg):
-    """The wire format: `SRV L|R <deg>` + newline."""
-    return "SRV %s %d\n" % ("L" if side == "left" else "R", deg)
-
-
 class Lights:
-    """The hull's signal lights, and the two headlight-cover servos on the same
-    ESP32. `set_status()` drives the safety colour; `set_override()` and
-    `set_pattern()` let an admin substitute a hand-authored test pattern for it,
-    `set_fps()` changes how often any of it is redrawn - see "Admin test-pattern
-    override" above - and `set_servos()` points the covers at explicit angles,
-    which is the one thing here that moves rather than lights.
+    """The hull's signal lights. `set_status()` drives the safety colour;
+    `set_override()` and `set_pattern()` let an admin substitute a hand-authored
+    test pattern for it, and `set_fps()` changes how often any of it is redrawn -
+    see "Admin test-pattern override" above.
 
     Owns one worker thread. The status is held as "the latest wanted", never
     accumulated: if it changes three times between two frames, the hull shows the
@@ -420,12 +379,6 @@ class Lights:
         self._pattern = None  # [(pixels, hold_s), ...] or None until an admin loads one
         self._pattern_total_s = 0.0
         self._fps = DEFAULT_FPS  # how often _run() re-samples time and writes a frame
-        # Cover angles: the wanted one per side, `None` until an operator asks,
-        # and the one the ESP32 was last actually told, so the keepalive can tell
-        # a re-assert from a change.
-        self._servos = dict.fromkeys(SERVO_SIDES)
-        self._servos_sent = dict.fromkeys(SERVO_SIDES)
-        self._servos_write = 0.0
         self._last_frame = None  # the exact line last written, to skip repeats
         self._last_write = 0.0
         self._last_open_attempt = 0.0
@@ -545,51 +498,6 @@ class Lights:
         self._wake.set()
         return True
 
-    def set_servos(self, left=None, right=None):
-        """Point the headlight covers at explicit angles, in degrees.
-
-        `None` for a side leaves that side alone, so one slider can be moved
-        without asserting anything about the other. Returns `(ok, message)`
-        rather than swallowing a bad value the way the setters above do: a
-        slider that asks for an angle outside the cover's travel has to come
-        back as those words to the operator, because the alternative - nothing
-        moves and nothing is said - is indistinguishable from a dead link.
-
-        Never blocks. The angle is only stored here; the worker writes it, and
-        keeps writing it, on the keepalive.
-        """
-        if self._closed:
-            return False, "the lights driver is shut down"
-        wanted = {}
-        for side, value in (("left", left), ("right", right)):
-            if value is None:
-                continue
-            lo, hi = servo_range(side)
-            try:
-                deg = int(round(float(value)))
-            except (TypeError, ValueError, OverflowError):
-                return False, f"{side} angle {value!r} is not a number of degrees"
-            if not lo <= deg <= hi:
-                ends = SERVO_ENDPOINTS[side]
-                return False, (
-                    f"{side} cover travels {lo}-{hi} deg ({ends['closed']} closed, "
-                    f"{ends['open']} open); {deg} is outside it"
-                )
-            wanted[side] = deg
-        if not wanted:
-            return False, "no angle given: send a left, a right, or both"
-        with self._lock:
-            changed = {s: d for s, d in wanted.items() if self._servos[s] != d}
-            self._servos.update(wanted)
-        if changed:
-            # WARNING, not INFO: this is the one thing in this module that moves
-            # a mechanism, and the log is where somebody looks after finding a
-            # cover somewhere they did not leave it.
-            log.warning("headlight covers -> %s",
-                        ", ".join(f"{s} {d} deg" for s, d in sorted(changed.items())))
-            self._wake.set()
-        return True, ", ".join(f"{s} {d} deg" for s, d in sorted(wanted.items()))
-
     def telemetry(self):
         """The `telemetry.lights` block, which the dashboard cross-checks.
 
@@ -602,21 +510,12 @@ class Lights:
         with self._lock:
             wanted, shown, shown_custom = self._wanted, self._shown, self._shown_custom
             override, pattern, fps = self._override, self._pattern, self._fps
-            servos = dict(self._servos)
         block = {
             "link": self.available and self._frames > 0,
             "verified": False,  # no return path on this firmware
             "frames": self._frames,
             "override": override,
             "fps": fps,
-            # Commanded, never measured - the servos have no feedback and this
-            # firmware acks nothing, so these are "what the ESP32 was last told",
-            # exactly like `colour`. Reported even while they are None (nobody
-            # has asked yet, so the covers are wherever the ESP32 booted them),
-            # because the dashboard merges telemetry dicts key by key: a field
-            # that vanished on a restart would leave yesterday's angle on screen.
-            "servo_left_deg": servos["left"],
-            "servo_right_deg": servos["right"],
         }
         if pattern is not None:
             block["pattern_frames"] = len(pattern)
@@ -642,12 +541,6 @@ class Lights:
         point: a dumb driver holds its last frame forever, so leaving the hull as
         it is would leave a colour asserting a state nothing is maintaining -
         green on a boat with no autonomy running. Dark is honest; stale is not.
-
-        The headlight covers are deliberately left where they are. A colour is a
-        claim about the boat and goes stale the moment nobody is maintaining it;
-        a cover is a mechanism, and closing one on the way out would move
-        hardware nobody asked to move, in the one code path that runs while
-        something is already going wrong.
         """
         if self._closed:
             return
@@ -686,12 +579,7 @@ class Lights:
         with self._lock:
             wanted = self._wanted
             override, pattern, total = self._override, self._pattern, self._pattern_total_s
-            servos = dict(self._servos)
-        # A cover angle is reason enough to hold the port open on its own: the
-        # covers are driven from `/led_control`, which can be used on a bench
-        # before anything has published a vessel status.
-        servos_asked = any(deg is not None for deg in servos.values())
-        if wanted is None and not servos_asked:
+        if wanted is None:
             return
 
         if self._serial is None:
@@ -700,10 +588,6 @@ class Lights:
                 return
 
         now = time.monotonic()
-        if servos_asked and not self._write_servos(now, servos):
-            return
-        if wanted is None:
-            return
         # KILLED is unconditional: whatever the switch says, solid red is the
         # rules' promise that the thrusters are dead.
         show_custom = override and pattern and wanted != "KILLED"
@@ -735,35 +619,6 @@ class Lights:
             self._shown = wanted
             self._shown_custom = show_custom
         self._drain()
-
-    def _write_servos(self, now, servos):
-        """Assert the cover angles: on a change, and again on the keepalive.
-
-        The keepalive is the point rather than an optimisation. The ESP32 comes
-        back from a reset with both covers CLOSED and says nothing about having
-        rebooted, so an angle sent once is an angle the dashboard would keep
-        claiming after the hull had quietly abandoned it.
-
-        Returns False when the port died under a write, in which case the caller
-        must stop for this tick - the port has been dropped for reopening.
-        """
-        due = (now - self._servos_write) >= KEEPALIVE_PERIOD
-        for side in SERVO_SIDES:
-            deg = servos[side]
-            if deg is None:
-                continue
-            if deg == self._servos_sent[side] and not due:
-                continue
-            if not self._write(servo_line(side, deg)):
-                self._reset_port()
-                # Both angles and the pixel frame have to be re-asserted on a
-                # fresh port, since nothing on the far side remembers.
-                self._servos_sent = dict.fromkeys(SERVO_SIDES)
-                self._last_frame = None
-                return False
-            self._servos_sent[side] = deg
-            self._servos_write = now
-        return True
 
     def _open(self):
         if serial is None:
@@ -810,7 +665,6 @@ class Lights:
         with self._lock:
             self._serial = port
         self._last_frame = None  # repaint on a fresh port
-        self._servos_sent = dict.fromkeys(SERVO_SIDES)  # and re-assert the covers
         self._last_error = None
         log.info("lights ESP32 on %s @ %s baud, %d LEDs",
                  self.port_name, self.baud, NUM_LEDS)
@@ -863,12 +717,9 @@ if __name__ == "__main__":
     # see one full breathe cycle and a dozen strobe flashes. Watch the strips;
     # every state the boat can be in should be visibly distinct.
     #
-    # Add `--covers` to sweep the headlight covers afterwards. That is opt-in
-    # because it MOVES HARDWARE: everything else here only lights LEDs, and a
-    # bench check that swings two servos by default is one somebody runs next to
-    # a half-assembled bow.
-    import sys
-
+    # The headlights and the covers are NOT here: they are a different board and a
+    # different link - `python -m nodes.io_manager.headlights` is their bench
+    # check.
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     lights = Lights()
     try:
@@ -876,19 +727,6 @@ if __name__ == "__main__":
             lights.set_status(name)
             print(f"{name:<15} -> {STATUS_COLOURS[name]} ({STATUS_PATTERNS[name][0]})")
             time.sleep(4.0)
-            print(f"                  {lights.telemetry()}")
-        if "--covers" in sys.argv:
-            for label, key in (("closed", "closed"), ("open", "open"), ("closed", "closed")):
-                left = SERVO_ENDPOINTS["left"][key]
-                right = SERVO_ENDPOINTS["right"][key]
-                print(f"covers {label:<8} -> {lights.set_servos(left, right)}")
-                time.sleep(3.0)
-            # And one place that is neither end, which is the whole point of the
-            # command: a cover that only ever reaches its endpoints would be the
-            # old O/C pair with extra steps.
-            mid = {s: sum(servo_range(s)) // 2 for s in SERVO_SIDES}
-            print(f"covers midway   -> {lights.set_servos(mid['left'], mid['right'])}")
-            time.sleep(3.0)
             print(f"                  {lights.telemetry()}")
     finally:
         lights.close()
